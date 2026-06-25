@@ -1788,6 +1788,78 @@ class MecchaESP:
             finally:
                 k32.CloseHandle(th)
 
+    def start_fps_tracker(self):
+        """
+        Spawn a 500 Hz background thread that detects game ticks by polling the
+        Y-component of the ViewTarget camera location.  Each time that float
+        changes the game rendered a new frame.  The count is aggregated every
+        second and stored in the returned dict so the overlay can display it.
+
+        Returns: dict with key "game_fps" (int, updated ~every second).
+        """
+        import threading as _threading
+        import time as _time
+
+        fps_info = {"game_fps": 0}
+
+        def _tracker():
+            VIEW_TARGET_OFF = 0x0340          # cam_mgr + 0x340 = ViewTarget
+            pc_cam_key = "APlayerController::PlayerCameraManager"
+            pov_off = self.offsets.get("FCameraCacheEntry::POV", 0x10)
+            loc_off = self.offsets.get("FMinimalViewInfo::Location", 0x0)
+            # Y component (+4) changes even when standing still (minor jitter)
+            SAMPLE_OFF = VIEW_TARGET_OFF + pov_off + loc_off + 4
+
+            pov_y_addr   = 0
+            last_val     = None
+            tick_count   = 0
+            window_start = _time.perf_counter()
+            last_refresh = 0.0
+
+            while True:
+                try:
+                    now = _time.perf_counter()
+
+                    # Re-resolve the camera chain once per second (or on first run)
+                    if now - last_refresh >= 1.0:
+                        last_refresh = now
+                        try:
+                            pc_cam_off = self.offsets.get(pc_cam_key, 0)
+                            world = self._get_world()
+                            if world and pc_cam_off:
+                                pc = self._get_local_controller(world)
+                                if pc:
+                                    cam_mgr = rp(self.pm, pc + pc_cam_off)
+                                    if cam_mgr > 0x100000:
+                                        pov_y_addr = cam_mgr + SAMPLE_OFF
+                        except Exception:
+                            pov_y_addr = 0
+
+                    # Fast poll: read 4 bytes, count changes
+                    if pov_y_addr:
+                        try:
+                            val = self.pm.read_bytes(pov_y_addr, 4)
+                            if val != last_val:
+                                tick_count += 1
+                                last_val = val
+                        except Exception:
+                            pov_y_addr = 0
+
+                    # Publish FPS once per second
+                    elapsed = now - window_start
+                    if elapsed >= 1.0:
+                        fps_info["game_fps"] = round(tick_count / elapsed)
+                        tick_count   = 0
+                        window_start = now
+
+                    _time.sleep(0.002)   # 500 Hz
+
+                except Exception:
+                    _time.sleep(0.1)
+
+        _threading.Thread(target=_tracker, daemon=True).start()
+        return fps_info
+
     def throttle_game_process(self, on: bool, quality: int = 3):
         """Lower/restore the game process priority class while painting.
 

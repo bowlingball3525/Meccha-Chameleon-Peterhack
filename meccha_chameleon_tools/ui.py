@@ -1563,6 +1563,9 @@ class Overlay(QWidget):
         self._paint_throttle: bool = False  # True while a paint job is running
         self._paint_throttle_quality: int = 3  # quality level active during last throttle
 
+        # Game FPS tracker — 500 Hz background thread counts camera ticks/sec
+        self._game_fps_info = self.esp.start_fps_tracker()
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_overlay)
         self.timer.start(16)
@@ -2627,36 +2630,40 @@ class Overlay(QWidget):
         non_local = [p for p in all_players if not p["is_local"]]
         _draw_label(painter, 10, 20, f"Players: {len(non_local)}", QColor(255, 255, 255))
 
-        # Overlay FPS — always running at 60fps (timer never throttled).
-        # Label is "OVL: Xfps" to distinguish from the game's own FPS counter.
+        # FPS counters — overlay (timer-derived) + in-game (500 Hz camera tracker)
         overlay_fps = round(1000 / max(1, self.timer.interval()))
+        game_fps    = self._game_fps_info.get("game_fps", 0)
+
         if self._paint_throttle:
-            # Game process priority has been lowered; show which level is active.
-            if self._paint_throttle_quality >= 5:
-                paint_label = "PAINTING... (game: IDLE priority)"
-            else:
-                paint_label = "PAINTING... (game: -priority)"
-            _draw_label(painter, 10, 40, paint_label, QColor(255, 200, 80))
+            priority_label = "IDLE" if self._paint_throttle_quality >= 5 else "LOW"
+            _draw_label(painter, 10, 40,
+                        f"PAINTING... (game: {priority_label} priority)",
+                        QColor(255, 200, 80))
         else:
-            fps_color = (
+            ovl_color = (
                 QColor(100, 255, 140) if overlay_fps >= 45
                 else QColor(255, 220, 80) if overlay_fps >= 25
                 else QColor(255, 80, 80)
             )
-            _draw_label(painter, 10, 40, f"OVL: {overlay_fps}fps", fps_color)
+            game_color = (
+                QColor(100, 255, 140) if game_fps >= 45
+                else QColor(255, 220, 80) if game_fps >= 25
+                else QColor(255, 80, 80)
+            ) if game_fps > 0 else QColor(150, 150, 150)
 
-        # Camouflage status — always show (y=60, below FPS)
+            _draw_label(painter, 10, 40, f"OVL: {overlay_fps}fps", ovl_color)
+            game_label = f"GAME: {game_fps}fps" if game_fps > 0 else "GAME: --"
+            _draw_label(painter, 10, 57, game_label, game_color)
+
+        # Camouflage status — y=74, below both FPS lines
         if self._camo_feedback_count > 0 and self._camo_feedback:
-            # Brief post-F10 feedback (SAMPLING / SAMPLE FAIL / NO PAWN FOUND / CAMO BLEND / etc.)
             self._camo_feedback_count -= 1
             fg = QColor(*self._camouflage_color) if (self._camouflage_active and self._camouflage_color) else QColor(200, 200, 200)
-            _draw_label(painter, 10, 60, self._camo_feedback, fg)
+            _draw_label(painter, 10, 74, self._camo_feedback, fg)
         elif self._camouflage_active and self._camouflage_color:
-            # Steady state: camo is ON
-            _draw_label(painter, 10, 60, "CAMO ON (3D)", QColor(*self._camouflage_color))
+            _draw_label(painter, 10, 74, "CAMO ON (3D)", QColor(*self._camouflage_color))
         elif self.config.camouflage_enabled:
-            # Steady state: camo is OFF
-            _draw_label(painter, 10, 60, "CAMO OFF (F10)", QColor(150, 150, 150))
+            _draw_label(painter, 10, 74, "CAMO OFF (F10)", QColor(150, 150, 150))
 
         # Aimbot
         if self.config.aimbot_enabled:
