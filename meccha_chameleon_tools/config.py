@@ -104,12 +104,16 @@ def config_to_dict(config: Config) -> dict:
 
 
 def config_from_dict(d: dict) -> Config:
+    import dataclasses
     for key in _COLOR_KEYS:
         if key in d and isinstance(d[key], list):
             d[key] = tuple(d[key])
     # Flatten bone_indices if stored as list of pairs
     if "bone_indices" in d and isinstance(d["bone_indices"], list):
         d["bone_indices"] = {k: v for k, v in d["bone_indices"]}
+    # Strip unknown keys so stale JSON fields never crash the dataclass constructor.
+    valid = {f.name for f in dataclasses.fields(Config)}
+    d = {k: v for k, v in d.items() if k in valid}
     return Config(**d)
 
 

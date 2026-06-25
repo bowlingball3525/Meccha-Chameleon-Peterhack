@@ -3632,6 +3632,79 @@ class MecchaESP:
         del pawn, screen_w, screen_h
         return None
 
+    def _calibrate_body_uv_vertical(self, pawn):
+        """
+        Pre-freeze hit-test that finds the actual UV v-coordinates for the
+        character's head and feet by sampling the top and bottom of the on-screen
+        bounding box.
+
+        Returns (v_head, v_feet, u_front) or None if the hit-tests fail.
+
+        The caller uses these in _build_front_back_image_uv_points so that:
+            fv_img = (v - v_head) / (v_feet - v_head)
+        correctly maps image_top→head and image_bottom→feet regardless of
+        whether the paint atlas has v=0 at the top or the bottom.
+
+        MUST be called BEFORE _game_frozen — hit-testing outside the freeze is
+        safe and does not corrupt the pawn.
+        """
+        world = self._get_world()
+        pc = self._get_local_controller(world)
+        cam = self.get_camera()
+        comp = self._get_runtime_paint_component(pawn)
+        mesh, _ = self._get_paint_mesh(pawn, comp)
+        if not cam or not pc or not comp or not mesh:
+            print("[PAINT] UV vertical calib skipped (missing context)")
+            return None
+
+        sw, sh = self.get_viewport_size()
+        if not sw or not sh:
+            return None
+
+        bbox = self.project_body_screen_bbox(pawn, cam, sw, sh)
+        if not bbox:
+            print("[PAINT] UV vertical calib skipped (body off screen)")
+            return None
+
+        x0, y0, x1, y1 = bbox
+        cx = (x0 + x1) * 0.5
+        bh = max(8.0, y1 - y0)
+        # Sample 6% inside top and bottom edges to stay on the body (not air above/below).
+        py_head = y0 + bh * 0.06
+        py_cent = (y0 + y1) * 0.5
+        py_feet = y1 - bh * 0.06
+
+        def _ht(sx, sy):
+            ok, u, v = self._hit_test_at_screen(comp, mesh, pc, sx, sy)
+            if not ok:
+                return None
+            import math as _m
+            if not (_m.isfinite(u) and _m.isfinite(v)):
+                return None
+            return u, v
+
+        hr = _ht(cx, py_head)
+        hc = _ht(cx, py_cent)
+        hf = _ht(cx, py_feet)
+
+        if hr is None or hf is None:
+            print("[PAINT] UV vertical calib: head/feet hit-test failed — using defaults")
+            return None
+
+        v_head = hr[1]
+        v_feet = hf[1]
+        u_front = hc[0] if hc else self.PAINT_FRONT_U
+
+        if abs(v_feet - v_head) < 0.05:
+            print("[PAINT] UV vertical calib: degenerate result — using defaults")
+            return None
+
+        print(
+            f"[PAINT] UV vertical calib OK  v_head={v_head:.3f}  v_feet={v_feet:.3f}"
+            f"  u_front={u_front:.3f}  (range={abs(v_feet - v_head):.3f})"
+        )
+        return v_head, v_feet, u_front
+
     def _resolve_image_paint_layout(
         self, pawn, img_aspect, screen_w=0, screen_h=0, img_w=0, img_h=0,
         torso_cal=None,
@@ -3775,16 +3848,22 @@ class MecchaESP:
 
     def _build_front_back_image_uv_points(
         self, bgra_bytes, resolution, grid, opacity, layout=None, img_aspect=1.0,
-        wrap_mode="projector",
+        wrap_mode="projector", v_head=None, v_feet=None,
     ):
         """
         Map the source image onto the character's UV atlas as a single
         continuous wrap (no duplicate copies on front and back).
 
         Paint-sphere UV convention:
-          v=0 → TOP of body (neck/collar)   v=1 → BOTTOM (feet)
           u∈[0,0.5)  front hemisphere        u∈[0.5,1]  back hemisphere
           u=0.25     chest centre            u=0.75     spine centre
+
+        v_head / v_feet are calibrated UV v-coordinates for the character's
+        head and feet obtained by pre-freeze camera hit-testing.  Using them:
+          fv_img = (v - v_head) / (v_feet - v_head)
+        correctly maps image_top→head and image_bottom→feet regardless of
+        which direction the atlas uses for v (0=head or 0=feet).
+        Falls back to full [0,1] range when not provided.
 
         wrap_mode="projector"  (front→back linear)
           fu_img = u
@@ -3792,15 +3871,11 @@ class MecchaESP:
           Chest centre     → fu=0.25
           Spine centre     → fu=0.75
           Image right edge → u=1  (same armpit seam)
-          Front shows image columns 0%–50%, back shows 50%–100%.
-          The seam is at the body side (least visible location).
 
         wrap_mode="centered"  (chest-centred outward)
           fu_img = (u + 0.25) % 1.0
           Image centre (50%) lands exactly on the chest (u=0.25).
           The seam (image edges meeting) is at the spine centre (u=0.75).
-          Front shows image columns 25%–75% (centre of image on chest),
-          back shows 75%–100% + 0%–25% (image edges meet at spine).
 
         img_aspect=1.0 bypasses letterbox correction — the canvas was already
         stretched to square with Qt.IgnoreAspectRatio so direct (u,v) sampling
@@ -3811,6 +3886,15 @@ class MecchaESP:
         border = self.PAINT_UV_BORDER
         points = []
         seen = set()
+
+        # Calibrated vertical range — maps atlas v to image fraction [0,1].
+        # (v_feet - v_head) is signed; the formula handles both v-directions.
+        _v_head = v_head if v_head is not None else 0.0
+        _v_feet = v_feet if v_feet is not None else 1.0
+        _v_range = _v_feet - _v_head  # signed
+        if abs(_v_range) < 0.05:     # degenerate — fall back to full range
+            _v_head = 0.0
+            _v_range = 1.0
 
         def add(u, v, rgb):
             if not rgb:
@@ -3828,13 +3912,16 @@ class MecchaESP:
 
             wrap_mode="projector": fu_img = u  (front→back linear).
             wrap_mode="centered":  fu_img = (u+0.25)%1  (chest-centred).
-            img_aspect=1.0 → sample the full stretched canvas without letterboxing.
+            fv_img uses calibrated v_head/v_feet so the image top always maps
+            to the character's head and the bottom to the feet, regardless of
+            the atlas v-direction.
             """
             if wrap_mode == "centered":
                 fu_img = (u + 0.25) % 1.0   # image centre on chest; seam at spine
             else:
                 fu_img = u                   # image starts at front-side, ends at back
-            fv_img = v   # v=0 → image top (subject head); v=1 → image bottom (feet)
+            fv_img = (v - _v_head) / _v_range
+            fv_img = max(0.0, min(1.0, fv_img))
             return self._sample_bgra_at_paint_frac(
                 bgra_bytes, resolution, fu_img, fv_img, opacity, 1.0,
             )
@@ -3854,9 +3941,14 @@ class MecchaESP:
             for v_b in (border, 1.0 - border):
                 add(frac, v_b, sample(frac, v_b))
 
+        cal_str = (
+            f"v_head={_v_head:.3f} v_feet={_v_head + _v_range:.3f}"
+            if (v_head is not None or v_feet is not None)
+            else "v=default[0,1]"
+        )
         print(
             f"[PAINT] wrap points={len(points)} grid={grid} "
-            f"mode={wrap_mode} orig-aspect={img_aspect:.2f}"
+            f"mode={wrap_mode} {cal_str} orig-aspect={img_aspect:.2f}"
         )
         return points
 
@@ -4221,9 +4313,17 @@ class MecchaESP:
         front_u, back_u, vc, hu, hv = layout
         paint_regions = self.PAINT_HEMI_RECTS
 
+        # Camera-based UV calibration (runs BEFORE freeze — safe to hit-test here).
+        # Finds the actual UV v-coordinates of the character's head and feet so
+        # the image maps correctly regardless of which direction v runs in the atlas.
+        uv_cal = self._calibrate_body_uv_vertical(pawn)
+        v_head_cal = uv_cal[0] if uv_cal else None
+        v_feet_cal = uv_cal[1] if uv_cal else None
+
         uv_points = self._build_front_back_image_uv_points(
             bgra_bytes, resolution, grid, opacity,
             layout=layout, img_aspect=img_aspect, wrap_mode=wrap_mode,
+            v_head=v_head_cal, v_feet=v_feet_cal,
         )
         if not uv_points:
             print("[PAINT] no opaque pixels in image")

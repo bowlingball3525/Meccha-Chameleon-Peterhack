@@ -848,12 +848,13 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
 
-        self.cb_camo = self._chk("Camouflage Enabled (WIP - In Progress)","camouflage_enabled")
+        self.cb_camo = self._chk("Camouflage Enabled", "camouflage_enabled")
         lo.addWidget(self.cb_camo)
 
-        lbl = QLabel("Press F10 to sample and apply camouflage (WIP)")
-        lbl.setStyleSheet("color: #7a9a6a; font-size: 10px; padding: 4px 0;")
-        lo.addWidget(lbl)
+        btn_camo = QPushButton("Apply Camouflage")
+        btn_camo.setToolTip("Sample environment colours and paint them onto your character (also F10).")
+        btn_camo.clicked.connect(self._toggle_camouflage)
+        lo.addWidget(btn_camo)
 
         # ── Camo quality slider ───────────────────────────────────────────────
         _QLABELS = {1: "Draft", 2: "Low", 3: "Medium", 4: "High", 5: "Ultra"}
@@ -920,7 +921,7 @@ class Menu(QWidget):
         img_row.addWidget(btn_browse)
         lo.addLayout(img_row)
 
-        btn_apply_img = QPushButton("Apply Image to Character (Front + Back)")
+        btn_apply_img = QPushButton("Apply image to character")
         btn_apply_img.setToolTip(
             "Face your character toward the camera (3rd person) for best placement."
         )
@@ -969,12 +970,10 @@ class Menu(QWidget):
             "Projector: image starts at the front side and wraps to the back.\n"
             "Centered:  image centre sits on the chest; top→head, bottom→feet."
         )
-        self.cmb_wrap_mode.currentIndexChanged.connect(
-            lambda i: setattr(
-                self.config, "image_wrap_mode",
-                self.cmb_wrap_mode.itemData(i),
-            )
-        )
+        def _on_wrap_mode_change(i):
+            setattr(self.config, "image_wrap_mode", self.cmb_wrap_mode.itemData(i))
+            save_config(self.config)
+        self.cmb_wrap_mode.currentIndexChanged.connect(_on_wrap_mode_change)
         wrap_row.addWidget(self.cmb_wrap_mode, 1)
         lo.addLayout(wrap_row)
 
@@ -1161,6 +1160,27 @@ class Menu(QWidget):
             "=== Peterhack Changelog ===\n"
             "\n"
             "--- Jun 25, 2026 (latest) ---\n"
+            "\n"
+            "[Image Paint]\n"
+            "  + Camera-based UV calibration: before painting, Peterhack\n"
+            "    hit-tests the character model from the current camera view to\n"
+            "    find the actual UV v-coordinates of the head and feet.\n"
+            "    The image is then mapped so the top always reaches the head\n"
+            "    and the bottom always reaches the feet — no more flipped or\n"
+            "    off-center painting regardless of wrap mode.\n"
+            "  + 'Apply image to character' button renamed.\n"
+            "  + Wrap mode selection now auto-saves to config immediately.\n"
+            "\n"
+            "[Camouflage]\n"
+            "  + 'Apply Camouflage' button added — no longer F10-only.\n"
+            "\n"
+            "--- Jun 24, 2026 ---\n"
+            "\n"
+            "[FPS]\n"
+            "  + In-game FPS counter added via 500 Hz camera-tick tracker.\n"
+            "  + Top-left overlay now shows OVL (overlay) and GAME fps separately.\n"
+            "\n"
+            "--- Jun 23, 2026 ---\n"
             "\n"
             "[Image Paint]\n"
             "  + Wrap mode dropdown — choose how the image is projected onto\n"
