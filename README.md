@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://cdn.discordapp.com/attachments/1256685923303686305/1519729769141375057/peter-crackhead-animation-018idlepic4x.png?ex=6a3e9e24&is=6a3d4ca4&hm=c0566c7c25dd14faac8d55d66260dabc05b8717cec98a9714722f18936f40e1c&" alt="Peterhack Logo" width="200"/>
+</p>
+
 # Meccha Chameleon — Peterhack
 
 A heavily modified ESP and character-paint tool for **MECCHA CHAMELEON** (UE5.6).
