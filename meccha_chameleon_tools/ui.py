@@ -318,29 +318,64 @@ def draw_radar(painter, cam, local_pos, players, radar_cx, radar_cy, radar_size,
 
 
 # ---------------------------------------------------------------------------
-# Quality preset table
+# Quality preset tables
 # ---------------------------------------------------------------------------
-# Maps the 1-5 paint_quality slider value to:
-#   (camo_sample_size, camo_quality_samples, image_grid)
-# Low values = fewer stamps = faster but rougher.
-# High values = more stamps = slower but sharp/detailed.
-_QUALITY_TABLE = {
-    1: (16,  1,  64),   # Draft  — very fast, blocky
-    2: (24,  1,  96),   # Low    — quick, noticeable pixels
-    3: (32,  2, 128),   # Medium — balanced default
-    4: (48,  2, 192),   # High   — detailed, moderately slow
-    5: (64,  3, 256),   # Ultra  — sharpest, slowest
+
+# Image quality (1-5) — controls UV stamp grid for Apply Image.
+_IMAGE_QUALITY_TABLE = {
+    1: 64,    # Draft  — fastest, blocky
+    2: 96,    # Low
+    3: 128,   # Medium — default
+    4: 192,   # High
+    5: 256,   # Ultra  — sharpest
+}
+
+# Camo quality (1-20) — controls UV grid density and sub-sample count.
+# (camo_sample_size G, camo_quality q)
+#   UV stamps painted on body = G * G
+#   Screen pixels sampled per stamp = q * q
+# Higher level = finer colour resolution = more indistinguishable from environment.
+_CAMO_QUALITY_TABLE = {
+    1:  (8,   1),   # Draft      —    64 stamps
+    2:  (12,  1),   # Draft+     —   144 stamps
+    3:  (16,  1),   # Draft++    —   256 stamps
+    4:  (20,  1),   # Low-       —   400 stamps
+    5:  (24,  1),   # Low        —   576 stamps
+    6:  (32,  2),   # Low+       — 1,024 stamps / 4 sub-samples
+    7:  (40,  2),   # Medium-    — 1,600 stamps
+    8:  (48,  2),   # Medium     — 2,304 stamps
+    9:  (56,  2),   # Medium+    — 3,136 stamps
+    10: (64,  3),   # High-      — 4,096 stamps / 9 sub-samples
+    11: (80,  3),   # High       — 6,400 stamps
+    12: (96,  3),   # High+      — 9,216 stamps
+    13: (112, 4),   # Ultra-     — 12,544 stamps / 16 sub-samples
+    14: (128, 4),   # Ultra      — 16,384 stamps
+    15: (160, 4),   # Ultra+     — 25,600 stamps
+    16: (192, 5),   # Max-       — 36,864 stamps / 25 sub-samples
+    17: (224, 5),   # Max        — 50,176 stamps
+    18: (256, 6),   # Max+       — 65,536 stamps / 36 sub-samples
+    19: (384, 7),   # Extreme    — 147,456 stamps / 49 sub-samples
+    20: (512, 8),   # God Mode   — 262,144 stamps / 64 sub-samples (photo-realistic)
+}
+
+_CAMO_QLABELS = {
+    1: "Draft", 2: "Draft+", 3: "Draft++",
+    4: "Low-",  5: "Low",    6: "Low+",
+    7: "Medium-", 8: "Medium", 9: "Medium+",
+    10: "High-",  11: "High",  12: "High+",
+    13: "Ultra-", 14: "Ultra", 15: "Ultra+",
+    16: "Max-",   17: "Max",   18: "Max+",
+    19: "Extreme", 20: "God Mode",
 }
 
 def _quality_to_camo_settings(level: int):
-    """Return (camo_sample_size, camo_quality) for the given quality level."""
-    row = _QUALITY_TABLE.get(max(1, min(5, int(level))), _QUALITY_TABLE[3])
+    """Return (camo_sample_size, camo_quality) for the given quality level (1-20)."""
+    row = _CAMO_QUALITY_TABLE.get(max(1, min(20, int(level))), _CAMO_QUALITY_TABLE[8])
     return row[0], row[1]
 
 def _quality_to_image_grid(level: int) -> int:
-    """Return the image stamp grid size for the given quality level."""
-    row = _QUALITY_TABLE.get(max(1, min(5, int(level))), _QUALITY_TABLE[3])
-    return row[2]
+    """Return the image stamp grid size for the given quality level (1-5)."""
+    return _IMAGE_QUALITY_TABLE.get(max(1, min(5, int(level))), _IMAGE_QUALITY_TABLE[3])
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +431,7 @@ class Menu(QWidget):
         super().__init__()
         self.config = config
         self.esp = esp
-        self.setWindowTitle("Peterhack")
+        self.setWindowTitle("Peterhack | Meccha Chameleon")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._drag_pos = None
@@ -413,7 +448,7 @@ class Menu(QWidget):
         self._hotkeys_native = False
         # Seed legacy camo fields from the camo quality level on startup.
         _camo_sz, _camo_q = _quality_to_camo_settings(
-            getattr(self.config, "paint_quality", 3)
+            max(1, min(20, getattr(self.config, "paint_quality", 8)))
         )
         self.config.camouflage_sample_size = _camo_sz
         self.config.camouflage_quality     = _camo_q
@@ -571,22 +606,47 @@ class Menu(QWidget):
         outer.setSpacing(8)
 
         # ── Header: title left, Peter logo right ─────────────────────────────
+        LOGO_SIZE = 88   # logo is square; title block matches this height exactly
+
         header = QHBoxLayout()
         header.setSpacing(8)
         header.setContentsMargins(0, 0, 0, 0)
 
-        title = QLabel("Peterhack")
-        title.setObjectName("titleLbl")
-        title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        title.setFixedHeight(40)
-        title.setStyleSheet(
-            f"font-size: 14px; font-weight: bold; color: {self.PETER_GREEN_LIGHT}; letter-spacing: 0.5px;"
+        # Title block — two-line stacked label, same height as the logo so the
+        # header row sits flush on both sides.
+        title_widget = QWidget()
+        title_widget.setFixedHeight(LOGO_SIZE)
+        title_layout = QVBoxLayout(title_widget)
+        title_layout.setContentsMargins(4, 0, 4, 0)
+        title_layout.setSpacing(2)
+        title_layout.setAlignment(Qt.AlignVCenter)
+
+        lbl_main = QLabel("Peterhack")
+        lbl_main.setObjectName("titleLbl")
+        lbl_main.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        lbl_main.setStyleSheet(
+            f"font-size: 20px; font-weight: bold; color: {self.PETER_GREEN_LIGHT};"
+            " letter-spacing: 1px; border: none; background: transparent;"
         )
-        header.addWidget(title, 1)
+
+        lbl_sub = QLabel("Meccha Chameleon")
+        lbl_sub.setObjectName("subtitleLbl")
+        lbl_sub.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        lbl_sub.setStyleSheet(
+            "font-size: 11px; font-weight: normal; color: #7a9a6a;"
+            " letter-spacing: 0.5px; border: none; background: transparent;"
+        )
+
+        title_layout.addStretch(1)
+        title_layout.addWidget(lbl_main)
+        title_layout.addWidget(lbl_sub)
+        title_layout.addStretch(1)
+
+        header.addWidget(title_widget, 1)
 
         # Peter Griffin logo (top-right) — fetched from URL in a background thread.
         peter_lbl = QLabel()
-        peter_lbl.setFixedSize(88, 88)
+        peter_lbl.setFixedSize(LOGO_SIZE, LOGO_SIZE)
         peter_lbl.setAlignment(Qt.AlignCenter)
         peter_lbl.setScaledContents(True)
         self._peter_lbl = peter_lbl   # keep reference for async update
@@ -681,8 +741,6 @@ class Menu(QWidget):
         lo = QVBoxLayout(p)
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
-        self.cb_enabled = self._chk("ESP Enabled","enabled")
-        lo.addWidget(self.cb_enabled)
         row = QHBoxLayout()
         row.setSpacing(6)
         self.cb_dot = self._chk("Dot","dot_esp")
@@ -853,35 +911,38 @@ class Menu(QWidget):
 
         btn_camo = QPushButton("Apply Camouflage")
         btn_camo.setToolTip("Sample environment colours and paint them onto your character (also F10).")
-        btn_camo.clicked.connect(self._toggle_camouflage)
+        btn_camo.clicked.connect(
+            lambda: self._overlay._toggle_camouflage() if self._overlay else None
+        )
         lo.addWidget(btn_camo)
 
-        # ── Camo quality slider ───────────────────────────────────────────────
-        _QLABELS = {1: "Draft", 2: "Low", 3: "Medium", 4: "High", 5: "Ultra"}
+        # ── Camo quality slider (1-20) ────────────────────────────────────────
         camo_q_row = QHBoxLayout()
         camo_q_row.addWidget(QLabel("Camo quality:"))
         self.sld_paint_quality = QSlider(Qt.Horizontal)
-        self.sld_paint_quality.setRange(1, 5)
-        self.sld_paint_quality.setValue(getattr(self.config, "paint_quality", 3))
+        self.sld_paint_quality.setRange(1, 20)
+        _camo_q_init = max(1, min(20, getattr(self.config, "paint_quality", 8)))
+        self.sld_paint_quality.setValue(_camo_q_init)
         self.sld_paint_quality.setTickPosition(QSlider.TicksBelow)
         self.sld_paint_quality.setTickInterval(1)
         self.sld_paint_quality.setToolTip(
-            "F10 Camo only — 1=Draft (fastest) to 5=Ultra (slowest, most detailed)."
+            "Camo quality 1-20.\n"
+            "1 = Draft (fastest, blocky)  |  10 = High  |  20 = God Mode (photo-realistic, slowest).\n"
+            "Levels 15+ paint 25,000+ UV stamps for near-perfect environment matching."
         )
         camo_q_row.addWidget(self.sld_paint_quality)
         self.lbl_paint_quality = QLabel(
-            f"{_QLABELS.get(self.sld_paint_quality.value(), '')} "
-            f"({self.sld_paint_quality.value()})"
+            f"{_CAMO_QLABELS.get(_camo_q_init, str(_camo_q_init))} ({_camo_q_init})"
         )
         self.lbl_paint_quality.setStyleSheet(
-            "color: #eee; font-size: 11px; min-width: 80px;"
+            "color: #eee; font-size: 11px; min-width: 90px;"
         )
         def _on_camo_quality_change(v):
             setattr(self.config, "paint_quality", v)
             _camo_size, _camo_qual = _quality_to_camo_settings(v)
             self.config.camouflage_sample_size = _camo_size
             self.config.camouflage_quality     = _camo_qual
-            self.lbl_paint_quality.setText(f"{_QLABELS.get(v, '')} ({v})")
+            self.lbl_paint_quality.setText(f"{_CAMO_QLABELS.get(v, str(v))} ({v})")
         self.sld_paint_quality.valueChanged.connect(_on_camo_quality_change)
         camo_q_row.addWidget(self.lbl_paint_quality)
         lo.addLayout(camo_q_row)
@@ -929,6 +990,7 @@ class Menu(QWidget):
         lo.addWidget(btn_apply_img)
 
         # ── Image quality slider ──────────────────────────────────────────────
+        _IMG_QLABELS = {1: "Draft", 2: "Low", 3: "Medium", 4: "High", 5: "Ultra"}
         img_q_row = QHBoxLayout()
         img_q_row.addWidget(QLabel("Image quality:"))
         self.sld_image_quality = QSlider(Qt.Horizontal)
@@ -941,7 +1003,7 @@ class Menu(QWidget):
         )
         img_q_row.addWidget(self.sld_image_quality)
         self.lbl_image_quality = QLabel(
-            f"{_QLABELS.get(self.sld_image_quality.value(), '')} "
+            f"{_IMG_QLABELS.get(self.sld_image_quality.value(), '')} "
             f"({self.sld_image_quality.value()})"
         )
         self.lbl_image_quality.setStyleSheet(
@@ -949,7 +1011,7 @@ class Menu(QWidget):
         )
         def _on_image_quality_change(v):
             setattr(self.config, "image_quality", v)
-            self.lbl_image_quality.setText(f"{_QLABELS.get(v, '')} ({v})")
+            self.lbl_image_quality.setText(f"{_IMG_QLABELS.get(v, '')} ({v})")
         self.sld_image_quality.valueChanged.connect(_on_image_quality_change)
         img_q_row.addWidget(self.lbl_image_quality)
         lo.addLayout(img_q_row)
@@ -1161,6 +1223,15 @@ class Menu(QWidget):
             "\n"
             "--- Jun 25, 2026 (latest) ---\n"
             "\n"
+            "[Paint Presets]\n"
+            "  + Fixed crash when saving a paint preset.  The export function\n"
+            "    (ExportChannelToBytes) internally dispatches to render/job threads;\n"
+            "    wrapping it in a game-freeze deadlocked those threads and caused a\n"
+            "    WAIT_TIMEOUT crash.  The export now runs while the game is live —\n"
+            "    no freeze needed.  The in-memory image cache (written immediately\n"
+            "    when paint_image_bgra succeeds) covers the fast path so the export\n"
+            "    fallback is only reached on session restart or camo-only sessions.\n"
+            "\n"
             "[Image Paint]\n"
             "  + Camera-based UV calibration: before painting, Peterhack\n"
             "    hit-tests the character model from the current camera view to\n"
@@ -1173,6 +1244,15 @@ class Menu(QWidget):
             "\n"
             "[Camouflage]\n"
             "  + 'Apply Camouflage' button added — no longer F10-only.\n"
+            "  + Camo quality expanded to 1-20 (was 1-5) for truly\n"
+            "    indistinguishable environment blending:\n"
+            "      1  = Draft    (64 UV stamps — fastest)\n"
+            "      8  = Medium   (2,304 stamps — default)\n"
+            "      10 = High-    (4,096 stamps / 9 sub-samples)\n"
+            "      14 = Ultra    (16,384 stamps / 16 sub-samples)\n"
+            "      17 = Max      (50,176 stamps / 25 sub-samples)\n"
+            "      20 = God Mode (262,144 stamps / 64 sub-samples,\n"
+            "                     photo-realistic — takes a few seconds)\n"
             "\n"
             "--- Jun 24, 2026 ---\n"
             "\n"
@@ -1795,8 +1875,7 @@ class Overlay(QWidget):
 
         self._camo_feedback = "SAMPLING..."
         self._camo_feedback_count = 15
-        # Throttle overlay during sampling + paint; quality 5 keeps a 15-fps floor.
-        camo_q = getattr(self.menu.config, "paint_quality", 3) if self.menu else 3
+        camo_q = max(1, min(20, getattr(self.menu.config, "paint_quality", 8) if self.menu else 8))
         self.set_paint_throttle(True, quality=camo_q)
 
         try:
@@ -1832,7 +1911,7 @@ class Overlay(QWidget):
             local_pawn, pattern,
             brush_opacity=self.config.camouflage_opacity / 255.0,
             brush_hardness=0.42,
-            fast_paint=(camo_q >= 5),
+            fast_paint=(camo_q >= 6),  # fast batches from Low+ upward
         )
         self.set_paint_throttle(False)
         if ok:
@@ -2176,52 +2255,24 @@ class Overlay(QWidget):
         bcx   = (ib_x0 + ib_x1) * 0.5
         bcy   = (ib_y0 + ib_y1) * 0.5
 
-        # ── Identify the body's current colour (to exclude it) ───────────────
-        # Sample a cross pattern inside the body silhouette.
-        _bsamps = []
-        for dx, dy in ((0,0), (-bw*0.12,0), (bw*0.12,0), (0,-bh*0.08), (0,bh*0.08)):
-            c = sample_block(int(bcx + dx), int(bcy + dy))
-            if c:
-                _bsamps.append(c)
-        body_col = _bsamps[0] if _bsamps else (140, 110, 140)
-
-        # Per-channel median of body samples (more robust than single sample).
-        if len(_bsamps) > 1:
-            body_col = (
-                sorted(_bsamps, key=lambda c: c[0])[len(_bsamps)//2][0],
-                sorted(_bsamps, key=lambda c: c[1])[len(_bsamps)//2][1],
-                sorted(_bsamps, key=lambda c: c[2])[len(_bsamps)//2][2],
-            )
-
-        BODY_TOL = 45   # sum-abs tolerance (≈15 per channel)
-
-        def is_body(c):
-            return c is not None and (
-                abs(c[0]-body_col[0]) + abs(c[1]-body_col[1]) + abs(c[2]-body_col[2])
-            ) < BODY_TOL
-
-        def is_rejected(c):
-            return c is None or is_body(c) or self._is_esp_pixel(c)
-
-        # ── Halo background analysis ─────────────────────────────────────────
-        # Sample only the narrow halo ring (NOT the full capture area) so our
-        # "scene colour" estimate comes from what's immediately around the body.
+        # ── Halo background analysis (used only as last-resort fallback) ────────
+        # Sample the halo ring for a representative background colour.
+        # We do NOT use this for body-colour detection because the character's
+        # body is painted with a multi-colour image — any single-colour threshold
+        # would mistake painted body pixels for background.
         _halo_samples = []
-        # Top/bottom strips
         for hx in range(0, rw, 2):
             for hy in list(range(0, ib_y0)) + list(range(ib_y1, rh)):
                 c = sample_block(hx, hy)
-                if c and not is_rejected(c):
+                if c and not self._is_esp_pixel(c):
                     _halo_samples.append(c)
-        # Left/right strips (body rows only)
         for hy in range(ib_y0, ib_y1, 2):
             for hx in list(range(0, ib_x0)) + list(range(ib_x1, rw)):
                 c = sample_block(hx, hy)
-                if c and not is_rejected(c):
+                if c and not self._is_esp_pixel(c):
                     _halo_samples.append(c)
 
         if _halo_samples:
-            # Median (central half) to ignore outliers
             _halo_samples.sort(key=lambda c: c[0] + c[1] + c[2])
             _q1 = len(_halo_samples) // 4
             _q3 = 3 * len(_halo_samples) // 4
@@ -2231,58 +2282,68 @@ class Overlay(QWidget):
                 sum(c[1] for c in _mid) // len(_mid),
                 sum(c[2] for c in _mid) // len(_mid),
             )
-            _avg = [sum(c[k] for c in _halo_samples)/len(_halo_samples) for k in range(3)]
-            _var = sum((c[k]-_avg[k])**2 for c in _halo_samples for k in range(3)) / len(_halo_samples)
-            bg_uniform = _var < 1800   # low variance → solid wall/floor
         else:
-            median_bg  = body_col
-            bg_uniform = True
-        print(f"[CAMO-SS] body={body_col} median_bg={median_bg} "
-              f"uniform={bg_uniform} halo_samples={len(_halo_samples)}", flush=True)
+            median_bg = (128, 128, 128)
+        print(f"[CAMO-SS] median_bg={median_bg} halo_samples={len(_halo_samples)}", flush=True)
 
         # ── Directed background lookup ────────────────────────────────────────
-        # For each body UV cell, walk toward the NEAREST BODY EDGE first so we
-        # pick up the background colour that would be visible through that part
-        # of the character (upper body → sky, lower body → ground, sides → env).
+        # For each body UV cell, walk toward the nearest bbox edge and sample
+        # the first pixels found OUTSIDE the body bounding box.
+        #
+        # KEY DESIGN CHOICE: body detection is PURELY GEOMETRIC (bbox-based).
+        # Color-based body detection breaks when the character is painted with a
+        # multi-colour image — painted reds/yellows/greens all look like valid
+        # background colours to a single-colour threshold.  Using the bbox avoids
+        # this entirely: head area walks UP → finds sign/sky; feet walk DOWN →
+        # find floor; sides walk LEFT/RIGHT → find environment walls/objects.
 
         def nearest_bg(lx, ly):
             """
-            Directed edge walk: walk toward the closest side of the body
-            bounding box, then continue into the background beyond it.
-            This ensures each body part gets the environment colour visible
-            at that screen position, not just whatever happens to be closest.
-            """
-            # Direct hit: if this pixel is already background, use it.
-            c0 = sample_block(lx, ly)
-            if c0 and not is_rejected(c0):
-                return c0
+            Walk outward from the character body bbox to find background colour.
 
-            # Normalised position within the body bounding box [0,1].
+            Walks toward the nearest bbox edge first so each body region gets
+            the environment colour visible from that direction:
+              head (rel_y ≈ 0) → walks UP  → samples sign / sky
+              feet (rel_y ≈ 1) → walks DOWN → samples floor / ground
+              sides             → walks L/R → samples surrounding objects
+            """
             bw_px = max(1, ib_x1 - ib_x0)
             bh_px = max(1, ib_y1 - ib_y0)
-            rel_x = (lx - ib_x0) / bw_px   # 0=left edge, 1=right edge
-            rel_y = (ly - ib_y0) / bh_px   # 0=top  edge, 1=bottom edge
+            rel_x = max(0.0, min(1.0, (lx - ib_x0) / bw_px))
+            rel_y = max(0.0, min(1.0, (ly - ib_y0) / bh_px))
 
-            # Build four cardinal directions sorted so the nearest body edge
-            # is tried first (gives most accurate "see-through" colour).
             dir_candidates = sorted([
-                (rel_x,       -1,  0),   # toward left edge
+                (rel_x,       -1,  0),   # toward left  edge
                 (1.0 - rel_x,  1,  0),   # toward right edge
-                (rel_y,        0, -1),   # toward top edge
-                (1.0 - rel_y,  0,  1),   # toward bottom edge
+                (rel_y,        0, -1),   # toward top   edge (head → up)
+                (1.0 - rel_y,  0,  1),   # toward bottom edge (feet → down)
             ], key=lambda d: d[0])
 
             for _, dx, dy in dir_candidates:
+                samples = []
+                in_body = True
                 for k in range(1, MAX_WALK_PX + 1):
-                    sx, sy = int(lx + dx * k), int(ly + dy * k)
+                    sx = int(lx + dx * k)
+                    sy = int(ly + dy * k)
                     if not (0 <= sx < rw and 0 <= sy < rh):
                         break
-                    c = px(sx, sy)
-                    if c and not is_rejected(c):
-                        fc = sample_block(sx, sy)
-                        if fc and not is_rejected(fc):
-                            return fc
-                        break   # body pixel in this direction — try next dir
+                    # Transition: detect the moment we leave the body bbox
+                    if in_body:
+                        still_in = (ib_x0 <= sx <= ib_x1 and ib_y0 <= sy <= ib_y1)
+                        if not still_in:
+                            in_body = False
+                    # Once outside the body bbox, collect background pixels
+                    if not in_body:
+                        c = px(sx, sy)
+                        if c and not self._is_esp_pixel(c):
+                            samples.append(c)
+                            if len(samples) >= 5:
+                                break
+                if samples:
+                    r = sum(c[0] for c in samples) // len(samples)
+                    g = sum(c[1] for c in samples) // len(samples)
+                    b = sum(c[2] for c in samples) // len(samples)
+                    return (r, g, b)
 
             return median_bg
 
@@ -2329,7 +2390,7 @@ class Overlay(QWidget):
                     add_point_col(frac, edge, col)
 
         print(f"[CAMO-SS] points={len(points)} G={G} quality={quality} "
-              f"body={body_col} bg={median_bg}", flush=True)
+              f"bg={median_bg}", flush=True)
         if len(points) < 4:
             print("[CAMO-SS] too few points", flush=True)
             return None
@@ -2465,11 +2526,6 @@ class Overlay(QWidget):
             painter.setPen(QPen(fg_color))
             painter.drawText(x, y, text)
             painter.restore()
-
-        if not self.config.enabled:
-            painter.setPen(QPen(QColor(255, 255, 255)))
-            painter.drawText(10, 20, "ESP OFF")
-            return
 
         cam = self.esp.get_camera()
         # During free-cam / transitions get_camera may fail briefly.

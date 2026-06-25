@@ -3252,13 +3252,30 @@ class MecchaESP:
         if not blob:
             pawn = pawn or self._get_local_pawn()
             if pawn:
+                # Run the export WITHOUT a freeze — ExportChannelToBytes internally
+                # dispatches to render/job threads.  Freezing would deadlock those
+                # threads and crash the game with a WAIT_TIMEOUT.
                 try:
-                    blob, resolution = self.export_paint_albedo(pawn)
+                    comp = self._get_runtime_paint_component(pawn)
+                    if comp:
+                        self._prepare_paint_component(comp)
+                        raw = self._call_export_channel_bytes(
+                            comp, self.EPaintChannel_Albedo
+                        )
+                        if raw:
+                            res_exp = self.get_albedo_resolution(comp)
+                            if len(raw) == res_exp * res_exp * 4:
+                                blob = bytes(raw)
+                                resolution = res_exp
+                                self._last_paint_bgra = blob
+                                self._last_paint_resolution = resolution
+                                print(f"[PAINT] saving exported paint ({len(blob)} bytes)")
+                            else:
+                                print(f"[PAINT] export size mismatch: {len(raw)} bytes, "
+                                      f"expected {res_exp * res_exp * 4}")
                 except Exception as e:
                     print(f"[PAINT] export failed during save: {e}")
                     blob = None
-                if blob:
-                    print(f"[PAINT] saving exported paint ({len(blob)} bytes)")
 
         if not blob:
             return False, (
@@ -4370,6 +4387,11 @@ class MecchaESP:
                 base_regions=paint_regions, comp=live_comp, fast_mode=fast_paint,
             )
             if ok:
+                # Cache the input image immediately so preset-save works even if
+                # the compose step below fails or the session restarts.
+                self._last_paint_bgra = bytes(bgra_bytes)
+                self._last_paint_resolution = resolution
+                self._last_paint_grid = grid
                 print("[PAINT] UV stamp path completed")
             else:
                 print("[PAINT] UV stamp path failed")
@@ -4378,8 +4400,9 @@ class MecchaESP:
             composed = self._compose_front_back_texture_fitted(
                 bgra_bytes, resolution, atlas_res, opacity, layout, img_aspect,
             )
-            self._last_paint_bgra = composed
-            self._last_paint_resolution = atlas_res
-            self._last_paint_grid = grid
+            if composed:
+                # Overwrite with the higher-quality composed atlas texture if available.
+                self._last_paint_bgra = composed
+                self._last_paint_resolution = atlas_res
             print(f"[PAINT] front/back apply done ({grid}×{grid} per side)")
         return ok
