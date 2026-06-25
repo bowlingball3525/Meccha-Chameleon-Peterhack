@@ -496,11 +496,8 @@ class Menu(QWidget):
     # Peter Griffin logo — async URL fetch
     # ------------------------------------------------------------------
     _PETER_URL = (
-        "https://cdn.discordapp.com/attachments/1010073921745326100/"
-        "1518628887402381312/"
-        "peter-crackhead-animation-018idlepic4x.png"
-        "?ex=6a3d3fdd&is=6a3bee5d"
-        "&hm=3497e819db39cc7c7511206b6c4fa676efc91147d83f2a3f6d10a3d6b2e0092f&"
+        "https://raw.githubusercontent.com/bowlingball3525/"
+        "Meccha-Chameleon-Peterhack/refs/heads/main/peter.png"
     )
 
     def _start_peter_logo_fetch(self):
