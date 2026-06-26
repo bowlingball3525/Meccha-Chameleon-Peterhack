@@ -4368,24 +4368,164 @@ class MecchaESP:
         return ok
 
     # ──────────────────────────────────────────────────────────────────────────
-    # UV Diagnostic: paint 4 colored quadrants so you can see UV→body mapping
+    # UV Diagnostic — multiple overlay modes for ongoing atlas calibration
     # ──────────────────────────────────────────────────────────────────────────
-    def paint_uv_diagnostic(self, progress_cb=None):
+    UV_DIAG_MODES = ("quadrants", "islands", "grid", "slices", "full")
+
+    # Distinct fill colours per paint island (front then back, matches PAINT_*_ISLANDS order).
+    UV_DIAG_ISLAND_COLORS = (
+        (255,  60, 200),   # F1 head
+        (  0, 200, 255),   # F2 chest
+        (255, 140,   0),   # F3 legs L
+        (160,  60, 255),   # F4 legs R
+        (255, 120, 150),   # B1 head L
+        (180, 255,   0),   # B2 head R
+        (100, 180, 255),   # B3 spine
+        (255, 210,   0),   # B4 back R
+        (255,  80,  80),   # B5 leg L upper
+        ( 80, 255, 120),   # B6 leg R upper
+        (255, 255, 255),   # B7 leg L lower
+        (  0, 230, 230),   # B8 leg R lower
+    )
+    UV_DIAG_SLICE_COLORS = (
+        (255,  50, 150),   # image head third
+        (  0, 180, 180),   # image torso third
+        (255, 120,   0),   # image legs third
+    )
+    UV_DIAG_QUAD_COLORS = (
+        (220,  40,  40),   # u0-0.5 v0-0.5  RED
+        ( 40, 200,  40),   # u0.5-1  v0-0.5  GREEN
+        ( 40,  80, 220),   # u0-0.5 v0.5-1  BLUE
+        (220, 200,   0),   # u0.5-1  v0.5-1  YELLOW
+    )
+
+    @staticmethod
+    def _diag_dim_color(rgb, factor=0.45):
+        return tuple(max(0, min(255, int(c * factor))) for c in rgb)
+
+    @classmethod
+    def _diag_fill_rect(cls, pts, u0, v0, u1, v1, color, seg=6):
+        for i in range(seg):
+            for j in range(seg):
+                u = u0 + (u1 - u0) * (i + 0.5) / seg
+                v = v0 + (v1 - v0) * (j + 0.5) / seg
+                pts.append((u, v, color))
+
+    @classmethod
+    def _diag_stroke_rect(cls, pts, u0, v0, u1, v1, color, steps=10):
+        for i in range(steps):
+            t = (i + 0.5) / steps
+            pts.append((u0 + t * (u1 - u0), v0, color))
+            pts.append((u0 + t * (u1 - u0), v1, color))
+            pts.append((u0, v0 + t * (v1 - v0), color))
+            pts.append((u1, v0 + t * (v1 - v0), color))
+
+    @classmethod
+    def _diag_cross(cls, pts, u, v, color, arm=0.05):
+        for du in (-arm, 0.0, arm):
+            pts.append((u + du, v, color))
+        for dv in (-arm, 0.0, arm):
+            pts.append((u, v + dv, color))
+
+    @classmethod
+    def _diag_grid_lines(cls, pts, values=(0.25, 0.5, 0.75), steps=14):
+        line_c = (255, 255, 255)
+        for val in values:
+            for i in range(steps):
+                t = (i + 0.5) / steps
+                pts.append((val, t, line_c))
+                pts.append((t, val, line_c))
+
+    @classmethod
+    def _diag_slice_color(cls, iy0, iy1):
+        mid = (iy0 + iy1) * 0.5
+        if mid < 0.40:
+            return cls.UV_DIAG_SLICE_COLORS[0]
+        if mid < 0.66:
+            return cls.UV_DIAG_SLICE_COLORS[1]
+        return cls.UV_DIAG_SLICE_COLORS[2]
+
+    def _build_uv_diagnostic_points(self, mode="full"):
+        """Build stamp list for the requested UV diagnostic overlay mode."""
+        mode = (mode or "full").lower()
+        if mode not in self.UV_DIAG_MODES:
+            mode = "full"
+        pts = []
+
+        if mode in ("quadrants", "full"):
+            quads = (
+                ((0.0, 0.5), (0.0, 0.5), self.UV_DIAG_QUAD_COLORS[0]),
+                ((0.5, 1.0), (0.0, 0.5), self.UV_DIAG_QUAD_COLORS[1]),
+                ((0.0, 0.5), (0.5, 1.0), self.UV_DIAG_QUAD_COLORS[2]),
+                ((0.5, 1.0), (0.5, 1.0), self.UV_DIAG_QUAD_COLORS[3]),
+            )
+            dim = mode == "full"
+            for (u0, u1), (v0, v1), color in quads:
+                c = self._diag_dim_color(color) if dim else color
+                self._diag_fill_rect(pts, u0, v0, u1, v1, c, seg=7 if dim else 8)
+
+        if mode == "grid":
+            grid_n = 12
+            for gy in range(grid_n):
+                for gx in range(grid_n):
+                    u = (gx + 0.5) / grid_n
+                    v = (gy + 0.5) / grid_n
+                    pts.append((
+                        u, v,
+                        (int(u * 255), int(v * 255), 128),
+                    ))
+            self._diag_grid_lines(pts)
+
+        if mode in ("islands", "slices", "full"):
+            all_islands = list(self.PAINT_FRONT_ISLANDS) + list(self.PAINT_BACK_ISLANDS)
+            names = (
+                "F-head", "F-chest", "F-legL", "F-legR",
+                "B-headL", "B-headR", "B-spine", "B-backR",
+                "B-legLu", "B-legRu", "B-legLl", "B-legRl",
+            )
+            for idx, island in enumerate(all_islands):
+                u0, v0, u1, v1, iy0, iy1 = island
+                if mode == "slices":
+                    color = self._diag_slice_color(iy0, iy1)
+                else:
+                    color = self.UV_DIAG_ISLAND_COLORS[idx % len(self.UV_DIAG_ISLAND_COLORS)]
+                self._diag_fill_rect(pts, u0, v0, u1, v1, color, seg=6)
+                self._diag_stroke_rect(pts, u0, v0, u1, v1, (255, 255, 255), steps=8)
+                uc = (u0 + u1) * 0.5
+                vc = (v0 + v1) * 0.5
+                self._diag_cross(pts, uc, vc, (0, 0, 0), arm=0.03)
+                label = names[idx] if idx < len(names) else f"I{idx}"
+                print(
+                    f"[DIAG] island {label}  "
+                    f"u=[{u0:.2f},{u1:.2f}] v=[{v0:.2f},{v1:.2f}] "
+                    f"img_y=[{iy0:.2f},{iy1:.2f}]"
+                )
+
+        if mode in ("quadrants", "full"):
+            self._diag_cross(pts, 0.25, 0.50, (255, 255, 255), arm=0.05)
+            self._diag_cross(pts, 0.75, 0.50, (0, 230, 230), arm=0.05)
+            self._diag_cross(pts, 0.50, 0.25, (255, 255, 0), arm=0.04)
+            self._diag_cross(pts, 0.50, 0.75, (255, 128, 0), arm=0.04)
+
+        if mode in ("full", "grid"):
+            self._diag_grid_lines(pts)
+
+        if mode == "slices":
+            self._diag_grid_lines(pts, values=(0.34, 0.68))
+
+        print(f"[DIAG] mode={mode} stamps={len(pts)}")
+        return pts
+
+    def paint_uv_diagnostic(self, mode="full", progress_cb=None):
         """
-        Paint a UV atlas diagnostic onto the character.
+        Paint a UV atlas diagnostic overlay onto the character.
 
-        The UV space [0,1]×[0,1] is split into 4 colored quadrants:
-          • TOP-LEFT   (u 0.0–0.5, v 0.0–0.5) → RED
-          • TOP-RIGHT  (u 0.5–1.0, v 0.0–0.5) → GREEN
-          • BOTTOM-LEFT  (u 0.0–0.5, v 0.5–1.0) → BLUE
-          • BOTTOM-RIGHT (u 0.5–1.0, v 0.5–1.0) → YELLOW
-
-        Markers:
-          • WHITE cross at u=0.25, v=0.5  (assumed front / chest centre)
-          • CYAN  cross at u=0.75, v=0.5  (assumed back / spine centre)
-
-        Take a screenshot of the front and back of your character and share it —
-        this tells us exactly which UV coordinate maps to which body part.
+        Modes (see uv_diag_mode in config):
+          quadrants — 4 coloured atlas quadrants + reference crosses
+          islands   — each centered-mode paint island in a unique colour
+          grid      — 12×12 UV grid (R=u, G=v) + reference lines
+          slices    — image head/torso/legs thirds shown on island rects
+          full      — dim quadrants + island fills + borders + grid (default)
         """
         pawn = self._find_local_pawn()
         if not pawn:
@@ -4397,49 +4537,29 @@ class MecchaESP:
             print("[DIAG] no paint component at pawn+0x0B68")
             return False
 
-        # Build coloured UV stamps (6×6 per quadrant)
-        SEG = 8
-        RADIUS = 0.08
+        mode = (mode or "full").lower()
+        if mode not in self.UV_DIAG_MODES:
+            mode = "full"
 
-        quads = [
-            ((0.0, 0.5), (0.0, 0.5), (220,  40,  40)),   # top-left    RED
-            ((0.5, 1.0), (0.0, 0.5), ( 40, 200,  40)),   # top-right   GREEN
-            ((0.0, 0.5), (0.5, 1.0), ( 40,  80, 220)),   # bottom-left BLUE
-            ((0.5, 1.0), (0.5, 1.0), (220, 200,   0)),   # bottom-right YELLOW
-        ]
-        pts = []
-        for (u0, u1), (v0, v1), color in quads:
-            for i in range(SEG):
-                for j in range(SEG):
-                    u = u0 + (u1 - u0) * (i + 0.5) / SEG
-                    v = v0 + (v1 - v0) * (j + 0.5) / SEG
-                    pts.append((u, v, color))
+        pts = self._build_uv_diagnostic_points(mode)
+        if not pts:
+            print("[DIAG] no diagnostic stamps generated")
+            return False
 
-        # White cross at assumed FRONT centre (u=0.25, v=0.5)
-        for du in (-0.06, 0.0, 0.06):
-            pts.append((0.25 + du, 0.50, (255, 255, 255)))
-        for dv in (-0.06, 0.06):
-            pts.append((0.25, 0.50 + dv, (255, 255, 255)))
-
-        # Cyan cross at assumed BACK centre (u=0.75, v=0.5)
-        for du in (-0.06, 0.0, 0.06):
-            pts.append((0.75 + du, 0.50, (0, 230, 230)))
-        for dv in (-0.06, 0.06):
-            pts.append((0.75, 0.50 + dv, (0, 230, 230)))
-
-        print(f"[DIAG] painting {len(pts)} UV diagnostic stamps (radius={RADIUS})")
+        radius = 0.07 if mode == "grid" else 0.08
+        print(f"[DIAG] painting mode={mode} stamps={len(pts)} radius={radius}")
         if progress_cb:
-            progress_cb(0, f"UV diagnostic: {len(pts)} stamps…")
+            progress_cb(0, f"UV diagnostic ({mode}): {len(pts)} stamps…")
 
         try:
             with self._game_frozen("DIAG"):
                 self._prepare_paint_component(comp)
                 self._call_clear_paint_channel(comp)
-                self._write_brush_settings(comp, RADIUS, 1.0, 1.0)
+                self._write_brush_settings(comp, radius, 1.0, 1.0)
                 self._call_paint_pattern(comp, pts, channel=4)
-            print("[DIAG] UV diagnostic done — screenshot front & back now!")
+            print("[DIAG] done — screenshot front & back, check log for island coords")
             if progress_cb:
-                progress_cb(100, "UV diagnostic done — screenshot your character!")
+                progress_cb(100, f"UV diagnostic ({mode}) done — screenshot now!")
             return True
         except Exception as e:
             import traceback

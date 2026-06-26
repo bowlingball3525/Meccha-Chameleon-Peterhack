@@ -72,15 +72,15 @@ class Config:
     paint_image_grid: int = 32
     preset_paint_grid: int = 32
     # Quality level 1-5 for F10 Camouflage (grid size / samples per cell).
-    paint_quality: int = 3
+    paint_quality: int = 8             # camo quality 1-20; 8=Medium
     # Quality level 1-5 for Apply Image to Character (stamp grid density).
     image_quality: int = 3
     # Wrap mode for Apply Image to Character.
     # "projector" → image starts at front-side, finishes at back (fu = u).
     # "centered"  → image center on chest, top→head, bottom→feet (fu = (u+0.25)%1).
     image_wrap_mode: str = "projector"
-
-    # Bone indices (fallback if name resolution fails)
+    # UV diagnostic overlay mode: quadrants | islands | grid | slices | full
+    uv_diag_mode: str = "full"
     # Common UE5 mannequin bone indices
     bone_indices: dict = field(default_factory=lambda: {
         "head": 66, "neck_01": 65, "spine_03": 52,

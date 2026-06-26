@@ -989,16 +989,46 @@ class Menu(QWidget):
         btn_apply_img.clicked.connect(self._apply_paint_image)
         lo.addWidget(btn_apply_img)
 
-        btn_uv_test = QPushButton("UV Test (diagnostic)")
+        btn_uv_test = QPushButton("Run UV Test")
         btn_uv_test.setToolTip(
-            "Paints 4 colored UV quadrants on your character.\n"
-            "RED = top-left UV, GREEN = top-right, BLUE = bottom-left, YELLOW = bottom-right.\n"
-            "WHITE cross = assumed front centre (u=0.25)  CYAN cross = assumed back centre (u=0.75).\n"
-            "Screenshot front & back then share — lets us fix UV mapping if off."
+            "Paints a UV diagnostic overlay on your character.\n"
+            "Use the mode dropdown to switch views:\n"
+            "  Full     — quadrants + paint islands + grid (recommended)\n"
+            "  Islands  — each centered-mode island in a unique colour\n"
+            "  Slices   — head/torso/legs image thirds on island rects\n"
+            "  Grid     — 12×12 UV grid (red=u, green=v)\n"
+            "  Quadrants— original 4-colour atlas quadrants\n"
+            "Screenshot front & back, then share — island coords are logged."
         )
         btn_uv_test.setStyleSheet("background-color: #2a4a6a; color: #aef;")
         btn_uv_test.clicked.connect(self._run_uv_diagnostic)
         lo.addWidget(btn_uv_test)
+
+        uv_diag_row = QHBoxLayout()
+        uv_diag_row.addWidget(QLabel("UV test mode:"))
+        self.cmb_uv_diag_mode = QComboBox()
+        _uv_modes = [
+            ("Full (islands + grid)", "full"),
+            ("Islands only", "islands"),
+            ("Image slices", "slices"),
+            ("UV grid", "grid"),
+            ("Quadrants only", "quadrants"),
+        ]
+        for label, val in _uv_modes:
+            self.cmb_uv_diag_mode.addItem(label, val)
+        _cur_uv = getattr(self.config, "uv_diag_mode", "full")
+        _uv_idx = next(
+            (i for i, (_, v) in enumerate(_uv_modes) if v == _cur_uv), 0,
+        )
+        self.cmb_uv_diag_mode.setCurrentIndex(_uv_idx)
+
+        def _on_uv_diag_mode_change(i):
+            setattr(self.config, "uv_diag_mode", self.cmb_uv_diag_mode.itemData(i))
+            save_config(self.config)
+
+        self.cmb_uv_diag_mode.currentIndexChanged.connect(_on_uv_diag_mode_change)
+        uv_diag_row.addWidget(self.cmb_uv_diag_mode, 1)
+        lo.addLayout(uv_diag_row)
 
         # ── Image quality slider ──────────────────────────────────────────────
         _IMG_QLABELS = {1: "Draft", 2: "Low", 3: "Medium", 4: "High", 5: "Ultra"}
@@ -1233,6 +1263,17 @@ class Menu(QWidget):
             "=== Peterhack Changelog ===\n"
             "\n"
             "--- Jun 26, 2026 (latest) ---\n"
+            "\n"
+            "[UV Diagnostic Tool — expanded]\n"
+            "  + UV test mode dropdown with 5 overlay types:\n"
+            "      Full      — dim quadrants + island rects + grid (default)\n"
+            "      Islands   — each centered-mode paint island, unique colour\n"
+            "      Slices    — head/torso/legs image thirds on island rects\n"
+            "      Grid      — 12×12 UV grid (R=u, G=v) + reference lines\n"
+            "      Quadrants — original 4-colour atlas quadrants\n"
+            "  + Island u/v bounds logged to latest.log on every run.\n"
+            "  + Reference crosses: white=u0.25, cyan=u0.75, yellow/orange\n"
+            "    at u0.5 v0.25/v0.75 for fine coordinate reading.\n"
             "\n"
             "[Image Paint — Centered mode: island-calibrated UV map]\n"
             "  + UV diagnostic screenshots revealed the atlas is NOT one rectangle\n"
@@ -1582,23 +1623,55 @@ class Menu(QWidget):
         )
 
     def _run_uv_diagnostic(self):
-        """Launch a UV diagnostic paint job: 4 colored quadrants + centre markers."""
+        """Launch a UV diagnostic paint job using the selected overlay mode."""
+        mode = getattr(self.config, "uv_diag_mode", "full")
+        mode_labels = {
+            "full": "Full (quadrants + islands + grid)",
+            "islands": "Islands only",
+            "slices": "Image slices (head/torso/legs)",
+            "grid": "UV coordinate grid",
+            "quadrants": "Quadrants only",
+        }
+        mode_hint = {
+            "full": (
+                "Dim quadrants + coloured island rects (white borders) + grid lines.\n"
+                "Each island matches centered-mode image painting.\n"
+                "White cross=u0.25,v0.5  Cyan=u0.75,v0.5  Yellow=u0.5,v0.25  Orange=u0.5,v0.75"
+            ),
+            "islands": (
+                "Each paint island in a unique colour with white border.\n"
+                "F-head=magenta, F-chest=cyan, F-legL=orange, F-legR=purple, etc.\n"
+                "Island u/v coords printed to latest.log."
+            ),
+            "slices": (
+                "Pink=head third, Teal=torso third, Orange=legs third.\n"
+                "Shows how centered mode splits your image across islands.\n"
+                "Grid lines at image slice boundaries (34%, 68%)."
+            ),
+            "grid": (
+                "12×12 UV grid — red channel=u, green channel=v.\n"
+                "White lines at u/v = 0.25, 0.5, 0.75.\n"
+                "Use to read exact UV coordinates from screenshots."
+            ),
+            "quadrants": (
+                "RED=top-left UV, GREEN=top-right, BLUE=bottom-left, YELLOW=bottom-right.\n"
+                "White cross=u0.25,v0.5  Cyan cross=u0.75,v0.5"
+            ),
+        }
+
         def worker():
             pawn = self.esp.wait_for_paintable_pawn()
             if not pawn:
                 return False, "Could not find your character — spawn in a match first."
-            ok = self.esp.paint_uv_diagnostic()
+            ok = self.esp.paint_uv_diagnostic(mode=mode)
             if ok:
-                return True, (
-                    "UV diagnostic painted!\n"
-                    "RED=top-left UV, GREEN=top-right, BLUE=bottom-left, YELLOW=bottom-right.\n"
-                    "WHITE cross = assumed front (u=0.25), CYAN = assumed back (u=0.75).\n"
-                    "Screenshot your character front & back and share!"
-                )
+                label = mode_labels.get(mode, mode)
+                hint = mode_hint.get(mode, "")
+                return True, f"UV diagnostic painted ({label}).\n{hint}\nScreenshot front & back!"
             return False, "UV diagnostic failed — are you in a match?"
 
         self._run_paint_job(
-            "Painting UV diagnostic… game will pause briefly",
+            f"Painting UV diagnostic ({mode})… game will pause briefly",
             worker,
             progress_label="UV Diagnostic",
         )
