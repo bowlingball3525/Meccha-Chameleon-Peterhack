@@ -2818,6 +2818,26 @@ class MecchaESP:
         except Exception:
             return False
 
+    def _paint_brush_radius_pixels(self, comp, grid, overlap=0.85):
+        """Brush radius in texture pixels — matches the working camo path."""
+        res = self.get_albedo_resolution(comp=comp)
+        g = max(1, int(grid))
+        return (res / g) * overlap
+
+    def _white_flood_atlas(self, comp, grid=8, channel=4):
+        """Cover the full UV atlas in white before image painting."""
+        radius = self._paint_brush_radius_pixels(comp, grid, overlap=0.95)
+        white = (255, 255, 255)
+        pts = [
+            ((gx + 0.5) / grid, (gy + 0.5) / grid, white)
+            for gy in range(grid)
+            for gx in range(grid)
+        ]
+        self._write_brush_settings(comp, radius, 1.0, 1.0)
+        ok = self._call_paint_pattern_batched(comp, pts, channel=channel, log_prefix="PAINT")
+        print(f"[PAINT] white flood {grid}x{grid} r={radius:.1f}px ok={ok}")
+        return ok
+
     def _opaque_image_average(self, bgra_bytes, resolution):
         """Mean RGB of non-transparent texture pixels (for base coat)."""
         rs = gs = bs = n = 0
@@ -2894,32 +2914,25 @@ class MecchaESP:
         else:
             g = max(1, int(round(len(points) ** 0.5)))
 
-        # Brush radius is in UV-space units (0..1 fraction of texture width).
-        # For image/preset painting we want each stamp to cover exactly its own cell
-        # plus a tiny overlap to seal seams: radius = 0.6 / g  (= 0.6 × cell_size).
-        # - Too large (old: 3.5/g = 0.109 for g=32) → each stamp floods many cells →
-        #   the last stamp wins everywhere → whole body turns one solid colour.
-        # - Too large as pixel units (e.g. 2.4 or 64 UV) → same flooding, much worse.
-        # - 0.6/g keeps stamps just slightly overlapping their neighbours only.
+        # Brush radius is in TEXTURE PIXELS (see camo path — comp+0x0170).
+        # Old UV-fraction values (e.g. 1.5/g = 0.012 for g=128) produced sub-pixel
+        # dots — body stayed white with only tiny coloured specks visible.
+        overlap = 0.85
         if log_prefix in ("PAINT", "PRESET"):
-            # 1.5/g gives ~3× overlap so stamps merge seamlessly into a solid surface.
-            # g=256 → radius=0.0059 UV ≈ 6 px diameter on a 1024 texture.
-            radius = min(0.45, 1.5 / g)
-        else:
-            radius = min(0.45, 3.5 / g)   # camo: wide blending is fine (smooth colours)
+            overlap = 0.90
+        radius = self._paint_brush_radius_pixels(paint_comp, g, overlap=overlap)
 
         hardness = brush_hardness
         if log_prefix in ("PAINT", "PRESET"):
-            # 0.95 = near-hard circles that still blend at edges without
-            # creating the blurry/smeared "watercolour" look of low hardness.
             hardness = 0.95
         opacity = max(0.0, min(1.0, float(brush_opacity)))
         paint_channel = 4  # EPaintChannel::All — same as F10 camo (Albedo-only is invisible)
         try:
+            atlas_res = self.get_albedo_resolution(comp=paint_comp)
             self._write_brush_settings(paint_comp, radius, hardness, opacity)
-            print(f"[{log_prefix}] grid~{g}x{g} brush r={radius:.4f}UV "
-                  f"hard={hardness:.2f} op={opacity:.2f} stamps={len(points)} "
-                  f"freeze={freeze}")
+            print(f"[{log_prefix}] grid~{g}x{g} brush r={radius:.1f}px "
+                  f"(atlas={atlas_res}) hard={hardness:.2f} op={opacity:.2f} "
+                  f"stamps={len(points)} freeze={freeze}")
         except Exception as e:
             print(f"[{log_prefix}] brush settings write failed: {e}")
 
@@ -4377,7 +4390,7 @@ class MecchaESP:
     UV_DIAG_BATCH = 64
     UV_DIAG_FILL_SEG = 10
     UV_DIAG_ISLAND_SEG = 12
-    UV_DIAG_RADIUS = 0.10
+    UV_DIAG_BRUSH_OVERLAP = 0.90
 
     # Distinct fill colours per paint island (front then back, matches PAINT_*_ISLANDS order).
     UV_DIAG_ISLAND_COLORS = (
@@ -4572,8 +4585,11 @@ class MecchaESP:
             print("[DIAG] no diagnostic stamps generated")
             return False
 
-        radius = 0.08 if mode == "grid" else self.UV_DIAG_RADIUS
-        print(f"[DIAG] painting mode={mode} stamps={len(pts)} radius={radius}")
+        radius = self._paint_brush_radius_pixels(
+            comp, self.UV_DIAG_FILL_SEG if mode != "grid" else 12,
+            overlap=self.UV_DIAG_BRUSH_OVERLAP,
+        )
+        print(f"[DIAG] painting mode={mode} stamps={len(pts)} radius={radius:.1f}px")
         if progress_cb:
             progress_cb(0, f"UV diagnostic ({mode}): {len(pts)} stamps…")
 
@@ -4675,15 +4691,7 @@ class MecchaESP:
                     return False
                 self._prepare_paint_component(live_comp)
                 self._call_clear_paint_channel(live_comp)
-                white = (255, 255, 255)
-                white_pts = [
-                    (u, v, white)
-                    for u in (0.25, 0.75)
-                    for v in (0.25, 0.75)
-                ]
-                self._write_brush_settings(live_comp, 0.35, 1.0, 1.0)
-                self._call_paint_pattern(live_comp, white_pts, channel=4)
-                print("[PAINT] white flood done (4 stamps, r=0.35)")
+                self._white_flood_atlas(live_comp, grid=8, channel=4)
 
                 ok = self._apply_uv_paint_points(
                     pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
@@ -4730,15 +4738,7 @@ class MecchaESP:
 
             self._call_clear_paint_channel(live_comp)
 
-            white = (255, 255, 255)
-            white_pts = [
-                (u, v, white)
-                for u in (0.25, 0.75)
-                for v in (0.25, 0.75)
-            ]
-            self._write_brush_settings(live_comp, 0.35, 1.0, 1.0)
-            self._call_paint_pattern(live_comp, white_pts, channel=4)
-            print("[PAINT] white flood done (4 stamps, r=0.35)")
+            self._white_flood_atlas(live_comp, grid=8, channel=4)
 
             ok = self._apply_uv_paint_points(
                 pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
