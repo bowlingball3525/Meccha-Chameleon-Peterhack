@@ -4084,11 +4084,22 @@ class MecchaESP:
             add(u_center - half_u, v, rgb_left or rgb_top or rgb_bot)
             add(u_center + half_u, v, rgb_right or rgb_top or rgb_bot)
 
-    def _paint_image_centered(self, pawn, bgra_bytes, resolution, grid, opacity, progress_cb):
+    def _paint_image_centered(
+        self, pawn, bgra_bytes, resolution, grid, opacity, progress_cb, img_aspect=1.0,
+    ):
         """
-        Paint the image centered on the character:
-          1) Screen-space on the camera-visible side (perfect screen centering)
-          2) UV-space on the opposite side (u + 0.5 on the paint sphere/atlas)
+        Screen-space paint centered on the character's visible body — no UV guessing.
+
+        Front side:  PaintAtScreenPosition raycasts each screen point to the mesh UV,
+                     so the image is perfectly centered on whatever face is visible.
+                     No knowledge of the UV atlas layout is required.
+        Back side:   UV paint at the known spine centre (u=0.75) using the same image.
+                     Falls back to hardcoded UV extents — no hit-test calls that crash.
+
+        _calibrate_uv_from_screen_rect / _hit_test_at_screen are intentionally NOT
+        called here: the native HitTestAtScreenPosition worker has an ABI mismatch
+        (dereferences its 6th arg at +0x38 when we pass null) → EXCEPTION_ACCESS_
+        VIOLATION reading 0x38 → game crash.
         """
         world = self._get_world()
         pc = self._get_local_controller(world)
@@ -4106,22 +4117,37 @@ class MecchaESP:
             print("[PAINT] body not on screen")
             return False
 
-        rect = self._centered_square_rect(*bbox, fill=0.90)
         screen_worker = self._resolve_paint_screen_worker()
         if not screen_worker:
             print("[PAINT] PaintAtScreenPosition worker unavailable")
             return False
 
+        # Build a screen rect that fits the image aspect ratio inside the body bbox.
+        # This ensures no letter-boxing / pillar-boxing — the image fills the body.
+        body_rect = self._body_image_screen_rect(bbox, width_fill=0.52, height_fill=0.95)
+        paint_rect = self._fit_screen_rect_to_image_aspect(body_rect, img_aspect)
+
         screen_points = self._build_screen_image_points(
-            bgra_bytes, resolution, rect, grid, opacity,
+            bgra_bytes, resolution, paint_rect, grid, opacity, img_aspect=img_aspect,
         )
         if not screen_points:
             print("[PAINT] no opaque pixels in image")
             return False
 
-        radius = min(0.5, 1.25 / grid)
+        # Back face: UV paint centred at the spine (u=0.75) with fixed extents.
+        vc  = self.PAINT_BODY_VC
+        hu  = self.PAINT_BODY_HU
+        hv  = self.PAINT_BODY_HV
+        u_opp = self.PAINT_BACK_U
+        opposite_points = self._build_uv_image_points_for_rect(
+            bgra_bytes, resolution, grid, opacity, u_opp, vc, hu, hv,
+            img_aspect=img_aspect,
+        )
+
+        radius   = min(0.5, 1.25 / grid)
         brush_op = max(0.0, min(1.0, opacity / 255.0))
         base_color = self._opaque_image_average(bgra_bytes, resolution)
+        total_stamps = len(screen_points) + len(opposite_points)
 
         def _report(done, total):
             if progress_cb:
@@ -4130,53 +4156,38 @@ class MecchaESP:
                 except Exception:
                     pass
 
-        total_stamps = len(screen_points)
-        opposite_points = []
-        u_opp = vc = hu = hv = 0.0
-
         self._prepare_paint_component(comp)
-        cal = self._calibrate_uv_from_screen_rect(comp, mesh, pc, rect)
-        if cal:
-            uc, vc, hu, hv = cal
-            u_opp = (uc + 0.5) % 1.0
-        else:
-            uc, vc, hu, hv = (
-                self.PAINT_FRONT_U, self.PAINT_BODY_VC,
-                self.PAINT_BODY_HU, self.PAINT_BODY_HV,
-            )
-            u_opp = self.PAINT_BACK_U
-            print("[PAINT] using fallback opposite UV center")
-        opposite_points = self._build_uv_image_points_for_rect(
-            bgra_bytes, resolution, grid, opacity, u_opp, vc, hu, hv,
-        )
-        total_stamps += len(opposite_points)
-
         self._write_brush_settings(comp, radius, 1.0, brush_op)
+
+        # Front: screen-space (channel=4 / All — same as camo; Albedo-only is invisible)
         ok_screen = self._call_paint_at_screen(
-            comp, mesh, pc, screen_worker, screen_points,
-            channel=self.EPaintChannel_Albedo,
+            comp, mesh, pc, screen_worker, screen_points, channel=4,
         )
         _report(len(screen_points), total_stamps)
+        print(
+            f"[PAINT] screen({mesh_src}) ok={ok_screen} stamps={len(screen_points)} "
+            f"rect={int(paint_rect[2]-paint_rect[0])}x{int(paint_rect[3]-paint_rect[1])}"
+        )
 
+        # Back: UV paint under freeze (safe — no hit-test)
         ok_uv = True
         if opposite_points:
             opp_region = (
                 max(0.0, u_opp - hu), max(0.0, vc - hv),
                 min(1.0, u_opp + hu), min(1.0, vc + hv),
             )
-            with self._game_frozen("PAINT"):
+            with self._game_frozen("PAINT-BACK"):
                 self._prepare_paint_component(comp)
                 self._write_brush_settings(comp, radius, 1.0, brush_op)
                 ok_uv = self._apply_uv_paint_points(
                     pawn, opposite_points, log_prefix="PAINT", replace=True,
                     brush_grid=grid, brush_opacity=brush_op, brush_hardness=1.0,
                     freeze=False, base_color=base_color,
-                    base_regions=(opp_region,),
+                    base_regions=(opp_region,), comp=comp,
                 )
             _report(total_stamps, total_stamps)
+            print(f"[PAINT] back UV ok={ok_uv} stamps={len(opposite_points)}")
 
-        print(f"[PAINT] screen({mesh_src})={ok_screen} stamps={len(screen_points)} "
-              f"opposite_uv={len(opposite_points)} ok={ok_uv}")
         return ok_screen or (bool(opposite_points) and ok_uv)
 
     def _paint_texture_via_uv(
@@ -4303,16 +4314,51 @@ class MecchaESP:
         front_u, back_u, vc, hu, hv = layout
         paint_regions = self.PAINT_HEMI_RECTS
 
-        # Camera-based UV calibration (runs BEFORE freeze — safe to hit-test here).
-        # Finds the actual UV v-coordinates of the character's head and feet so
-        # the image maps correctly regardless of which direction v runs in the atlas.
+        # ── Centered mode: screen-space front + UV back ───────────────────────
+        # PaintAtScreenPosition raycasts each screen pixel directly onto the mesh,
+        # so the image is always perfectly centred on the visible body regardless
+        # of the paint-sphere UV layout.  No UV-atlas assumptions required.
+        if wrap_mode == "centered":
+            # Step 1 – clear & flood-white under a brief freeze
+            with self._game_frozen("PAINT"):
+                live_comp = rp(self.pm, pawn + 0x0B68)
+                if not live_comp or live_comp <= 0x100000:
+                    print("[PAINT] paint component lost before clear")
+                    return False
+                self._prepare_paint_component(live_comp)
+                self._call_clear_paint_channel(live_comp)
+                white = (255, 255, 255)
+                white_pts = [
+                    (u, v, white)
+                    for u in (0.25, 0.75)
+                    for v in (0.25, 0.75)
+                ]
+                self._write_brush_settings(live_comp, 0.35, 1.0, 1.0)
+                self._call_paint_pattern(live_comp, white_pts, channel=4)
+                print("[PAINT] white flood done (4 stamps, r=0.35)")
+
+            # Step 2 – screen-space front + UV back (no hit-test calls)
+            ok = self._paint_image_centered(
+                pawn, bgra_bytes, resolution, grid, opacity, progress_cb,
+                img_aspect=img_aspect,
+            )
+            if ok:
+                self._last_paint_bgra = bytes(bgra_bytes)
+                self._last_paint_resolution = resolution
+                self._last_paint_grid = grid
+                print("[PAINT] centered apply done")
+            return ok
+
+        # ── Projector mode: UV wrap across the full atlas ──────────────────────
+        # The image is stretched across u=[0,1] so it wraps continuously from the
+        # front-side seam, over the chest, across the back, and back to the seam.
         uv_cal = self._calibrate_body_uv_vertical(pawn)
         v_head_cal = uv_cal[0] if uv_cal else None
         v_feet_cal = uv_cal[1] if uv_cal else None
 
         uv_points = self._build_front_back_image_uv_points(
             bgra_bytes, resolution, grid, opacity,
-            layout=layout, img_aspect=img_aspect, wrap_mode=wrap_mode,
+            layout=layout, img_aspect=img_aspect, wrap_mode="projector",
             v_head=v_head_cal, v_feet=v_feet_cal,
         )
         if not uv_points:
@@ -4332,36 +4378,24 @@ class MecchaESP:
                 return False
             self._prepare_paint_component(live_comp)
 
-            # ── Step 1: wipe previous paint ───────────────────────────────────
             self._call_clear_paint_channel(live_comp)
 
-            # ── Step 2: white flood with ONE big-brush pass ───────────────────
-            # Four stamps placed at the UV quadrant centres (0.25/0.75 × 0.25/0.75)
-            # with radius=0.35 each.  At that radius every pair of adjacent stamps
-            # overlaps in the middle, so the full [0,1]×[0,1] atlas is covered in
-            # a single call — no gaps, no repeated sweeping.
             white = (255, 255, 255)
             white_pts = [
                 (u, v, white)
                 for u in (0.25, 0.75)
                 for v in (0.25, 0.75)
             ]
-            self._write_brush_settings(live_comp, 0.35, 1.0, 1.0)   # BIG brush
+            self._write_brush_settings(live_comp, 0.35, 1.0, 1.0)
             self._call_paint_pattern(live_comp, white_pts, channel=4)
             print("[PAINT] white flood done (4 stamps, r=0.35)")
 
-            # ── Step 3: image detail pass — small brush for quality ───────────
-            # _apply_uv_paint_points calls _write_brush_settings itself as its
-            # first action, setting radius = 1.5/grid (≈0.006 UV for grid=256)
-            # and hardness = 0.95.  No need to touch the brush here.
             ok = self._apply_uv_paint_points(
                 pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
                 progress_cb=progress_cb, freeze=False, base_color=base_color,
                 base_regions=paint_regions, comp=live_comp, fast_mode=fast_paint,
             )
             if ok:
-                # Cache the input image immediately so preset-save works even if
-                # the compose step below fails or the session restarts.
                 self._last_paint_bgra = bytes(bgra_bytes)
                 self._last_paint_resolution = resolution
                 self._last_paint_grid = grid
@@ -4374,8 +4408,7 @@ class MecchaESP:
                 bgra_bytes, resolution, atlas_res, opacity, layout, img_aspect,
             )
             if composed:
-                # Overwrite with the higher-quality composed atlas texture if available.
                 self._last_paint_bgra = composed
                 self._last_paint_resolution = atlas_res
-            print(f"[PAINT] front/back apply done ({grid}×{grid} per side)")
+            print(f"[PAINT] projector apply done ({grid}×{grid} per side)")
         return ok
