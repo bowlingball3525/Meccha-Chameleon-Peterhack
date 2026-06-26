@@ -484,22 +484,24 @@ class MecchaESP:
     PAINT_BODY_VC = 0.50
     PAINT_BODY_HU = 0.22
     PAINT_BODY_HV = 0.38
-    # Island rects: (u0, v0, u1, v1, img_y0, img_y1) — img_y in [0,1] image space.
+    # Island rects: (u0, v0, u1, v1, img_y0, img_y1) — calibrated Jun 2026 diagnostic.
+    #   GREEN  u∈[0.52,0.98] v∈[0.02,0.48] → front head / back head-R
+    #   BLUE   u∈[0.02,0.48] v∈[0.52,0.98] → front chest / back spine
+    #   YELLOW u∈[0.52,0.98] v∈[0.52,0.98] → front leg-L / back-right panel
+    #   RED    u∈[0.02,0.48] v∈[0.02,0.48] → front leg-R inner / back head-L
     PAINT_FRONT_ISLANDS = (
-        (0.52, 0.04, 0.96, 0.46, 0.00, 0.34),   # head + outer arms (green zone)
-        (0.04, 0.54, 0.46, 0.84, 0.30, 0.68),   # chest/torso (blue zone)
-        (0.52, 0.56, 0.96, 0.96, 0.62, 1.00),   # legs L (yellow zone)
-        (0.04, 0.04, 0.46, 0.46, 0.62, 1.00),   # legs R inner (red zone)
+        (0.52, 0.02, 0.98, 0.48, 0.00, 0.35),   # head + outer arms (green quad)
+        (0.02, 0.52, 0.48, 0.98, 0.32, 0.68),   # chest / torso (blue quad)
+        (0.52, 0.52, 0.98, 0.98, 0.65, 1.00),   # leg L (yellow quad)
+        (0.02, 0.02, 0.48, 0.48, 0.65, 1.00),   # leg R inner (red quad)
     )
     PAINT_BACK_ISLANDS = (
-        (0.04, 0.04, 0.46, 0.46, 0.00, 0.34),   # head-left (red zone)
-        (0.52, 0.04, 0.96, 0.46, 0.00, 0.34),   # head-right (green zone)
-        (0.04, 0.54, 0.46, 0.84, 0.30, 0.68),   # spine (blue zone)
-        (0.52, 0.54, 0.96, 0.96, 0.30, 0.68),   # back-right panel (yellow)
-        (0.04, 0.04, 0.46, 0.46, 0.62, 1.00),   # leg L upper (red, overlaps head L)
-        (0.52, 0.04, 0.96, 0.46, 0.62, 1.00),   # leg R upper (green, overlaps head R)
-        (0.04, 0.46, 0.46, 0.56, 0.68, 1.00),   # leg L lower (near u=0.25 cross)
-        (0.52, 0.46, 0.96, 0.56, 0.68, 1.00),   # leg R lower (near u=0.75 cross)
+        (0.02, 0.02, 0.48, 0.48, 0.00, 0.35),   # head-left (red quad)
+        (0.52, 0.02, 0.98, 0.48, 0.00, 0.35),   # head-right (green quad)
+        (0.02, 0.52, 0.48, 0.98, 0.32, 0.68),   # spine (blue quad)
+        (0.52, 0.52, 0.98, 0.98, 0.32, 0.68),   # back-right (yellow quad)
+        (0.02, 0.42, 0.48, 0.58, 0.65, 1.00),   # leg L lower (u≈0.25 cross)
+        (0.52, 0.42, 0.98, 0.58, 0.65, 1.00),   # leg R lower (u≈0.75 cross)
     )
 
     @classmethod
@@ -4372,20 +4374,27 @@ class MecchaESP:
     # ──────────────────────────────────────────────────────────────────────────
     UV_DIAG_MODES = ("quadrants", "islands", "grid", "slices", "full")
 
+    UV_DIAG_BATCH = 64
+    UV_DIAG_FILL_SEG = 10
+    UV_DIAG_ISLAND_SEG = 12
+    UV_DIAG_RADIUS = 0.10
+
     # Distinct fill colours per paint island (front then back, matches PAINT_*_ISLANDS order).
     UV_DIAG_ISLAND_COLORS = (
         (255,  60, 200),   # F1 head
         (  0, 200, 255),   # F2 chest
-        (255, 140,   0),   # F3 legs L
-        (160,  60, 255),   # F4 legs R
+        (255, 140,   0),   # F3 leg L
+        (160,  60, 255),   # F4 leg R
         (255, 120, 150),   # B1 head L
         (180, 255,   0),   # B2 head R
         (100, 180, 255),   # B3 spine
         (255, 210,   0),   # B4 back R
-        (255,  80,  80),   # B5 leg L upper
-        ( 80, 255, 120),   # B6 leg R upper
-        (255, 255, 255),   # B7 leg L lower
-        (  0, 230, 230),   # B8 leg R lower
+        (255, 255, 255),   # B5 leg L lower
+        (  0, 230, 230),   # B6 leg R lower
+    )
+    UV_DIAG_ISLAND_NAMES = (
+        "F-head", "F-chest", "F-legL", "F-legR",
+        "B-headL", "B-headR", "B-spine", "B-backR", "B-legLl", "B-legRl",
     )
     UV_DIAG_SLICE_COLORS = (
         (255,  50, 150),   # image head third
@@ -4398,10 +4407,6 @@ class MecchaESP:
         ( 40,  80, 220),   # u0-0.5 v0.5-1  BLUE
         (220, 200,   0),   # u0.5-1  v0.5-1  YELLOW
     )
-
-    @staticmethod
-    def _diag_dim_color(rgb, factor=0.45):
-        return tuple(max(0, min(255, int(c * factor))) for c in rgb)
 
     @classmethod
     def _diag_fill_rect(cls, pts, u0, v0, u1, v1, color, seg=6):
@@ -4451,18 +4456,17 @@ class MecchaESP:
         if mode not in self.UV_DIAG_MODES:
             mode = "full"
         pts = []
+        border = self.PAINT_UV_BORDER
 
         if mode in ("quadrants", "full"):
             quads = (
-                ((0.0, 0.5), (0.0, 0.5), self.UV_DIAG_QUAD_COLORS[0]),
-                ((0.5, 1.0), (0.0, 0.5), self.UV_DIAG_QUAD_COLORS[1]),
-                ((0.0, 0.5), (0.5, 1.0), self.UV_DIAG_QUAD_COLORS[2]),
-                ((0.5, 1.0), (0.5, 1.0), self.UV_DIAG_QUAD_COLORS[3]),
+                ((border, 0.5 - border), (border, 0.5 - border), self.UV_DIAG_QUAD_COLORS[0]),
+                ((0.5 + border, 1.0 - border), (border, 0.5 - border), self.UV_DIAG_QUAD_COLORS[1]),
+                ((border, 0.5 - border), (0.5 + border, 1.0 - border), self.UV_DIAG_QUAD_COLORS[2]),
+                ((0.5 + border, 1.0 - border), (0.5 + border, 1.0 - border), self.UV_DIAG_QUAD_COLORS[3]),
             )
-            dim = mode == "full"
             for (u0, u1), (v0, v1), color in quads:
-                c = self._diag_dim_color(color) if dim else color
-                self._diag_fill_rect(pts, u0, v0, u1, v1, c, seg=7 if dim else 8)
+                self._diag_fill_rect(pts, u0, v0, u1, v1, color, seg=self.UV_DIAG_FILL_SEG)
 
         if mode == "grid":
             grid_n = 12
@@ -4476,25 +4480,35 @@ class MecchaESP:
                     ))
             self._diag_grid_lines(pts)
 
-        if mode in ("islands", "slices", "full"):
+        if mode in ("islands", "slices"):
             all_islands = list(self.PAINT_FRONT_ISLANDS) + list(self.PAINT_BACK_ISLANDS)
-            names = (
-                "F-head", "F-chest", "F-legL", "F-legR",
-                "B-headL", "B-headR", "B-spine", "B-backR",
-                "B-legLu", "B-legRu", "B-legLl", "B-legRl",
-            )
             for idx, island in enumerate(all_islands):
                 u0, v0, u1, v1, iy0, iy1 = island
                 if mode == "slices":
                     color = self._diag_slice_color(iy0, iy1)
                 else:
                     color = self.UV_DIAG_ISLAND_COLORS[idx % len(self.UV_DIAG_ISLAND_COLORS)]
-                self._diag_fill_rect(pts, u0, v0, u1, v1, color, seg=6)
-                self._diag_stroke_rect(pts, u0, v0, u1, v1, (255, 255, 255), steps=8)
+                self._diag_fill_rect(
+                    pts, u0, v0, u1, v1, color, seg=self.UV_DIAG_ISLAND_SEG,
+                )
+                self._diag_stroke_rect(pts, u0, v0, u1, v1, (255, 255, 255), steps=12)
                 uc = (u0 + u1) * 0.5
                 vc = (v0 + v1) * 0.5
-                self._diag_cross(pts, uc, vc, (0, 0, 0), arm=0.03)
-                label = names[idx] if idx < len(names) else f"I{idx}"
+                self._diag_cross(pts, uc, vc, (0, 0, 0), arm=0.035)
+                label = self.UV_DIAG_ISLAND_NAMES[idx] if idx < len(self.UV_DIAG_ISLAND_NAMES) else f"I{idx}"
+                print(
+                    f"[DIAG] island {label}  "
+                    f"u=[{u0:.2f},{u1:.2f}] v=[{v0:.2f},{v1:.2f}] "
+                    f"img_y=[{iy0:.2f},{iy1:.2f}]"
+                )
+
+        if mode == "full":
+            # Quadrants already filled above — overlay white island borders only.
+            all_islands = list(self.PAINT_FRONT_ISLANDS) + list(self.PAINT_BACK_ISLANDS)
+            for idx, island in enumerate(all_islands):
+                u0, v0, u1, v1, iy0, iy1 = island
+                self._diag_stroke_rect(pts, u0, v0, u1, v1, (255, 255, 255), steps=14)
+                label = self.UV_DIAG_ISLAND_NAMES[idx] if idx < len(self.UV_DIAG_ISLAND_NAMES) else f"I{idx}"
                 print(
                     f"[DIAG] island {label}  "
                     f"u=[{u0:.2f},{u1:.2f}] v=[{v0:.2f},{v1:.2f}] "
@@ -4508,13 +4522,25 @@ class MecchaESP:
             self._diag_cross(pts, 0.50, 0.75, (255, 128, 0), arm=0.04)
 
         if mode in ("full", "grid"):
-            self._diag_grid_lines(pts)
+            self._diag_grid_lines(pts, steps=12)
 
         if mode == "slices":
-            self._diag_grid_lines(pts, values=(0.34, 0.68))
+            self._diag_grid_lines(pts, values=(0.34, 0.68), steps=12)
 
         print(f"[DIAG] mode={mode} stamps={len(pts)}")
         return pts
+
+    def _call_paint_pattern_batched(self, comp, points, channel=4, batch=None, log_prefix="DIAG"):
+        batch = batch or self.UV_DIAG_BATCH
+        total = len(points)
+        n_batches = (total + batch - 1) // batch
+        for bi, off in enumerate(range(0, total, batch)):
+            chunk = points[off:off + batch]
+            if not self._call_paint_pattern(comp, chunk, channel=channel):
+                print(f"[{log_prefix}] batch {bi + 1}/{n_batches} failed at offset {off}")
+                return False
+        print(f"[{log_prefix}] batched {total} stamps in {n_batches} calls (batch={batch})")
+        return True
 
     def paint_uv_diagnostic(self, mode="full", progress_cb=None):
         """
@@ -4525,7 +4551,7 @@ class MecchaESP:
           islands   — each centered-mode paint island in a unique colour
           grid      — 12×12 UV grid (R=u, G=v) + reference lines
           slices    — image head/torso/legs thirds shown on island rects
-          full      — dim quadrants + island fills + borders + grid (default)
+          full      — full-bright quadrants + white island border overlays (default)
         """
         pawn = self._find_local_pawn()
         if not pawn:
@@ -4546,21 +4572,26 @@ class MecchaESP:
             print("[DIAG] no diagnostic stamps generated")
             return False
 
-        radius = 0.07 if mode == "grid" else 0.08
+        radius = 0.08 if mode == "grid" else self.UV_DIAG_RADIUS
         print(f"[DIAG] painting mode={mode} stamps={len(pts)} radius={radius}")
         if progress_cb:
             progress_cb(0, f"UV diagnostic ({mode}): {len(pts)} stamps…")
 
         try:
             with self._game_frozen("DIAG"):
-                self._prepare_paint_component(comp)
-                self._call_clear_paint_channel(comp)
-                self._write_brush_settings(comp, radius, 1.0, 1.0)
-                self._call_paint_pattern(comp, pts, channel=4)
-            print("[DIAG] done — screenshot front & back, check log for island coords")
-            if progress_cb:
-                progress_cb(100, f"UV diagnostic ({mode}) done — screenshot now!")
-            return True
+                live_comp = rp(self.pm, pawn + 0x0B68)
+                if not live_comp or live_comp <= 0x100000:
+                    print("[DIAG] paint component lost before apply")
+                    return False
+                self._prepare_paint_component(live_comp)
+                self._call_clear_paint_channel(live_comp)
+                self._write_brush_settings(live_comp, radius, 1.0, 1.0)
+                ok = self._call_paint_pattern_batched(live_comp, pts, channel=4)
+            if ok:
+                print("[DIAG] done — screenshot front & back, check log for island coords")
+                if progress_cb:
+                    progress_cb(100, f"UV diagnostic ({mode}) done — screenshot now!")
+            return ok
         except Exception as e:
             import traceback
             print(f"[DIAG] error: {e}")

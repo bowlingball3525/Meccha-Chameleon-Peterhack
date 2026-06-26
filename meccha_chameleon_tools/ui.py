@@ -1633,9 +1633,9 @@ class Menu(QWidget):
         }
         mode_hint = {
             "full": (
-                "Dim quadrants + coloured island rects (white borders) + grid lines.\n"
-                "Each island matches centered-mode image painting.\n"
-                "White cross=u0.25,v0.5  Cyan=u0.75,v0.5  Yellow=u0.5,v0.25  Orange=u0.5,v0.75"
+                "Full-bright quadrants (RED/GREEN/BLUE/YELLOW) + white island borders.\n"
+                "Borders show where centered-mode image islands are mapped.\n"
+                "White cross=u0.25,v0.5  Cyan=u0.75,v0.5  Yellow/Orange at u0.5"
             ),
             "islands": (
                 "Each paint island in a unique colour with white border.\n"
