@@ -465,20 +465,42 @@ class MecchaESP:
     PAINT_UV_BATCH_SAFE = 24     # max stamps per shellcode (avoids timeout use-after-free)
     PAINT_LIVE_BATCH_PAUSE = 0.022  # seconds between live batches (camo unfrozen path)
     MIN_PAINT_ALPHA = 24         # skip transparent PNG pixels (avoid black stamps)
-    # Paint-sphere atlas (matches F10 camo layout):
-    #   u∈[0,½) front column, u∈[½,1] back column, v=0 feet → v=1 head.
-    #   Border strips at 0.01/0.99 carry head, arms, and torso edges.
+    # Paint-sphere atlas layout (confirmed via UV diagnostic, Jun 2026):
+    #   The atlas is NOT one rectangle per side — head, torso, and legs live in
+    #   separate UV islands scattered across u/v space.
+    #   Diagnostic quadrant → body part (front view):
+    #     GREEN  (u 0.5-1, v 0-0.5)  → head + outer arms
+    #     BLUE   (u 0-0.5, v 0.5-1)  → chest / torso (also back spine strip)
+    #     YELLOW (u 0.5-1, v 0.5-1)  → legs (front-left), back-right panel
+    #     RED    (u 0-0.5, v 0-0.5)  → inner leg / back-head-left
+    #   v=0 → head end,  v=1 → feet end  (empirical from diagnostic).
     PAINT_FRONT_HEMI = (0.0, 0.0, 0.5, 1.0)
     PAINT_BACK_HEMI = (0.5, 0.0, 1.0, 1.0)
     PAINT_HEMI_RECTS = (PAINT_FRONT_HEMI, PAINT_BACK_HEMI)
     PAINT_UV_BORDER = 0.01
     PAINT_UV_SEAM = 0.49
-    # Legacy panel centers (screen-calibration / opposite-side mirror only).
     PAINT_FRONT_U = 0.25
     PAINT_BACK_U = 0.75
     PAINT_BODY_VC = 0.50
     PAINT_BODY_HU = 0.22
     PAINT_BODY_HV = 0.38
+    # Island rects: (u0, v0, u1, v1, img_y0, img_y1) — img_y in [0,1] image space.
+    PAINT_FRONT_ISLANDS = (
+        (0.52, 0.04, 0.96, 0.46, 0.00, 0.34),   # head + outer arms (green zone)
+        (0.04, 0.54, 0.46, 0.84, 0.30, 0.68),   # chest/torso (blue zone)
+        (0.52, 0.56, 0.96, 0.96, 0.62, 1.00),   # legs L (yellow zone)
+        (0.04, 0.04, 0.46, 0.46, 0.62, 1.00),   # legs R inner (red zone)
+    )
+    PAINT_BACK_ISLANDS = (
+        (0.04, 0.04, 0.46, 0.46, 0.00, 0.34),   # head-left (red zone)
+        (0.52, 0.04, 0.96, 0.46, 0.00, 0.34),   # head-right (green zone)
+        (0.04, 0.54, 0.46, 0.84, 0.30, 0.68),   # spine (blue zone)
+        (0.52, 0.54, 0.96, 0.96, 0.30, 0.68),   # back-right panel (yellow)
+        (0.04, 0.04, 0.46, 0.46, 0.62, 1.00),   # leg L upper (red, overlaps head L)
+        (0.52, 0.04, 0.96, 0.46, 0.62, 1.00),   # leg R upper (green, overlaps head R)
+        (0.04, 0.46, 0.46, 0.56, 0.68, 1.00),   # leg L lower (near u=0.25 cross)
+        (0.52, 0.46, 0.96, 0.56, 0.68, 1.00),   # leg R lower (near u=0.75 cross)
+    )
 
     @classmethod
     def paint_body_uv_rect(cls, u_center, v_center, half_u, half_v):
@@ -4026,6 +4048,73 @@ class MecchaESP:
             )
         return points
 
+    def _build_island_image_uv_points(
+        self, bgra_bytes, resolution, grid, opacity,
+        u0, v0, u1, v1, img_y0, img_y1, img_aspect=1.0,
+    ):
+        """
+        Map an image vertical slice [img_y0, img_y1] onto a UV island rect [u0,v0]-[u1,v1].
+        Used for centered mode where head/torso/legs occupy separate atlas islands.
+        """
+        points = []
+        seen = set()
+        img_y0 = max(0.0, min(1.0, img_y0))
+        img_y1 = max(0.0, min(1.0, img_y1))
+        if img_y1 <= img_y0 + 0.01:
+            return points
+
+        for gy in range(grid):
+            for gx in range(grid):
+                fu = (gx + 0.5) / grid
+                fv_uv = (gy + 0.5) / grid
+                u = u0 + fu * (u1 - u0)
+                v = v0 + fv_uv * (v1 - v0)
+                img_fy = img_y0 + fv_uv * (img_y1 - img_y0)
+                rgb = self._sample_bgra_at_paint_frac(
+                    bgra_bytes, resolution, fu, img_fy, opacity, img_aspect,
+                )
+                if not rgb:
+                    continue
+                key = (round(u * 2048), round(v * 2048))
+                if key in seen:
+                    continue
+                seen.add(key)
+                points.append((u, v, rgb))
+        return points
+
+    def _build_centered_island_uv_points(
+        self, bgra_bytes, resolution, grid, opacity, img_aspect=1.0,
+    ):
+        """Build UV stamps for centered mode using diagnostic-calibrated island map."""
+        points = []
+        seen = set()
+        for u0, v0, u1, v1, iy0, iy1 in self.PAINT_FRONT_ISLANDS:
+            chunk = self._build_island_image_uv_points(
+                bgra_bytes, resolution, grid, opacity,
+                u0, v0, u1, v1, iy0, iy1, img_aspect=img_aspect,
+            )
+            for pt in chunk:
+                key = (round(pt[0] * 2048), round(pt[1] * 2048))
+                if key not in seen:
+                    seen.add(key)
+                    points.append(pt)
+        for u0, v0, u1, v1, iy0, iy1 in self.PAINT_BACK_ISLANDS:
+            chunk = self._build_island_image_uv_points(
+                bgra_bytes, resolution, grid, opacity,
+                u0, v0, u1, v1, iy0, iy1, img_aspect=img_aspect,
+            )
+            for pt in chunk:
+                key = (round(pt[0] * 2048), round(pt[1] * 2048))
+                if key not in seen:
+                    seen.add(key)
+                    points.append(pt)
+        print(
+            f"[PAINT] centered island points={len(points)} grid={grid} "
+            f"front_islands={len(self.PAINT_FRONT_ISLANDS)} "
+            f"back_islands={len(self.PAINT_BACK_ISLANDS)}"
+        )
+        return points
+
     def _build_uv_image_points_for_rect(
         self, bgra_bytes, resolution, grid, opacity, u_center, v_center, half_u, half_v,
         flip_v=False, img_aspect=1.0,
@@ -4412,39 +4501,20 @@ class MecchaESP:
         front_u, back_u, vc, hu, hv = layout
         paint_regions = self.PAINT_HEMI_RECTS
 
-        # ── Centered mode: UV-space, image on both front and back panels ─────
-        # PaintAtScreenPosition was tried here but raycasts from a first-person
-        # camera hit the inside of the character mesh at random UV islands
-        # (back of head, inner leg, back of arm) — not the chest.
-        # Pure UV-space painting is reliable: map the full image into the front
-        # panel (chest centre u=0.25) and back panel (spine centre u=0.75),
-        # head-to-toe in both cases.
+        # ── Centered mode: island-based UV mapping (diagnostic-calibrated) ─────
+        # The UV atlas has separate islands for head, torso, and legs — not one
+        # rectangle per side.  Diagnostic (Jun 2026) showed:
+        #   front head  → GREEN zone  (u 0.5-1, v 0-0.5)
+        #   front chest → BLUE zone   (u 0-0.5, v 0.5-1)
+        #   front legs  → YELLOW/RED  (u 0.5-1 / 0-0.5, v 0.5-1)
+        # Image is split into vertical thirds mapped onto each island.
         if wrap_mode == "centered":
-            half_u = 0.23   # front/back panel UV half-width  (0.25±0.23 = 0.02…0.48)
-            half_v = 0.49   # full body height                 (0.5 ±0.49 = 0.01…0.99)
-            vc     = 0.50
-
-            front_pts = self._build_uv_image_points_for_rect(
-                bgra_bytes, resolution, grid, opacity,
-                u_center=self.PAINT_FRONT_U, v_center=vc,
-                half_u=half_u, half_v=half_v,
-                img_aspect=img_aspect,
+            uv_points = self._build_centered_island_uv_points(
+                bgra_bytes, resolution, grid, opacity, img_aspect=img_aspect,
             )
-            back_pts = self._build_uv_image_points_for_rect(
-                bgra_bytes, resolution, grid, opacity,
-                u_center=self.PAINT_BACK_U, v_center=vc,
-                half_u=half_u, half_v=half_v,
-                img_aspect=img_aspect,
-            )
-            uv_points = front_pts + back_pts
             if not uv_points:
                 print("[PAINT] no opaque pixels in image")
                 return False
-
-            print(
-                f"[PAINT] centered UV stamps front={len(front_pts)} "
-                f"back={len(back_pts)} grid={grid}"
-            )
 
             ok = False
             with self._game_frozen("PAINT"):
@@ -4467,12 +4537,7 @@ class MecchaESP:
                 ok = self._apply_uv_paint_points(
                     pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
                     progress_cb=progress_cb, freeze=False, base_color=base_color,
-                    base_regions=(
-                        (self.PAINT_FRONT_U - half_u, vc - half_v,
-                         self.PAINT_FRONT_U + half_u, vc + half_v),
-                        (self.PAINT_BACK_U  - half_u, vc - half_v,
-                         self.PAINT_BACK_U  + half_u, vc + half_v),
-                    ),
+                    base_regions=self.PAINT_HEMI_RECTS,
                     comp=live_comp, fast_mode=fast_paint,
                 )
 
@@ -4480,7 +4545,7 @@ class MecchaESP:
                 self._last_paint_bgra = bytes(bgra_bytes)
                 self._last_paint_resolution = resolution
                 self._last_paint_grid = grid
-                print("[PAINT] centered apply done")
+                print("[PAINT] centered island apply done")
             return ok
 
         # ── Projector mode: UV wrap across the full atlas ──────────────────────
