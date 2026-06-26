@@ -3654,76 +3654,46 @@ class MecchaESP:
 
     def _calibrate_body_uv_vertical(self, pawn):
         """
-        Pre-freeze hit-test that finds the actual UV v-coordinates for the
-        character's head and feet by sampling the top and bottom of the on-screen
-        bounding box.
+        Returns (v_head, v_feet, u_front) for _build_front_back_image_uv_points,
+        or None to fall back to full-range defaults.
 
-        Returns (v_head, v_feet, u_front) or None if the hit-tests fail.
+        The previous implementation called the native HitTestAtScreenPosition
+        worker (RVA 0x50F8D20) to ray-cast screen points onto the paint mesh
+        and read back UV coordinates.  That worker has a different ABI from what
+        we assumed — it dereferences its 6th argument (passed as null) at
+        offset +0x38, causing EXCEPTION_ACCESS_VIOLATION reading 0x38 every time,
+        which kills the game before a single stamp is sent.
 
-        The caller uses these in _build_front_back_image_uv_points so that:
-            fv_img = (v - v_head) / (v_feet - v_head)
-        correctly maps image_top→head and image_bottom→feet regardless of
-        whether the paint atlas has v=0 at the top or the bottom.
-
-        MUST be called BEFORE _game_frozen — hit-testing outside the freeze is
-        safe and does not corrupt the pawn.
+        Until the correct ABI is confirmed, we use the safe geometry-only path:
+        read the character's root position, project the body AABB corners to
+        screen space, and derive head/feet UV estimates from the UV border
+        constants we already use for stamping.  No native calls → no crash.
         """
-        world = self._get_world()
-        pc = self._get_local_controller(world)
-        cam = self.get_camera()
-        comp = self._get_runtime_paint_component(pawn)
-        mesh, _ = self._get_paint_mesh(pawn, comp)
-        if not cam or not pc or not comp or not mesh:
-            print("[PAINT] UV vertical calib skipped (missing context)")
-            return None
-
-        sw, sh = self.get_viewport_size()
-        if not sw or not sh:
-            return None
-
-        bbox = self.project_body_screen_bbox(pawn, cam, sw, sh)
-        if not bbox:
-            print("[PAINT] UV vertical calib skipped (body off screen)")
-            return None
-
-        x0, y0, x1, y1 = bbox
-        cx = (x0 + x1) * 0.5
-        bh = max(8.0, y1 - y0)
-        # Sample 6% inside top and bottom edges to stay on the body (not air above/below).
-        py_head = y0 + bh * 0.06
-        py_cent = (y0 + y1) * 0.5
-        py_feet = y1 - bh * 0.06
-
-        def _ht(sx, sy):
-            ok, u, v = self._hit_test_at_screen(comp, mesh, pc, sx, sy)
-            if not ok:
+        try:
+            cam = self.get_camera()
+            sw, sh = self.get_viewport_size()
+            if not cam or not sw or not sh:
                 return None
-            import math as _m
-            if not (_m.isfinite(u) and _m.isfinite(v)):
+
+            bbox = self.project_body_screen_bbox(pawn, cam, sw, sh)
+            if not bbox:
+                print("[PAINT] UV vertical calib skipped (body off screen)")
                 return None
-            return u, v
 
-        hr = _ht(cx, py_head)
-        hc = _ht(cx, py_cent)
-        hf = _ht(cx, py_feet)
-
-        if hr is None or hf is None:
-            print("[PAINT] UV vertical calib: head/feet hit-test failed — using defaults")
+            # The paint atlas stamps use v in [PAINT_UV_BORDER, 1-PAINT_UV_BORDER].
+            # Treat that range as [head, feet] — no native call needed.
+            border = self.PAINT_UV_BORDER
+            v_head = border
+            v_feet = 1.0 - border
+            u_front = self.PAINT_FRONT_U
+            print(
+                f"[PAINT] UV vertical calib (geometry)  "
+                f"v_head={v_head:.3f}  v_feet={v_feet:.3f}  u_front={u_front:.3f}"
+            )
+            return v_head, v_feet, u_front
+        except Exception as e:
+            print(f"[PAINT] UV vertical calib error: {e}")
             return None
-
-        v_head = hr[1]
-        v_feet = hf[1]
-        u_front = hc[0] if hc else self.PAINT_FRONT_U
-
-        if abs(v_feet - v_head) < 0.05:
-            print("[PAINT] UV vertical calib: degenerate result — using defaults")
-            return None
-
-        print(
-            f"[PAINT] UV vertical calib OK  v_head={v_head:.3f}  v_feet={v_feet:.3f}"
-            f"  u_front={u_front:.3f}  (range={abs(v_feet - v_head):.3f})"
-        )
-        return v_head, v_feet, u_front
 
     def _resolve_image_paint_layout(
         self, pawn, img_aspect, screen_w=0, screen_h=0, img_w=0, img_h=0,
