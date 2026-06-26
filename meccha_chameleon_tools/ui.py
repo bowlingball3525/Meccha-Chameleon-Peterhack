@@ -989,6 +989,17 @@ class Menu(QWidget):
         btn_apply_img.clicked.connect(self._apply_paint_image)
         lo.addWidget(btn_apply_img)
 
+        btn_uv_test = QPushButton("UV Test (diagnostic)")
+        btn_uv_test.setToolTip(
+            "Paints 4 colored UV quadrants on your character.\n"
+            "RED = top-left UV, GREEN = top-right, BLUE = bottom-left, YELLOW = bottom-right.\n"
+            "WHITE cross = assumed front centre (u=0.25)  CYAN cross = assumed back centre (u=0.75).\n"
+            "Screenshot front & back then share — lets us fix UV mapping if off."
+        )
+        btn_uv_test.setStyleSheet("background-color: #2a4a6a; color: #aef;")
+        btn_uv_test.clicked.connect(self._run_uv_diagnostic)
+        lo.addWidget(btn_uv_test)
+
         # ── Image quality slider ──────────────────────────────────────────────
         _IMG_QLABELS = {1: "Draft", 2: "Low", 3: "Medium", 4: "High", 5: "Ultra"}
         img_q_row = QHBoxLayout()
@@ -1221,7 +1232,22 @@ class Menu(QWidget):
         txt.setPlainText(
             "=== Peterhack Changelog ===\n"
             "\n"
-            "--- Jun 25, 2026 (latest) ---\n"
+            "--- Jun 26, 2026 (latest) ---\n"
+            "\n"
+            "[UV Diagnostic Tool]\n"
+            "  + New 'UV Test (diagnostic)' button in the Image Paint tab.\n"
+            "    Paints 4 colored quadrants across the UV atlas so you can see\n"
+            "    exactly which UV coordinate maps to which part of the body:\n"
+            "      RED    = top-left UV quadrant  (u 0.0–0.5, v 0.0–0.5)\n"
+            "      GREEN  = top-right UV quadrant (u 0.5–1.0, v 0.0–0.5)\n"
+            "      BLUE   = bottom-left UV quad   (u 0.0–0.5, v 0.5–1.0)\n"
+            "      YELLOW = bottom-right UV quad  (u 0.5–1.0, v 0.5–1.0)\n"
+            "    WHITE cross = assumed front centre at u=0.25, v=0.5.\n"
+            "    CYAN  cross = assumed back centre at u=0.75, v=0.5.\n"
+            "    Screenshot front & back after running this so UV offsets\n"
+            "    can be corrected if the colours appear in wrong spots.\n"
+            "\n"
+            "--- Jun 25, 2026 ---\n"
             "\n"
             "[Image Paint — Centered mode overhauled]\n"
             "  + Centered mode now uses pure UV-space stamping on both the front\n"
@@ -1542,6 +1568,28 @@ class Menu(QWidget):
             "Looking for character... game will pause briefly while painting",
             worker,
             progress_label="Painting",
+        )
+
+    def _run_uv_diagnostic(self):
+        """Launch a UV diagnostic paint job: 4 colored quadrants + centre markers."""
+        def worker():
+            pawn = self.esp.wait_for_paintable_pawn()
+            if not pawn:
+                return False, "Could not find your character — spawn in a match first."
+            ok = self.esp.paint_uv_diagnostic()
+            if ok:
+                return True, (
+                    "UV diagnostic painted!\n"
+                    "RED=top-left UV, GREEN=top-right, BLUE=bottom-left, YELLOW=bottom-right.\n"
+                    "WHITE cross = assumed front (u=0.25), CYAN = assumed back (u=0.75).\n"
+                    "Screenshot your character front & back and share!"
+                )
+            return False, "UV diagnostic failed — are you in a match?"
+
+        self._run_paint_job(
+            "Painting UV diagnostic… game will pause briefly",
+            worker,
+            progress_label="UV Diagnostic",
         )
 
     def _refresh_paint_presets(self):

@@ -4278,6 +4278,86 @@ class MecchaESP:
             print(f"[PRESET] UV applied from preset file ({grid}x{grid})")
         return ok
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # UV Diagnostic: paint 4 colored quadrants so you can see UV→body mapping
+    # ──────────────────────────────────────────────────────────────────────────
+    def paint_uv_diagnostic(self, progress_cb=None):
+        """
+        Paint a UV atlas diagnostic onto the character.
+
+        The UV space [0,1]×[0,1] is split into 4 colored quadrants:
+          • TOP-LEFT   (u 0.0–0.5, v 0.0–0.5) → RED
+          • TOP-RIGHT  (u 0.5–1.0, v 0.0–0.5) → GREEN
+          • BOTTOM-LEFT  (u 0.0–0.5, v 0.5–1.0) → BLUE
+          • BOTTOM-RIGHT (u 0.5–1.0, v 0.5–1.0) → YELLOW
+
+        Markers:
+          • WHITE cross at u=0.25, v=0.5  (assumed front / chest centre)
+          • CYAN  cross at u=0.75, v=0.5  (assumed back / spine centre)
+
+        Take a screenshot of the front and back of your character and share it —
+        this tells us exactly which UV coordinate maps to which body part.
+        """
+        pawn = self._find_local_pawn()
+        if not pawn:
+            print("[DIAG] no local pawn found")
+            return False
+
+        comp = rp(self.pm, pawn + 0x0B68)
+        if not comp or comp <= 0x100000:
+            print("[DIAG] no paint component at pawn+0x0B68")
+            return False
+
+        # Build coloured UV stamps (6×6 per quadrant)
+        SEG = 8
+        RADIUS = 0.08
+
+        quads = [
+            ((0.0, 0.5), (0.0, 0.5), (220,  40,  40)),   # top-left    RED
+            ((0.5, 1.0), (0.0, 0.5), ( 40, 200,  40)),   # top-right   GREEN
+            ((0.0, 0.5), (0.5, 1.0), ( 40,  80, 220)),   # bottom-left BLUE
+            ((0.5, 1.0), (0.5, 1.0), (220, 200,   0)),   # bottom-right YELLOW
+        ]
+        pts = []
+        for (u0, u1), (v0, v1), color in quads:
+            for i in range(SEG):
+                for j in range(SEG):
+                    u = u0 + (u1 - u0) * (i + 0.5) / SEG
+                    v = v0 + (v1 - v0) * (j + 0.5) / SEG
+                    pts.append((u, v, color))
+
+        # White cross at assumed FRONT centre (u=0.25, v=0.5)
+        for du in (-0.06, 0.0, 0.06):
+            pts.append((0.25 + du, 0.50, (255, 255, 255)))
+        for dv in (-0.06, 0.06):
+            pts.append((0.25, 0.50 + dv, (255, 255, 255)))
+
+        # Cyan cross at assumed BACK centre (u=0.75, v=0.5)
+        for du in (-0.06, 0.0, 0.06):
+            pts.append((0.75 + du, 0.50, (0, 230, 230)))
+        for dv in (-0.06, 0.06):
+            pts.append((0.75, 0.50 + dv, (0, 230, 230)))
+
+        print(f"[DIAG] painting {len(pts)} UV diagnostic stamps (radius={RADIUS})")
+        if progress_cb:
+            progress_cb(0, f"UV diagnostic: {len(pts)} stamps…")
+
+        try:
+            with self._game_frozen("DIAG"):
+                self._prepare_paint_component(comp)
+                self._call_clear_paint_channel(comp)
+                self._write_brush_settings(comp, RADIUS, 1.0, 1.0)
+                self._call_paint_pattern(comp, pts, channel=4)
+            print("[DIAG] UV diagnostic done — screenshot front & back now!")
+            if progress_cb:
+                progress_cb(100, "UV diagnostic done — screenshot your character!")
+            return True
+        except Exception as e:
+            import traceback
+            print(f"[DIAG] error: {e}")
+            traceback.print_exc()
+            return False
+
     def paint_image_bgra(
         self, pawn, bgra_bytes, resolution, opacity=255, grid=32, progress_cb=None,
         screen_w=0, screen_h=0, img_aspect=1.0, img_w=0, img_h=0, fast_paint=False,
