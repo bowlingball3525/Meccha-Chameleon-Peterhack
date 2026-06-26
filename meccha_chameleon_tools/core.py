@@ -2511,7 +2511,10 @@ class MecchaESP:
         def q(v):
             return struct.pack("<Q", v)
 
-        sc = b"\x55\x48\x89\xE5\x48\x83\xE4\xF0\x48\x83\xEC\x20"
+        # sub rsp, 0x40: 0x20 shadow + 0x20 for the two stack args at [rsp+0x20/+0x28].
+        # Using 0x20 here writes PlayerController into the saved-rbp slot and corrupts
+        # the thread stack, crashing the game (identical fix to _call_paint_at_screen).
+        sc = b"\x55\x48\x89\xE5\x48\x83\xE4\xF0\x48\x83\xEC\x40"
         sc += b"\x48\xB9" + q(res_ptr)
         sc += b"\x48\xBA" + q(comp)
         sc += b"\x49\xB8" + q(mesh)
