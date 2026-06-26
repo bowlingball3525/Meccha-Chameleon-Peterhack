@@ -4122,29 +4122,35 @@ class MecchaESP:
             print("[PAINT] PaintAtScreenPosition worker unavailable")
             return False
 
+        # Screen-space grid is capped at 64 (4 096 raycasts).
+        # PaintAtScreenPosition does a full raycast per point, so fewer stamps
+        # are needed vs UV painting — the game's raycast handles UV naturally.
+        # Using the full image-quality grid (128-256) packs 16k-65k calls into
+        # one remote shellcode blob and times out after 5 s, hanging the UI.
+        screen_grid = min(grid, 64)
+
         # Build a screen rect that fits the image aspect ratio inside the body bbox.
-        # This ensures no letter-boxing / pillar-boxing — the image fills the body.
         body_rect = self._body_image_screen_rect(bbox, width_fill=0.52, height_fill=0.95)
         paint_rect = self._fit_screen_rect_to_image_aspect(body_rect, img_aspect)
 
         screen_points = self._build_screen_image_points(
-            bgra_bytes, resolution, paint_rect, grid, opacity, img_aspect=img_aspect,
+            bgra_bytes, resolution, paint_rect, screen_grid, opacity, img_aspect=img_aspect,
         )
         if not screen_points:
             print("[PAINT] no opaque pixels in image")
             return False
 
         # Back face: UV paint centred at the spine (u=0.75) with fixed extents.
-        vc  = self.PAINT_BODY_VC
-        hu  = self.PAINT_BODY_HU
-        hv  = self.PAINT_BODY_HV
+        vc    = self.PAINT_BODY_VC
+        hu    = self.PAINT_BODY_HU
+        hv    = self.PAINT_BODY_HV
         u_opp = self.PAINT_BACK_U
         opposite_points = self._build_uv_image_points_for_rect(
             bgra_bytes, resolution, grid, opacity, u_opp, vc, hu, hv,
             img_aspect=img_aspect,
         )
 
-        radius   = min(0.5, 1.25 / grid)
+        radius   = min(0.5, 1.25 / screen_grid)
         brush_op = max(0.0, min(1.0, opacity / 255.0))
         base_color = self._opaque_image_average(bgra_bytes, resolution)
         total_stamps = len(screen_points) + len(opposite_points)
@@ -4159,14 +4165,26 @@ class MecchaESP:
         self._prepare_paint_component(comp)
         self._write_brush_settings(comp, radius, 1.0, brush_op)
 
-        # Front: screen-space (channel=4 / All — same as camo; Albedo-only is invisible)
-        ok_screen = self._call_paint_at_screen(
-            comp, mesh, pc, screen_worker, screen_points, channel=4,
-        )
-        _report(len(screen_points), total_stamps)
+        # Front: batched screen-space calls (PAINT_UV_BATCH_SAFE = 24 per remote
+        # thread).  Each batch has its own 5-second timeout — no global hang.
+        batch_sz = self.PAINT_UV_BATCH_SAFE
+        ok_screen = True
+        sent = 0
+        for off in range(0, len(screen_points), batch_sz):
+            chunk = screen_points[off:off + batch_sz]
+            if not self._call_paint_at_screen(
+                comp, mesh, pc, screen_worker, chunk, channel=4,
+            ):
+                print(f"[PAINT] screen batch failed at offset {off}")
+                ok_screen = False
+                break
+            sent += len(chunk)
+            _report(sent, total_stamps)
+
         print(
             f"[PAINT] screen({mesh_src}) ok={ok_screen} stamps={len(screen_points)} "
-            f"rect={int(paint_rect[2]-paint_rect[0])}x{int(paint_rect[3]-paint_rect[1])}"
+            f"grid={screen_grid} rect={int(paint_rect[2]-paint_rect[0])}"
+            f"x{int(paint_rect[3]-paint_rect[1])}"
         )
 
         # Back: UV paint under freeze (safe — no hit-test)
