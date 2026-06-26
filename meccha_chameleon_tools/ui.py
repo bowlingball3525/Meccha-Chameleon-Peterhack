@@ -1060,7 +1060,6 @@ class Menu(QWidget):
         # ── Wrap mode dropdown ────────────────────────────────────────────────
         wrap_row = QHBoxLayout()
         wrap_row.addWidget(QLabel("Wrap mode:"))
-        from PyQt5.QtWidgets import QComboBox
         self.cmb_wrap_mode = QComboBox()
         self.cmb_wrap_mode.addItem("Projector  (front → back)", "projector")
         self.cmb_wrap_mode.addItem("Centered   (chest outward)", "centered")
