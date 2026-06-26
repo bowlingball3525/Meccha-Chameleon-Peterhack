@@ -4332,16 +4332,45 @@ class MecchaESP:
         front_u, back_u, vc, hu, hv = layout
         paint_regions = self.PAINT_HEMI_RECTS
 
-        # ── Centered mode: screen-space front + UV back ───────────────────────
-        # PaintAtScreenPosition raycasts each screen pixel directly onto the mesh,
-        # so the image is always perfectly centred on the visible body regardless
-        # of the paint-sphere UV layout.  No UV-atlas assumptions required.
+        # ── Centered mode: UV-space, image on both front and back panels ─────
+        # PaintAtScreenPosition was tried here but raycasts from a first-person
+        # camera hit the inside of the character mesh at random UV islands
+        # (back of head, inner leg, back of arm) — not the chest.
+        # Pure UV-space painting is reliable: map the full image into the front
+        # panel (chest centre u=0.25) and back panel (spine centre u=0.75),
+        # head-to-toe in both cases.
         if wrap_mode == "centered":
-            # Step 1 – clear & flood-white under a brief freeze
+            half_u = 0.23   # front/back panel UV half-width  (0.25±0.23 = 0.02…0.48)
+            half_v = 0.49   # full body height                 (0.5 ±0.49 = 0.01…0.99)
+            vc     = 0.50
+
+            front_pts = self._build_uv_image_points_for_rect(
+                bgra_bytes, resolution, grid, opacity,
+                u_center=self.PAINT_FRONT_U, v_center=vc,
+                half_u=half_u, half_v=half_v,
+                img_aspect=img_aspect,
+            )
+            back_pts = self._build_uv_image_points_for_rect(
+                bgra_bytes, resolution, grid, opacity,
+                u_center=self.PAINT_BACK_U, v_center=vc,
+                half_u=half_u, half_v=half_v,
+                img_aspect=img_aspect,
+            )
+            uv_points = front_pts + back_pts
+            if not uv_points:
+                print("[PAINT] no opaque pixels in image")
+                return False
+
+            print(
+                f"[PAINT] centered UV stamps front={len(front_pts)} "
+                f"back={len(back_pts)} grid={grid}"
+            )
+
+            ok = False
             with self._game_frozen("PAINT"):
                 live_comp = rp(self.pm, pawn + 0x0B68)
                 if not live_comp or live_comp <= 0x100000:
-                    print("[PAINT] paint component lost before clear")
+                    print("[PAINT] paint component lost before apply")
                     return False
                 self._prepare_paint_component(live_comp)
                 self._call_clear_paint_channel(live_comp)
@@ -4355,11 +4384,18 @@ class MecchaESP:
                 self._call_paint_pattern(live_comp, white_pts, channel=4)
                 print("[PAINT] white flood done (4 stamps, r=0.35)")
 
-            # Step 2 – screen-space front + UV back (no hit-test calls)
-            ok = self._paint_image_centered(
-                pawn, bgra_bytes, resolution, grid, opacity, progress_cb,
-                img_aspect=img_aspect,
-            )
+                ok = self._apply_uv_paint_points(
+                    pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
+                    progress_cb=progress_cb, freeze=False, base_color=base_color,
+                    base_regions=(
+                        (self.PAINT_FRONT_U - half_u, vc - half_v,
+                         self.PAINT_FRONT_U + half_u, vc + half_v),
+                        (self.PAINT_BACK_U  - half_u, vc - half_v,
+                         self.PAINT_BACK_U  + half_u, vc + half_v),
+                    ),
+                    comp=live_comp, fast_mode=fast_paint,
+                )
+
             if ok:
                 self._last_paint_bgra = bytes(bgra_bytes)
                 self._last_paint_resolution = resolution
