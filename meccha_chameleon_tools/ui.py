@@ -4,6 +4,8 @@ import math
 import ctypes
 import sys
 import os
+import threading
+import time
 from typing import Tuple, Optional
 
 from PyQt5.QtWidgets import (
@@ -35,6 +37,14 @@ def rotation_to_axes(rot):
     right = (sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp)
     up = (-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp)
     return forward, right, up
+
+
+def rotate_local_by_actor_rot(lx, ly, lz, rot_deg):
+    """Rotate a body-local offset by actor FRotator (pitch, yaw, roll in degrees)."""
+    if not rot_deg:
+        return lx, ly, lz
+    q = MecchaESP._euler_to_quat(*rot_deg)
+    return MecchaESP._quat_rotate(q, (lx, ly, lz))
 
 
 def w2s(world_pos, camera, screen_w, screen_h):
@@ -152,6 +162,7 @@ MOD_NOREPEAT = 0x4000
 HK_MENU_INSERT = 1
 HK_MENU_F1 = 2
 HK_CAMO_F10 = 3
+HK_CAMO_F9 = 4
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +395,9 @@ def _quality_to_image_grid(level: int) -> int:
 class Menu(QWidget):
     paint_job_finished = pyqtSignal(bool, str)
     paint_job_progress = pyqtSignal(int, int)
+    camo_job_finished = pyqtSignal(bool)
+    camo_status_update = pyqtSignal(str)
+    camo_do_wrap_sample = pyqtSignal()
 
     # Peter pants green sampled from logo — RGB(32, 96, 16)
     PETER_GREEN       = "#206010"
@@ -440,12 +454,25 @@ class Menu(QWidget):
         self._paint_busy = False
         self.paint_job_finished.connect(self._finish_paint_job)
         self.paint_job_progress.connect(self._on_paint_job_progress)
+        self.camo_job_finished.connect(self._camo_menu_done)
+        self.camo_status_update.connect(self._on_camo_status_update)
+        self.camo_do_wrap_sample.connect(self._on_camo_wrap_sample)
+        self._camo_sample_holder = {}
         self._paint_watchdog = QTimer(self)
         self._paint_watchdog.setSingleShot(True)
         self._paint_watchdog.timeout.connect(self._paint_watchdog_timeout)
+        self._camo_watchdog = QTimer(self)
+        self._camo_watchdog.setSingleShot(True)
+        self._camo_watchdog.timeout.connect(self._camo_watchdog_timeout)
+        self._camo_force_reset_timer = QTimer(self)
+        self._camo_force_reset_timer.setSingleShot(True)
+        self._camo_force_reset_timer.timeout.connect(self._camo_force_reset_if_stuck)
         self._overlay = None
         self._hotkeys_registered = False
         self._hotkeys_native = False
+        self._camo_thread = None
+        self._camo_busy = False
+        self._camo_stop_event = threading.Event()
         # Seed legacy camo fields from the camo quality level on startup.
         _camo_sz, _camo_q = _quality_to_camo_settings(
             max(1, min(20, getattr(self.config, "paint_quality", 8)))
@@ -456,8 +483,279 @@ class Menu(QWidget):
         self._build_ui()
         self.setFixedSize(580, 820)
 
+    def _on_camo_status_update(self, text):
+        if hasattr(self, "lbl_camo_status"):
+            self.lbl_camo_status.setText(text)
+        self._camo_set_overlay_feedback(text.upper(), 120)
+
     def attach_overlay(self, overlay):
         self._overlay = overlay
+
+    def _camo_set_overlay_feedback(self, text, frames=60):
+        if self._overlay:
+            self._overlay._camo_feedback = text
+            self._overlay._camo_feedback_count = frames
+
+    def _update_camo_buttons(self):
+        painting = bool(getattr(self, "_camo_busy", False))
+        if hasattr(self, "btn_camo_apply"):
+            self.btn_camo_apply.setEnabled(not painting)
+        # Stop is always available — it closes meccha-camouflage.exe even when idle.
+
+    def _reset_camo_job_state(self, status_text="Ready — use buttons or F10/F9"):
+        """Clear camo busy/abort state so Apply works again."""
+        self._camo_watchdog.stop()
+        self._camo_force_reset_timer.stop()
+        self._camo_busy = False
+        self._camo_thread = None
+        self._camo_stop_event.clear()
+        try:
+            self.esp._camo_abort = False
+        except Exception:
+            pass
+        self._update_camo_buttons()
+        if hasattr(self, "lbl_camo_status"):
+            self.lbl_camo_status.setText(status_text)
+
+    def _camo_watchdog_timeout(self):
+        if not getattr(self, "_camo_busy", False):
+            return
+        print("[CAMO] UI watchdog — forcing camo reset", flush=True)
+        self.esp.camo_stop()
+        self._camo_set_overlay_feedback("CAMO TIMEOUT", 90)
+        self._reset_camo_job_state("Timed out — you can try again")
+
+    def _camo_force_reset_if_stuck(self):
+        if not getattr(self, "_camo_busy", False):
+            return
+        print("[CAMO] force-reset after stop", flush=True)
+        self._reset_camo_job_state("Ready — use buttons or F10/F9")
+
+    def _paint_camo_now(self):
+        """Apply camo — used by menu button, F10, and overlay."""
+        if not self.config.camouflage_enabled:
+            self.lbl_camo_status.setText("Camouflage disabled — enable checkbox first")
+            self._camo_set_overlay_feedback("CAMO DISABLED", 60)
+            return
+        if getattr(self, "_camo_busy", False):
+            self.lbl_camo_status.setText("Already painting...")
+            return
+        if self._camo_thread and self._camo_thread.is_alive():
+            self.lbl_camo_status.setText("Still stopping — wait a moment...")
+            return
+        self._camo_force_reset_timer.stop()
+        self._camo_stop_event.clear()
+        self.esp._camo_abort = False
+        self._camo_busy = True
+        self.lbl_camo_status.setText("Starting...")
+        self._camo_set_overlay_feedback("STARTING...", 600)
+        self._camo_thread = threading.Thread(target=self._camo_menu_worker, daemon=True)
+        self._camo_thread.start()
+        self._camo_watchdog.start(600_000)
+        self._update_camo_buttons()
+
+    def _on_camo_wrap_sample(self):
+        """Main-thread screen capture + UV colour sampling for full-body wrap."""
+        points = None
+        try:
+            if self._overlay and not self._camo_stop_event.is_set():
+                camo_q = max(1, min(10, getattr(self.config, "paint_quality", 8)))
+                sz, cq = _quality_to_camo_settings(camo_q)
+                self.config.camouflage_sample_size = sz
+                self.config.camouflage_quality = cq
+                if self._overlay:
+                    self._overlay.set_paint_throttle(True, quality=camo_q)
+                points = self._overlay._sample_screenspace_pattern(full_body=True)
+        except Exception as exc:
+            print(f"[CAMO] wrap sample failed: {exc}", flush=True)
+        finally:
+            if self._overlay:
+                self._overlay.set_paint_throttle(False)
+        holder = getattr(self, "_camo_sample_holder", None)
+        if holder is not None:
+            holder["points"] = points
+            ev = holder.get("event")
+            if ev:
+                ev.set()
+
+    def _camo_apply_via_bridge(self, full_wrap=False):
+        """Apply camo through meccha-camouflage.exe (game-thread template_brush_paint)."""
+        if self._camo_stop_event.is_set():
+            return False
+        mode = "full-body wrap" if full_wrap else "standard"
+        print(f"[CAMO] bridge apply ({mode})", flush=True)
+        self.esp._camo_full_body_wrap = bool(full_wrap)
+        try:
+            self.esp.camo_launch_exe()
+        except Exception as exc:
+            print(f"[CAMO] exe launch failed: {exc}", flush=True)
+        if self._camo_stop_event.is_set():
+            return False
+        self.camo_status_update.emit(
+            "Applying camo (back pass)..." if full_wrap else "Applying camo...",
+        )
+        return self.esp.camo_apply()
+
+    def _camo_apply_full_body_wrap(self):
+        """
+        Hybrid 360° wrap:
+          1) Atlas-wrap sample (main thread) — no bridge running yet.
+          2) Single bridge TCP paint (camera-visible back, once).
+          3) UV stamps on front hemisphere only, layered without ClearChannel.
+
+        Never runs UV full-body fallback — that path does not sync material and
+        looks like one solid colour swapping.  Never spam F10 during bridge setup.
+        """
+        if self._camo_stop_event.is_set():
+            return False
+
+        if not self._overlay:
+            print("[CAMO] wrap needs overlay for atlas sampling", flush=True)
+            return False
+
+        try:
+            self.esp.camo_kill_bridge_competition()
+        except Exception as exc:
+            print(f"[CAMO] pre-wrap bridge kill: {exc}", flush=True)
+
+        camo_q = max(1, min(10, getattr(self.config, "paint_quality", 8)))
+        sz, cq = _quality_to_camo_settings(camo_q)
+        self.config.camouflage_sample_size = sz
+        self.config.camouflage_quality = cq
+
+        print("[CAMO] hybrid wrap: sample → bridge back → UV front", flush=True)
+        self.camo_status_update.emit("Sampling front/sides (360°)...")
+        ev = threading.Event()
+        self._camo_sample_holder = {"points": None, "event": ev}
+        self.camo_do_wrap_sample.emit()
+        if not ev.wait(120):
+            print("[CAMO] wrap sample timed out", flush=True)
+            return False
+        if self._camo_stop_event.is_set():
+            return False
+
+        points = self._camo_sample_holder.get("points")
+        if not points:
+            print("[CAMO] wrap sample returned no points", flush=True)
+            return False
+
+        seam = self.esp.PAINT_UV_SEAM
+        front_pts = [p for p in points if p[0] < seam]
+        if len(front_pts) < 4:
+            print(f"[CAMO] too few front-hemi points ({len(front_pts)})", flush=True)
+            return False
+
+        print(
+            f"[CAMO] sampled {len(points)} pts (front={len(front_pts)} "
+            f"back={len(points) - len(front_pts)})",
+            flush=True,
+        )
+
+        print("[CAMO] bridge back-pass (single TCP paint)", flush=True)
+        bridge_ok = self._camo_apply_via_bridge(full_wrap=True)
+        if self._camo_stop_event.is_set():
+            return False
+
+        try:
+            self.esp.camo_kill_bridge_competition()
+        except Exception as exc:
+            print(f"[CAMO] bridge kill before UV front: {exc}", flush=True)
+
+        if not bridge_ok:
+            print(
+                "[CAMO] bridge TCP failed — skipping UV front "
+                "(full-body UV fallback causes solid-colour flicker)",
+                flush=True,
+            )
+            return False
+
+        pawn = self.esp._get_local_pawn()
+        if not pawn:
+            print("[CAMO] wrap UV apply: no local pawn", flush=True)
+            return bridge_ok
+
+        print(
+            f"[CAMO] UV front-hemi layer {len(front_pts)} points "
+            f"(grid={sz} accumulate=True)",
+            flush=True,
+        )
+        self.camo_status_update.emit("Painting front & sides...")
+        uv_ok = self.esp.set_camouflage_screenspace(
+            pawn,
+            front_pts,
+            brush_opacity=self.config.camouflage_opacity / 255.0,
+            fast_paint=(camo_q >= 6),
+            brush_grid=sz,
+            brush_overlap=0.82,
+            wrap_mode=True,
+            accumulate=True,
+        )
+        return bridge_ok and uv_ok
+
+    def _camo_apply_bridge_only(self):
+        """Standard bridge camo — faster single-pass template paint."""
+        return self._camo_apply_via_bridge(full_wrap=False)
+
+    def _camo_menu_worker(self):
+        ok = False
+        try:
+            full_wrap = getattr(self.config, "camo_full_body_wrap", True)
+            if full_wrap:
+                ok = self._camo_apply_full_body_wrap()
+            else:
+                ok = self._camo_apply_bridge_only()
+        except Exception as exc:
+            print(f"[CAMO] worker exception: {exc}", flush=True)
+            ok = False
+        finally:
+            self.camo_job_finished.emit(ok)
+
+    def _camo_menu_done(self, ok):
+        self._camo_watchdog.stop()
+        self._camo_force_reset_timer.stop()
+        self._camo_busy = False
+        self._camo_thread = None
+        self.esp._camo_abort = False
+        stopped = self._camo_stop_event.is_set()
+        if stopped:
+            self.lbl_camo_status.setText("Stopped")
+            self._camo_set_overlay_feedback("CAMO STOPPED", 60)
+        elif ok:
+            if self._overlay:
+                self._overlay._camo_last_apply = time.monotonic()
+                self._overlay._camouflage_active = True
+                self._overlay._camouflage_color = (140, 180, 120)
+            self.lbl_camo_status.setText("Done!")
+            self._camo_set_overlay_feedback("CAMO OK", 90)
+        else:
+            self.lbl_camo_status.setText("Failed — try again")
+            self._camo_set_overlay_feedback("CAMO FAIL", 90)
+        self._camo_stop_event.clear()
+        self._update_camo_buttons()
+        QTimer.singleShot(
+            3000,
+            lambda: self.lbl_camo_status.setText("Ready — Start applies, Stop closes EXE"),
+        )
+
+    def _stop_camo_now(self):
+        """Stop camo — cancels paint and stops meccha-camouflage.exe."""
+        self._camo_stop_event.set()
+        self.esp._camo_abort = True
+        self.lbl_camo_status.setText("Stopping...")
+        self._camo_set_overlay_feedback("STOPPING...", 60)
+        if hasattr(self.esp, "_emergency_unfreeze_game"):
+            self.esp._emergency_unfreeze_game("CAMO-STOP")
+        self.esp.camo_stop()
+        if getattr(self, "_camo_busy", False):
+            # Worker emits camo_job_finished when it exits; fallback reset if stuck.
+            self._camo_force_reset_timer.start(8000)
+        else:
+            self.lbl_camo_status.setText("Stopped — EXE closed")
+            self._camo_set_overlay_feedback("CAMO STOPPED", 60)
+            QTimer.singleShot(
+                2000,
+                lambda: self.lbl_camo_status.setText("Ready — Start applies, Stop closes EXE"),
+            )
 
     def _register_global_hotkeys(self):
         """RegisterHotKey works when Peterhack is elevated and the game is not."""
@@ -469,11 +767,12 @@ class Menu(QWidget):
         user32 = ctypes.windll.user32
         ok_insert = bool(user32.RegisterHotKey(hwnd, HK_MENU_INSERT, MOD_NOREPEAT, 0x2D))
         ok_f1 = bool(user32.RegisterHotKey(hwnd, HK_MENU_F1, MOD_NOREPEAT, 0x70))
-        ok_f10 = bool(user32.RegisterHotKey(hwnd, HK_CAMO_F10, MOD_NOREPEAT, 0x79))
-        self._hotkeys_registered = ok_insert or ok_f1 or ok_f10
+        # F10/F9 are NOT registered here — meccha-camouflage.exe needs global F10 for injection.
+        self._hotkeys_registered = ok_insert or ok_f1
         self._hotkeys_native = ok_insert and ok_f1
         print(
-            f"[UI] global hotkeys Insert={ok_insert} F1={ok_f1} F10={ok_f10} hwnd=0x{hwnd:X}",
+            f"[UI] global hotkeys Insert={ok_insert} F1={ok_f1} "
+            f"(F10/F9 polled, not registered) hwnd=0x{hwnd:X}",
             flush=True,
         )
         if not ok_insert:
@@ -485,7 +784,7 @@ class Menu(QWidget):
         hwnd = int(self.winId())
         if hwnd:
             user32 = ctypes.windll.user32
-            for hid in (HK_MENU_INSERT, HK_MENU_F1, HK_CAMO_F10):
+            for hid in (HK_MENU_INSERT, HK_MENU_F1):
                 user32.UnregisterHotKey(hwnd, hid)
         self._hotkeys_registered = False
         self._hotkeys_native = False
@@ -496,15 +795,17 @@ class Menu(QWidget):
             self.raise_()
             self.activateWindow()
 
+    def _on_hotkey_f9(self):
+        self._stop_camo_now()
+
     def _on_hotkey_f10(self):
-        if not self.config.camouflage_enabled or not self._overlay:
+        if not self.config.camouflage_enabled:
             return
-        import time
-        if time.monotonic() - self._overlay._camo_last_apply >= 3.0:
-            self._overlay._toggle_camouflage()
-        else:
-            self._overlay._camo_feedback = "WAIT..."
-            self._overlay._camo_feedback_count = 30
+        if self._overlay and time.monotonic() - self._overlay._camo_last_apply < 3.0:
+            self._camo_set_overlay_feedback("WAIT...", 30)
+            self.lbl_camo_status.setText("Wait 3s between applies")
+            return
+        self._paint_camo_now()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -521,9 +822,6 @@ class Menu(QWidget):
             if msg.message == WM_HOTKEY:
                 if msg.wParam in (HK_MENU_INSERT, HK_MENU_F1):
                     self._toggle_menu_visibility()
-                    return True, 0
-                if msg.wParam == HK_CAMO_F10:
-                    self._on_hotkey_f10()
                     return True, 0
         return super().nativeEvent(eventType, message)
 
@@ -684,14 +982,14 @@ class Menu(QWidget):
             QScrollBar:vertical {{ width: 0px; }}
             QScrollBar:horizontal {{ height: 0px; }}
         """)
-        self.tab_list.addItems(["VISUALS","RADAR","AIMBOT","COLORS","CAMOUFLAGE","CHANGELOG"])
+        self.tab_list.addItems(["VISUALS","RADAR","AIMBOT","TRAINER","COLORS","CAMOUFLAGE","CHANGELOG"])
         self.tab_list.currentRowChanged.connect(self._switch_tab)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background: transparent;")
 
         self._pages = {}
-        for tab_name in ["VISUALS","RADAR","AIMBOT","COLORS","CAMOUFLAGE","CHANGELOG"]:
+        for tab_name in ["VISUALS","RADAR","AIMBOT","TRAINER","COLORS","CAMOUFLAGE","CHANGELOG"]:
             page = QWidget()
             page.setStyleSheet("background: transparent;")
             self._pages[tab_name] = page
@@ -727,12 +1025,13 @@ class Menu(QWidget):
         self._build_visuals_tab()
         self._build_radar_tab()
         self._build_aimbot_tab()
+        self._build_trainer_tab()
         self._build_colors_tab()
         self._build_camouflage_tab()
         self._build_changelog_tab()
 
     def _switch_tab(self, idx):
-        names = ["VISUALS","RADAR","AIMBOT","COLORS","CAMOUFLAGE","CHANGELOG"]
+        names = ["VISUALS","RADAR","AIMBOT","TRAINER","COLORS","CAMOUFLAGE","CHANGELOG"]
         if 0 <= idx < len(names):
             self.stack.setCurrentIndex(idx)
 
@@ -878,6 +1177,58 @@ class Menu(QWidget):
         lo.addLayout(ar)
         lo.addStretch()
 
+    def _build_trainer_tab(self):
+        p = self._pages["TRAINER"]
+        lo = QVBoxLayout(p)
+        lo.setContentsMargins(4, 4, 4, 4)
+        lo.setSpacing(4)
+
+        hdr = QLabel("TRAINER (memory writes)")
+        hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
+        lo.addWidget(hdr)
+
+        hint = QLabel(
+            "Logs go to C:\\peterhack\\logs\\latest.log when Debug Logging is on.\n"
+            "No Gun CD / No Recoil match Desktop\\trainer. Others use SDK offsets."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
+        lo.addWidget(hint)
+
+        self.cb_trainer_debug = self._chk("Debug Logging", "trainer_debug")
+        lo.addWidget(self.cb_trainer_debug)
+        lo.addWidget(self._chk("No Gun Cooldown (Hunter)", "trainer_no_gun_cooldown"))
+        lo.addWidget(self._chk("No Recoil", "trainer_no_recoil"))
+        lo.addWidget(self._chk("No Decoy Cooldown", "trainer_no_decoy_cooldown"))
+        lo.addWidget(self._chk("Set Decoy Num", "trainer_set_decoy_num"))
+
+        dr = QHBoxLayout()
+        dr.addWidget(QLabel("Decoy count:"))
+        self.spn_decoy_count = QSpinBox()
+        self.spn_decoy_count.setRange(0, 99)
+        self.spn_decoy_count.setValue(int(self.config.trainer_decoy_count))
+        self.spn_decoy_count.valueChanged.connect(
+            lambda v: setattr(self.config, "trainer_decoy_count", int(v))
+        )
+        dr.addWidget(self.spn_decoy_count)
+        lo.addLayout(dr)
+
+        lo.addWidget(self._chk("Anti-Clipping (noclip)", "trainer_anti_clipping"))
+        lo.addWidget(self._chk("Anti-Kick (watchdog)", "trainer_anti_kick"))
+        lo.addWidget(self._chk("Auto-Rename", "trainer_auto_rename"))
+
+        rr = QHBoxLayout()
+        rr.addWidget(QLabel("Rename to:"))
+        self.txt_trainer_rename = QLineEdit(self.config.trainer_rename_text)
+        self.txt_trainer_rename.setMaxLength(32)
+        self.txt_trainer_rename.textChanged.connect(
+            lambda t: setattr(self.config, "trainer_rename_text", t.strip())
+        )
+        rr.addWidget(self.txt_trainer_rename)
+        lo.addLayout(rr)
+
+        lo.addStretch()
+
     def _build_colors_tab(self):
         p = self._pages["COLORS"]
         lo = QVBoxLayout(p)
@@ -906,60 +1257,73 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
 
+        hdr = QLabel("CAMOUFLAGE (SilentJMA bridge)")
+        hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
+        lo.addWidget(hdr)
+
         self.cb_camo = self._chk("Camouflage Enabled", "camouflage_enabled")
         lo.addWidget(self.cb_camo)
 
-        btn_camo = QPushButton("Apply Camouflage")
-        btn_camo.setToolTip("Sample environment colours and paint them onto your character (also F10).")
-        btn_camo.clicked.connect(
-            lambda: self._overlay._toggle_camouflage() if self._overlay else None
+        self.cb_camo_wrap = self._chk(
+            "Wrap around full body (360°)",
+            "camo_full_body_wrap",
         )
-        lo.addWidget(btn_camo)
+        self.cb_camo_wrap.setToolTip(
+            "360° wrap: sample floor in a ring, bridge paints your back once,\n"
+            "then UV-stamps front/sides on top. Requires bridge TCP (F10 in-game once).\n"
+            "Unchecked = faster single-pass bridge camo (camera-facing only)."
+        )
+        lo.addWidget(self.cb_camo_wrap)
 
-        # ── Camo quality slider (1-20) ────────────────────────────────────────
-        camo_q_row = QHBoxLayout()
-        camo_q_row.addWidget(QLabel("Camo quality:"))
-        self.sld_paint_quality = QSlider(Qt.Horizontal)
-        self.sld_paint_quality.setRange(1, 20)
-        _camo_q_init = max(1, min(20, getattr(self.config, "paint_quality", 8)))
-        self.sld_paint_quality.setValue(_camo_q_init)
-        self.sld_paint_quality.setTickPosition(QSlider.TicksBelow)
-        self.sld_paint_quality.setTickInterval(1)
-        self.sld_paint_quality.setToolTip(
-            "Camo quality 1-20.\n"
-            "1 = Draft (fastest, blocky)  |  10 = High  |  20 = God Mode (photo-realistic, slowest).\n"
-            "Levels 15+ paint 25,000+ UV stamps for near-perfect environment matching."
+        info = QLabel(
+            "Start → launches EXE + applies camo. Status shows each step.\n"
+            "Wait for Done! before starting again. Stop closes the EXE anytime.\n"
+            "Run Peterhack as Administrator."
         )
-        camo_q_row.addWidget(self.sld_paint_quality)
-        self.lbl_paint_quality = QLabel(
-            f"{_CAMO_QLABELS.get(_camo_q_init, str(_camo_q_init))} ({_camo_q_init})"
-        )
-        self.lbl_paint_quality.setStyleSheet(
-            "color: #eee; font-size: 11px; min-width: 90px;"
-        )
-        def _on_camo_quality_change(v):
-            setattr(self.config, "paint_quality", v)
-            _camo_size, _camo_qual = _quality_to_camo_settings(v)
-            self.config.camouflage_sample_size = _camo_size
-            self.config.camouflage_quality     = _camo_qual
-            self.lbl_paint_quality.setText(f"{_CAMO_QLABELS.get(v, str(v))} ({v})")
-        self.sld_paint_quality.valueChanged.connect(_on_camo_quality_change)
-        camo_q_row.addWidget(self.lbl_paint_quality)
-        lo.addLayout(camo_q_row)
+        info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 0;")
+        info.setWordWrap(True)
+        lo.addWidget(info)
 
-        # Opacity slider
-        or_ = QHBoxLayout()
-        or_.addWidget(QLabel("Blend:"))
-        self.sld_camo_opacity = QSlider(Qt.Horizontal)
-        self.sld_camo_opacity.setRange(0, 255)
-        self.sld_camo_opacity.setValue(self.config.camouflage_opacity)
-        self.sld_camo_opacity.valueChanged.connect(lambda v: setattr(self.config, "camouflage_opacity", v))
-        or_.addWidget(self.sld_camo_opacity)
-        self.lbl_camo_val = QLabel(str(self.config.camouflage_opacity))
-        self.lbl_camo_val.setStyleSheet("color: #eee; font-size: 11px; min-width: 30px;")
-        self.sld_camo_opacity.valueChanged.connect(lambda v: self.lbl_camo_val.setText(str(v)))
-        or_.addWidget(self.lbl_camo_val)
-        lo.addLayout(or_)
+        self.lbl_camo_status = QLabel("Ready — Start applies, Stop closes EXE")
+        self.lbl_camo_status.setStyleSheet("color: #888; font-size: 10px; padding: 4px 0;")
+        lo.addWidget(self.lbl_camo_status)
+
+        self.btn_camo_apply = QPushButton("Start Camouflage")
+        self.btn_camo_apply.setFixedHeight(32)
+        self.btn_camo_apply.setToolTip(
+            "Start meccha-camouflage.exe and apply via bridge (same as F10)."
+        )
+        self.btn_camo_apply.setStyleSheet(
+            "QPushButton { background-color: #2a4a1a; border: 1px solid #3a6a2a;"
+            " border-radius: 4px; font-weight: bold; font-size: 12px; }"
+            " QPushButton:hover { background-color: #3a6a2a; }"
+            " QPushButton:disabled { background-color: #1a2a14; color: #666; }"
+        )
+        self.btn_camo_apply.clicked.connect(self._paint_camo_now)
+        lo.addWidget(self.btn_camo_apply)
+
+        self.btn_camo_stop = QPushButton("Stop Camouflage")
+        self.btn_camo_stop.setFixedHeight(32)
+        self.btn_camo_stop.setEnabled(True)
+        self.btn_camo_stop.setToolTip(
+            "Cancel paint and stop meccha-camouflage.exe (same as F9)."
+        )
+        self.btn_camo_stop.setStyleSheet(
+            "QPushButton { background-color: #4a2a1a; border: 1px solid #6a3a2a;"
+            " border-radius: 4px; font-weight: bold; font-size: 12px; }"
+            " QPushButton:hover { background-color: #6a3a2a; }"
+            " QPushButton:disabled { background-color: #2a1a14; color: #666; }"
+        )
+        self.btn_camo_stop.clicked.connect(self._stop_camo_now)
+        lo.addWidget(self.btn_camo_stop)
+
+        legacy = QLabel(
+            "Previous Peterhack screen-sampling camo is backed up in\n"
+            "backup/camo_peterhack_pre_silentjma/ — see RESTORE.md to revert."
+        )
+        legacy.setStyleSheet("color: #666; font-size: 10px;")
+        legacy.setWordWrap(True)
+        lo.addWidget(legacy)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -1182,10 +1546,16 @@ class Menu(QWidget):
     def _on_paint_job_progress(self, done, total):
         pct = int(done * 100 / max(1, total))
         label = getattr(self, "_paint_progress_label", "Painting")
-        self._set_paint_status(
-            f"{label}... {pct}% (game frozen — wait until done)",
-            ok=None,
-        )
+        if done >= total:
+            self._set_paint_status(
+                f"{label}... {pct}% — syncing texture (keep waiting)",
+                ok=None,
+            )
+        else:
+            self._set_paint_status(
+                f"{label}... {pct}% (applying — game may stutter)",
+                ok=None,
+            )
 
     def _paint_watchdog_timeout(self):
         if self._paint_busy:
@@ -1261,7 +1631,37 @@ class Menu(QWidget):
         txt.setPlainText(
             "=== Peterhack Changelog ===\n"
             "\n"
-            "--- Jun 26, 2026 (latest) ---\n"
+            "--- Jun 29, 2026 (latest) ---\n"
+            "\n"
+            "[Camouflage — SilentJMA bridge + hybrid 360° wrap]\n"
+            "  + Standard camo uses meccha-camouflage.exe TCP bridge\n"
+            "    (template_brush_paint) for proper in-game material sync.\n"
+            "  + 'Wrap around full body' checkbox: hybrid 360° path —\n"
+            "      1) Atlas-wrap screen sample (ring around body)\n"
+            "      2) Single bridge TCP paint (camera-visible back)\n"
+            "      3) UV stamps on front hemisphere only (no ClearChannel)\n"
+            "    Rotating the character does not help in 3rd person — the\n"
+            "    camera follows and still sees the back.\n"
+            "  + Fixed bridge setup spamming F10 (each pulse repainted the\n"
+            "    back via the injected DLL even when TCP was not connected).\n"
+            "    Now: inject once, wait for TCP, at most one F10 if needed.\n"
+            "  + Removed UV full-body fallback when bridge TCP fails — that\n"
+            "    path logged success but looked like one solid colour swapping.\n"
+            "  + Start / Stop Camouflage buttons; F10 apply, F9 stop (polled).\n"
+            "  + Bundled camo/ binaries: meccha-camouflage.exe, xenos DLL,\n"
+            "    injector (place alongside Peterhack in camo/ folder).\n"
+            "\n"
+            "[Trainer tab]\n"
+            "  + Ported trainer toggles (No Gun CD, No Recoil, etc.) with\n"
+            "    debug logging to latest.log ([TRAINER:TAG] lines).\n"
+            "\n"
+            "[Logging / paint stability]\n"
+            "  + Session logs mirror to C:\\peterhack\\logs\\latest.log.\n"
+            "  + PaintAtUV worker resolved once per session (less log spam).\n"
+            "  + CAMO UV accumulate mode uses BeginStroke + EndStroke flush\n"
+            "    while frozen (no post-unfreeze injects — avoids UE crashes).\n"
+            "\n"
+            "--- Jun 26, 2026 ---\n"
             "\n"
             "[Image Paint — brush radius fix]\n"
             "  + Fixed image paint showing only tiny specks on a white body.\n"
@@ -1605,8 +2005,15 @@ class Menu(QWidget):
             self.paint_job_progress.emit(done, total)
 
         fast_paint = getattr(self.config, "image_quality", 3) >= 5
+        wrap_mode = getattr(self.config, "image_wrap_mode", "projector")
+        mode_label = MecchaESP.image_wrap_mode_label(wrap_mode)
 
         def worker():
+            print(
+                f"[PAINT] Apply Image to Character — mode={mode_label}, "
+                f"grid={grid}, quality={getattr(self.config, 'image_quality', 3)}"
+            )
+            print("[PAINT] image apply worker started")
             pawn = self.esp.wait_for_paintable_pawn()
             if not pawn:
                 return False, "Could not find your character — spawn in a match first."
@@ -1615,7 +2022,7 @@ class Menu(QWidget):
                 progress_cb=_paint_progress,
                 img_aspect=img_aspect, img_w=orig_w, img_h=orig_h,
                 fast_paint=fast_paint,
-                wrap_mode=getattr(self.config, "image_wrap_mode", "projector"),
+                wrap_mode=wrap_mode,
             )
             if ok:
                 return True, (
@@ -1624,7 +2031,7 @@ class Menu(QWidget):
             return False, "Image apply failed — try again in a match."
 
         self._run_paint_job(
-            "Looking for character... game will pause briefly while painting",
+            "Looking for character... game may stutter briefly while painting",
             worker,
             progress_label="Painting",
         )
@@ -1803,7 +2210,12 @@ class Overlay(QWidget):
         self._last_cam = None           # last-known-good camera; survives free-cam gaps
         self._camouflage_active = False
         self._camouflage_color = None  # Tuple[int,int,int] when sampled
-        self._camo_key_held = False    # edge detection for F10
+        self._camo_key_held = False    # legacy edge detect (unused)
+        self._camo_f9_held = False
+        self._f10_down_count = 0
+        self._f10_last_fire_ms = 0
+        self._f9_down_count = 0
+        self._f9_last_fire_ms = 0
         self._camo_feedback = ""       # brief status text ("Sampling...", "Camo ON", etc.)
         self._camo_feedback_count = 0
         self._original_pawn_color = None  # (r,g,b) to restore when camo toggled off
@@ -1862,12 +2274,40 @@ class Overlay(QWidget):
             return True
         return False
 
-    def _capture_region_bits(self, rx0, ry0, rw, rh, hide_overlay=True):
+    def _is_likely_player_model_pixel(self, rgb):
+        """Bright neutral/white pixels from the default local chameleon body."""
+        if not rgb or len(rgb) < 3:
+            return False
+        r, g, b = rgb[0], rgb[1], rgb[2]
+        if r > 235 and g > 235 and b > 235:
+            return True
+        if r > 215 and g > 215 and b > 215:
+            if abs(r - g) < 20 and abs(g - b) < 20:
+                return True
+        return False
+
+    def _camo_pixel_ok(self, rgb):
+        """True when a sampled pixel is usable background (not ESP or local body)."""
+        if not rgb:
+            return False
+        if self._is_esp_pixel(rgb):
+            return False
+        if getattr(self.config, "camouflage_hide_local_body", True):
+            return not self._is_likely_player_model_pixel(rgb)
+        return True
+
+    def _capture_region_bits(
+        self, rx0, ry0, rw, rh, hide_overlay=True, local_pawn=0, manage_body_hide=True,
+    ):
         """
         BitBlt a screen region aligned to the game client area.
 
         When hide_overlay is True the ESP overlay is hidden briefly so sampled
         pixels come from the game only (not our drawn boxes, dots, or labels).
+        When camouflage_hide_local_body is enabled, the local body meshes are
+        hidden for one capture frame so the white player model is not sampled.
+
+        Pass manage_body_hide=False when the caller already holds camo_sampling_hide_local.
         """
         hid = False
         try:
@@ -1879,7 +2319,14 @@ class Overlay(QWidget):
         if rw < 1 or rh < 1:
             return None
 
-        try:
+        hide_body = bool(
+            manage_body_hide
+            and local_pawn
+            and getattr(self.config, "camouflage_hide_local_body", True)
+        )
+
+        def _blit_capture():
+            nonlocal hid
             if hide_overlay:
                 hid = True
                 self._camo_sampling = True
@@ -1919,6 +2366,12 @@ class Overlay(QWidget):
             if not bits or len(bits) < rw * rh * 4:
                 return None
             return bits
+
+        try:
+            if hide_body:
+                with self.esp.camo_sampling_hide_local(local_pawn, enabled=True):
+                    return _blit_capture()
+            return _blit_capture()
         finally:
             if hid:
                 self._camo_sampling = False
@@ -2004,19 +2457,48 @@ class Overlay(QWidget):
                             break
             self._key_states[name] = bool(state)
 
-        if self.config.camouflage_enabled and menu and not getattr(menu, "_hotkeys_registered", False):
+        if self.config.camouflage_enabled and menu:
             VK_F10 = 0x79
-            camo_held = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F10) & 0x8000)
-            if camo_held and not self._camo_key_held:
+            f10_raw = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F10) & 0x8000)
+            if f10_raw:
+                self._f10_down_count += 1
+            else:
+                self._f10_down_count = 0
+            now_ms = int(time.time() * 1000)
+            if (
+                self._f10_down_count >= 2
+                and (now_ms - self._f10_last_fire_ms) > 3000
+                and (time.monotonic() - self._camo_last_apply) >= 3.0
+            ):
                 menu._on_hotkey_f10()
-            self._camo_key_held = camo_held
+                self._f10_last_fire_ms = now_ms
+                self._f10_down_count = 0
+
+            VK_F9 = 0x78
+            f9_raw = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F9) & 0x8000)
+            if f9_raw:
+                self._f9_down_count += 1
+            else:
+                self._f9_down_count = 0
+            if self._f9_down_count >= 2 and (now_ms - self._f9_last_fire_ms) > 1000:
+                menu._on_hotkey_f9()
+                self._f9_last_fire_ms = now_ms
+                self._f9_down_count = 0
 
     def _toggle_camouflage(self):
+        """Delegate to Menu — F10 polling and legacy callers."""
+        if self.menu:
+            self.menu._paint_camo_now()
+
+    def _stop_camouflage(self):
+        """Delegate to Menu — F9 polling and legacy callers."""
+        if self.menu:
+            self.menu._stop_camo_now()
+
+    def _toggle_camouflage_legacy_sampling(self):
         """
-        F10 = (re)apply the TRUE chameleon blend. Each press re-samples the floor
-        around the body and repaints via screen-space raycasts, so each body part
-        takes the colour of the floor beneath it. Re-applies fresh every press
-        (no solid-colour 'off' flood).
+        LEGACY — Peterhack screen-sampling chameleon (not used; kept for reference).
+        See backup/camo_peterhack_pre_silentjma/ui.py to restore.
         """
         local_pawn = self.esp._get_local_pawn()
         if not local_pawn:
@@ -2187,7 +2669,9 @@ class Overlay(QWidget):
             return None
 
         # Capture game pixels only — ESP overlay is hidden for the duration.
-        bits = self._capture_region_bits(rx0, ry0, rw, rh, hide_overlay=True)
+        bits = self._capture_region_bits(
+            rx0, ry0, rw, rh, hide_overlay=True, local_pawn=local_pawn,
+        )
 
         if not bits:
             print("[CAMO-SAMPLE] capture returned no data", flush=True)
@@ -2247,7 +2731,7 @@ class Overlay(QWidget):
             return None
         return points
 
-    def _sample_screenspace_pattern(self):
+    def _sample_screenspace_pattern(self, full_body=False):
         """
         See-through camouflage sampler (3rd-person, camera behind player).
 
@@ -2257,17 +2741,9 @@ class Overlay(QWidget):
         gets the sky/ceiling colour, the bottom gets the ground colour, the
         sides get the lateral environment colours.
 
-        Implementation:
-          1. Expand the capture region to 50% beyond the body bounding box so
-             there is real background to sample even for body-centre UV cells.
-          2. Walk budget is proportional to body size so we can always reach
-             the body edge and step into the background from any UV cell.
-          3. Directed walk: each UV cell walks TOWARD ITS NEAREST BODY EDGE
-             first, then continues outward into the background.  This means
-             upper-body cells preferentially sample what's above/above-left/
-             above-right, lower-body cells sample the ground, etc.
-
-        Returns list of (u, v, (r,g,b)) or None on failure.
+        full_body=True maps each atlas UV to a horizontal ring around the body
+        (paint-sphere layout) so front/sides get correct environment colours even
+        when the camera only sees the back (prone / 3rd-person).
         """
         try:
             import win32gui, win32ui, win32con
@@ -2302,14 +2778,20 @@ class Overlay(QWidget):
             (-BODY_HW, BODY_H,  -BODY_HW), (-BODY_HW, BODY_H,   BODY_HW),
             ( BODY_HW, BODY_H,   BODY_HW), ( BODY_HW, BODY_H,  -BODY_HW),
         ]
-        rot  = self.esp.get_actor_root_rotation(local_pawn)
-        yaw  = math.radians(rot[1]) if rot else 0.0
-        cyaw, syaw = math.cos(yaw), math.sin(yaw)
+        rot = self.esp.get_actor_root_rotation(local_pawn)
+        if not rot:
+            rot = (0.0, 0.0, 0.0)
         xs, ys = [], []
         for lx, ly, lz in corners:
-            rx = lx * cyaw - lz * syaw
-            rz = lx * syaw + lz * cyaw
-            s = w2s((pos[0] + rx, pos[1] + ly, pos[2] + rz), cam, sw, sh)
+            if full_body:
+                rx, ry, rz = rotate_local_by_actor_rot(lx, ly, lz, rot)
+            else:
+                yaw = math.radians(rot[1])
+                cyaw, syaw = math.cos(yaw), math.sin(yaw)
+                rx = lx * cyaw - lz * syaw
+                ry = ly
+                rz = lx * syaw + lz * cyaw
+            s = w2s((pos[0] + rx, pos[1] + ry, pos[2] + rz), cam, sw, sh)
             if s[2]:
                 xs.append(s[0]); ys.append(s[1])
         if len(xs) < 4:
@@ -2321,37 +2803,87 @@ class Overlay(QWidget):
         bw = max(8.0, bx1 - bx0)
         bh = max(8.0, by1 - by0)
 
-        # ── Background region: 50% expansion so body-centre UV cells can
-        # reach real environment pixels with the directed walk below.
-        HALO = 0.50
+        # ── Background region ────────────────────────────────────────────────
+        # full_body: capture the whole viewport so front/side ring samples that
+        # project outside the body bbox still hit real environment pixels.
+        HALO = 0.75 if full_body else 0.50
         quality = max(1, int(getattr(self.config, "camouflage_quality", 2)))
-        # Walk budget: enough to cross the body from any interior point to
-        # its edge, then step a bit further into the background.
         MAX_WALK_PX = int(max(bw, bh) * 0.65) + 8
 
-        halo_px_x = max(6, int(bw * HALO))
-        halo_px_y = max(6, int(bh * HALO))
-
-        rx0 = max(0,  int(bx0) - halo_px_x)
-        ry0 = max(0,  int(by0) - halo_px_y)
-        rx1 = min(sw, int(bx1) + halo_px_x + 1)
-        ry1 = min(sh, int(by1) + halo_px_y + 1)
-        rw  = rx1 - rx0
-        rh  = ry1 - ry0
+        if full_body:
+            rx0, ry0 = 0, 0
+            rx1, ry1 = sw, sh
+            rw, rh = sw, sh
+            halo_px_x = halo_px_y = 0
+        else:
+            halo_px_x = max(6, int(bw * HALO))
+            halo_px_y = max(6, int(bh * HALO))
+            rx0 = max(0, int(bx0) - halo_px_x)
+            ry0 = max(0, int(by0) - halo_px_y)
+            rx1 = min(sw, int(bx1) + halo_px_x + 1)
+            ry1 = min(sh, int(by1) + halo_px_y + 1)
+            rw = rx1 - rx0
+            rh = ry1 - ry0
+        mode = "atlas_wrap" if full_body else "screen_bbox"
         print(f"[CAMO-SS] body=({bx0:.0f},{by0:.0f})-({bx1:.0f},{by1:.0f}) "
-              f"halo={halo_px_x}×{halo_px_y}px region={rw}×{rh}", flush=True)
+              f"halo={halo_px_x}×{halo_px_y}px region={rw}×{rh} mode={mode} "
+              f"rot=({rot[0]:.0f},{rot[1]:.0f},{rot[2]:.0f})", flush=True)
         if rw < 8 or rh < 8:
             print("[CAMO-SS] region too small", flush=True)
             return None
 
         # ── Single capture (ESP overlay hidden so game pixels are sampled) ───
-        bits = self._capture_region_bits(rx0, ry0, rw, rh, hide_overlay=True)
+        hide_body = bool(getattr(self.config, "camouflage_hide_local_body", True))
+        import time as _time
+
+        def _pump_render():
+            QApplication.processEvents()
+
+        with self.esp.camo_sampling_hide_local(
+            local_pawn, enabled=hide_body, settle_ms=220, pump_frame=_pump_render,
+        ):
+            for _ in range(2):
+                _pump_render()
+                _time.sleep(0.04)
+            bits = self._capture_region_bits(
+                rx0, ry0, rw, rh,
+                hide_overlay=True,
+                local_pawn=local_pawn,
+                manage_body_hide=False,
+            )
 
         if not bits or len(bits) < rw * rh * 4:
             print("[CAMO-SS] capture failed", flush=True)
             return None
 
+        # ── Body bbox in region-local coords (for hide diagnostic) ───────────
+        ib_x0 = int(bx0) - rx0
+        ib_y0 = int(by0) - ry0
+        ib_x1 = int(bx1) - rx0
+        ib_y1 = int(by1) - ry0
+
         stride = rw * 4
+
+        def _body_pixel_stats():
+            white = bright = total = 0
+            for hy in range(max(0, ib_y0), min(rh, ib_y1 + 1)):
+                for hx in range(max(0, ib_x0), min(rw, ib_x1 + 1)):
+                    i = hy * stride + hx * 4
+                    rgb = (bits[i + 2], bits[i + 1], bits[i])
+                    total += 1
+                    if self._is_likely_player_model_pixel(rgb):
+                        white += 1
+                    elif sum(rgb) > 600:
+                        bright += 1
+            return white, bright, total
+
+        w_cnt, b_cnt, t_cnt = _body_pixel_stats()
+        if t_cnt:
+            print(
+                f"[CAMO-HIDE] body_bbox white={w_cnt}/{t_cnt} "
+                f"({100.0 * w_cnt / t_cnt:.1f}%) bright={b_cnt}",
+                flush=True,
+            )
 
         # ── Pixel helpers (region-local coordinates) ─────────────────────────
         def px(lx, ly):
@@ -2398,11 +2930,7 @@ class Overlay(QWidget):
         else:
             sample_block = block3
 
-        # ── Body silhouette in region-local coords ────────────────────────────
-        ib_x0 = int(bx0) - rx0
-        ib_y0 = int(by0) - ry0
-        ib_x1 = int(bx1) - rx0
-        ib_y1 = int(by1) - ry0
+        # ── Body silhouette centre (bbox already computed above) ───────────────
         bcx   = (ib_x0 + ib_x1) * 0.5
         bcy   = (ib_y0 + ib_y1) * 0.5
 
@@ -2415,12 +2943,12 @@ class Overlay(QWidget):
         for hx in range(0, rw, 2):
             for hy in list(range(0, ib_y0)) + list(range(ib_y1, rh)):
                 c = sample_block(hx, hy)
-                if c and not self._is_esp_pixel(c):
+                if c and self._camo_pixel_ok(c):
                     _halo_samples.append(c)
         for hy in range(ib_y0, ib_y1, 2):
             for hx in list(range(0, ib_x0)) + list(range(ib_x1, rw)):
                 c = sample_block(hx, hy)
-                if c and not self._is_esp_pixel(c):
+                if c and self._camo_pixel_ok(c):
                     _halo_samples.append(c)
 
         if _halo_samples:
@@ -2448,15 +2976,14 @@ class Overlay(QWidget):
         # this entirely: head area walks UP → finds sign/sky; feet walk DOWN →
         # find floor; sides walk LEFT/RIGHT → find environment walls/objects.
 
+        hide_body_capture = bool(
+            getattr(self.config, "camouflage_hide_local_body", True)
+        )
+
         def nearest_bg(lx, ly):
             """
             Walk outward from the character body bbox to find background colour.
-
-            Walks toward the nearest bbox edge first so each body region gets
-            the environment colour visible from that direction:
-              head (rel_y ≈ 0) → walks UP  → samples sign / sky
-              feet (rel_y ≈ 1) → walks DOWN → samples floor / ground
-              sides             → walks L/R → samples surrounding objects
+            Used when the body is still visible during capture.
             """
             bw_px = max(1, ib_x1 - ib_x0)
             bh_px = max(1, ib_y1 - ib_y0)
@@ -2464,10 +2991,10 @@ class Overlay(QWidget):
             rel_y = max(0.0, min(1.0, (ly - ib_y0) / bh_px))
 
             dir_candidates = sorted([
-                (rel_x,       -1,  0),   # toward left  edge
-                (1.0 - rel_x,  1,  0),   # toward right edge
-                (rel_y,        0, -1),   # toward top   edge (head → up)
-                (1.0 - rel_y,  0,  1),   # toward bottom edge (feet → down)
+                (rel_x,       -1,  0),
+                (1.0 - rel_x,  1,  0),
+                (rel_y,        0, -1),
+                (1.0 - rel_y,  0,  1),
             ], key=lambda d: d[0])
 
             for _, dx, dy in dir_candidates:
@@ -2478,15 +3005,13 @@ class Overlay(QWidget):
                     sy = int(ly + dy * k)
                     if not (0 <= sx < rw and 0 <= sy < rh):
                         break
-                    # Transition: detect the moment we leave the body bbox
                     if in_body:
                         still_in = (ib_x0 <= sx <= ib_x1 and ib_y0 <= sy <= ib_y1)
                         if not still_in:
                             in_body = False
-                    # Once outside the body bbox, collect background pixels
                     if not in_body:
                         c = px(sx, sy)
-                        if c and not self._is_esp_pixel(c):
+                        if c and self._camo_pixel_ok(c):
                             samples.append(c)
                             if len(samples) >= 5:
                                 break
@@ -2497,6 +3022,14 @@ class Overlay(QWidget):
                     return (r, g, b)
 
             return median_bg
+
+        def sample_env_at(lx, ly):
+            """Read environment at screen position (direct when body hidden for capture)."""
+            if hide_body_capture:
+                c = sample_block(int(lx), int(ly))
+                if c and self._camo_pixel_ok(c):
+                    return c
+            return nearest_bg(int(lx), int(ly))
 
         # ── Build the UV paint grid ───────────────────────────────────────────
         G = max(1, int(getattr(self.config, "camouflage_sample_size", 32)))
@@ -2511,37 +3044,119 @@ class Overlay(QWidget):
             seen_uv.add(key)
             points.append((u, v, col))
 
-        for j in range(G):
-            for i in range(G):
-                rs = gs = bs = ns = 0
-                for sj in range(quality):
-                    for si in range(quality):
-                        fu = (i + (si + 0.5) / quality) / G
-                        fv = (j + (sj + 0.5) / quality) / G
-                        gsx = bx0 + fu * bw
-                        gsy = by0 + fv * bh
-                        lx = gsx - rx0
-                        ly = gsy - ry0
-                        col = nearest_bg(int(lx), int(ly))
+        if full_body:
+            front_u = MecchaESP.PAINT_FRONT_U
+            pitch_abs = abs(rot[0]) if rot else 0.0
+            prone = pitch_abs > 45.0
+            ring_dist = 155.0 if prone else 120.0
+
+            def sample_atlas_uv(u, v):
+                """Paint-sphere UV → world ring point → screen environment colour."""
+                h_angle = (u - front_u) * 2.0 * math.pi
+                local_y = (v - 0.5) * BODY_H
+                local_x = math.sin(h_angle) * ring_dist
+                local_z = math.cos(h_angle) * ring_dist
+                rx, ry, rz = rotate_local_by_actor_rot(local_x, local_y, local_z, rot)
+                gsx, gsy, _on = w2s(
+                    (pos[0] + rx, pos[1] + ry, pos[2] + rz), cam, sw, sh,
+                )
+                lx = gsx - rx0
+                ly = gsy - ry0
+                if 0 <= lx < rw and 0 <= ly < rh:
+                    col = sample_env_at(int(lx), int(ly))
+                    if col:
+                        return col
+                dx = lx - bcx
+                dy = ly - bcy
+                mag = math.hypot(dx, dy)
+                if mag >= 1.0:
+                    dx /= mag
+                    dy /= mag
+                else:
+                    dx, dy = 0.0, -1.0
+                walk_lx = int(bcx + dx * max(bw, bh) * 0.62)
+                walk_ly = int(bcy + dy * max(bw, bh) * 0.62)
+                return sample_env_at(walk_lx, walk_ly)
+
+            def fill_uv_rect(u0, v0, u1, v1, seg_u, seg_v):
+                """Stamp a UV rectangle with environment colours."""
+                for ii in range(seg_u):
+                    for jj in range(seg_v):
+                        u = u0 + (u1 - u0) * (ii + 0.5) / seg_u
+                        v = v0 + (v1 - v0) * (jj + 0.5) / seg_v
+                        col = sample_atlas_uv(u, v)
                         if col:
-                            rs += col[0]; gs += col[1]; bs += col[2]; ns += 1
-                if ns:
-                    add_point_col(
-                        (i + 0.5) / G, (j + 0.5) / G,
-                        (rs // ns, gs // ns, bs // ns),
-                    )
+                            add_point_col(u, v, col)
 
-        # Border UV points (u/v = 0.01 & 0.99) for arm/edge UV islands
-        border_lx, border_ly = bcx, bcy
-        for edge in (0.01, 0.99):
-            for frac in [(k + 0.5) / G for k in range(G)]:
-                col = nearest_bg(int(border_lx), int(border_ly))
-                if col:
-                    add_point_col(edge, frac, col)
-                    add_point_col(frac, edge, col)
+            border = MecchaESP.PAINT_UV_BORDER
+            seam = MecchaESP.PAINT_UV_SEAM
+            seg = max(G, 28)
 
-        print(f"[CAMO-SS] points={len(points)} G={G} quality={quality} "
-              f"bg={median_bg}", flush=True)
+            # Front hemisphere u∈[0, 0.5) — the white half in 3rd-person (see u=0.5 seam).
+            fu0, fv0, fu1, fv1 = MecchaESP.PAINT_FRONT_HEMI
+            fill_uv_rect(
+                fu0 + border, fv0 + border, seam, fv1 - border,
+                seg_u=seg, seg_v=seg,
+            )
+            print(f"[CAMO-SS] front hemi grid {seg}×{seg} u∈[{fu0+border:.2f},{seam:.2f}]", flush=True)
+
+            # Extra density on calibrated front-body islands (head/chest/legs).
+            island_seg = max(14, seg // 2)
+            for u0, v0, u1, v1, _iy0, _iy1 in MecchaESP.PAINT_FRONT_ISLANDS:
+                fill_uv_rect(u0, v0, u1, v1, island_seg, island_seg)
+
+            # Back hemisphere UV backup (bridge usually covers this; fills gaps at seam).
+            bu0, bv0, bu1, bv1 = MecchaESP.PAINT_BACK_HEMI
+            fill_uv_rect(
+                max(bu0, seam + 0.01), bv0 + border, bu1 - border, bv1 - border,
+                seg_u=max(G, 20), seg_v=max(G, 20),
+            )
+
+            for edge in (0.01, seam - 0.02, seam + 0.02, 0.99):
+                for frac in [(k + 0.5) / seg for k in range(seg)]:
+                    col = sample_atlas_uv(edge, frac)
+                    if col:
+                        add_point_col(edge, frac, col)
+                    col = sample_atlas_uv(frac, edge)
+                    if col:
+                        add_point_col(frac, edge, col)
+        else:
+            for j in range(G):
+                for i in range(G):
+                    rs = gs = bs = ns = 0
+                    for sj in range(quality):
+                        for si in range(quality):
+                            fu = (i + (si + 0.5) / quality) / G
+                            fv = (j + (sj + 0.5) / quality) / G
+                            gsx = bx0 + fu * bw
+                            gsy = by0 + fv * bh
+                            lx = gsx - rx0
+                            ly = gsy - ry0
+                            col = sample_env_at(int(lx), int(ly))
+                            if col:
+                                rs += col[0]; gs += col[1]; bs += col[2]; ns += 1
+                    if ns:
+                        add_point_col(
+                            (i + 0.5) / G, (j + 0.5) / G,
+                            (rs // ns, gs // ns, bs // ns),
+                        )
+
+            for edge in (0.01, 0.99):
+                for frac in [(k + 0.5) / G for k in range(G)]:
+                    bx = int(ib_x0 + edge * (ib_x1 - ib_x0))
+                    by = int(ib_y0 + frac * (ib_y1 - ib_y0))
+                    col = sample_env_at(bx, by)
+                    if col:
+                        add_point_col(edge, frac, col)
+                        add_point_col(frac, edge, col)
+
+        unique_cols = len({p[2] for p in points})
+        front_n = sum(1 for p in points if p[0] < MecchaESP.PAINT_UV_SEAM)
+        back_n = len(points) - front_n
+        print(f"[CAMO-SS] points={len(points)} front={front_n} back={back_n} "
+              f"unique_colors={unique_cols} G={G} quality={quality} bg={median_bg} "
+              f"direct={hide_body_capture} mode={mode} "
+              f"ring={ring_dist if full_body else 'n/a'}", flush=True)
         if len(points) < 4:
             print("[CAMO-SS] too few points", flush=True)
             return None
@@ -2689,6 +3304,11 @@ class Overlay(QWidget):
             painter.setPen(QPen(QColor(255, 255, 255)))
             painter.drawText(10, 20, "NO CAMERA")
             return
+
+        try:
+            self.esp.tick_trainer(self.config)
+        except Exception as exc:
+            print(f"[TRAINER:TICK] overlay error: {exc}", flush=True)
 
         # Sticky player cache in core.get_players() — survives empty/partial reads (max 24).
         all_players = self.esp.get_players(

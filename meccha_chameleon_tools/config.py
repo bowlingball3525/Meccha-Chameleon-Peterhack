@@ -56,6 +56,18 @@ class Config:
     aimbot_show_fov: bool = True
     aimbot_visible_check: bool = False
 
+    # Trainer (ported from Desktop/trainer)
+    trainer_debug: bool = True
+    trainer_no_gun_cooldown: bool = False
+    trainer_no_recoil: bool = False
+    trainer_no_decoy_cooldown: bool = False
+    trainer_set_decoy_num: bool = False
+    trainer_decoy_count: int = 5
+    trainer_anti_clipping: bool = False
+    trainer_anti_kick: bool = False
+    trainer_auto_rename: bool = False
+    trainer_rename_text: str = "Player"
+
     # Radar
     radar_enabled: bool = False
     radar_size: int = 180
@@ -67,6 +79,8 @@ class Config:
     camouflage_sample_size: int = 32   # legacy — now driven by paint_quality
     camouflage_quality: int = 2        # legacy — now driven by paint_quality
     camouflage_opacity: int = 200
+    camouflage_hide_local_body: bool = True  # hide local mesh during screen sampling
+    camo_full_body_wrap: bool = False        # bridge two-pass 360° (off = standard bridge camo)
     paint_image_path: str = ""
     paint_image_opacity: int = 255
     paint_image_grid: int = 32

@@ -11,6 +11,9 @@ import ctypes
 import pymem
 from contextlib import contextmanager
 
+from meccha_chameleon_tools.camo_bridge import CamoBridgeMixin
+from meccha_chameleon_tools.trainer import TrainerMixin
+
 PAINT_PRESETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paint_presets")
 PAINT_FILE_MAGIC = b"MECHPAINT\x00"
 PAINT_FILE_VERSION = 2
@@ -458,13 +461,20 @@ class OffsetResolver:
 # ---------------------------------------------------------------------------
 # Game reader
 # ---------------------------------------------------------------------------
-class MecchaESP:
+class MecchaESP(CamoBridgeMixin, TrainerMixin):
     MAX_ESP_PLAYERS = 24
     PAINT_UV_BATCH_SIZE = 128    # default stamps per remote call (frozen apply)
     PAINT_UV_BATCH_FAST = 256    # larger batches when game is frozen
     PAINT_UV_BATCH_SAFE = 24     # max stamps per shellcode (avoids timeout use-after-free)
+    CAMO_MAX_BRUSH_PX = 32.0     # huge brushes corrupt RT / crash on unfreeze flush
+    CAMO_MAX_STAMPS = 16384      # paint full grid when possible — subsampling causes gaps
+    CAMO_WRAP_MAX_STAMPS = 8192  # wrap 360° — fewer injects, still covers both hemispheres
     PAINT_LIVE_BATCH_PAUSE = 0.022  # seconds between live batches (camo unfrozen path)
     MIN_PAINT_ALPHA = 24         # skip transparent PNG pixels (avoid black stamps)
+    IMAGE_WRAP_MODE_LABELS = {
+        "projector": "Projector (front → back, full-atlas wrap)",
+        "centered": "Centered (chest outward, island UV map)",
+    }
     # Paint-sphere atlas layout (confirmed via UV diagnostic, Jun 2026):
     #   The atlas is NOT one rectangle per side — head, torso, and legs live in
     #   separate UV islands scattered across u/v space.
@@ -546,7 +556,7 @@ class MecchaESP:
         (bytes([0x48, 0x8D, 0x3D, 0x00, 0x00, 0x00, 0x00]),
          bytes([1, 1, 1, 0, 0, 0, 0])),
     )
-    FNAMEPOOL_DELTA = 0xE3B40
+    FNAMEPOOL_DELTA = 0x11CB58   # GObjects − GNames (dump 5.6.1-44394996)
 
     OFFSET_MAP = {
         "UWorld::GameState": ("World", "GameState"),
@@ -671,17 +681,28 @@ class MecchaESP:
         self._bone_cache = {}
         self._paint_screen_worker_rva = None   # cached native PaintAtScreenPosition worker
         self._hittest_screen_worker_rva = None
+        self._paint_at_uv_worker_rva = None    # cached PaintAtUV deep native worker
+        self._active_freeze_handles = None     # set while _game_frozen() is active
+        self._paint_keep_unfrozen = False      # stay unfrozen after first inject in a session
+        self._paint_session_resumed = False    # avoid double-resume in _game_frozen finally
         self._players_cache = []               # sticky ESP player list; survives empty reads
         self._export_worker_rva = None
         self._import_worker_rva = None
         self._clear_worker_rva = None
         self._channel_io_resolved = False
+        self._cached_module_base = 0
+        self._inject_handle_cache = 0
         self._last_paint_bgra = None
         self._last_paint_resolution = 0
         self._last_paint_grid = 32
+        self._bridge_proc = None
+        self._bridge_dll_injected = False
+        self._camo_abort = False
+        self._init_trainer_state()
 
     def _scan_guobject_array(self):
         scanner = PatternScanner(self.pm, self.MODULE_NAME)
+        self._cached_module_base = scanner.base
         addr = scanner.scan(self.GUOBJECT_SIG, self.GUOBJECT_MASK)
         if not addr:
             return 0
@@ -732,6 +753,12 @@ class MecchaESP:
                 return max(1, int(default))
             except (TypeError, ValueError):
                 return 32
+
+    @classmethod
+    def image_wrap_mode_label(cls, wrap_mode):
+        """Human-readable Apply Image wrap mode for console output."""
+        key = (wrap_mode or "projector").strip().lower()
+        return cls.IMAGE_WRAP_MODE_LABELS.get(key, f"Unknown ({key})")
 
     def _get_world(self):
         viewport = rp(self.pm, self.gengine + self.offsets["UEngine::GameViewport"])
@@ -880,6 +907,14 @@ class MecchaESP:
             return None
         # UE5 FRotator = 3 doubles @ RelativeRotation (0x158)
         return rvec3(self.pm, root + 0x158)
+
+    def set_actor_root_yaw(self, actor, yaw_deg):
+        """Set root component yaw (degrees) while keeping pitch/roll."""
+        root = rp(self.pm, actor + self.offsets["AActor::RootComponent"])
+        if not root:
+            return False
+        rot = rvec3(self.pm, root + 0x158)
+        return wvec3(self.pm, root + 0x158, (rot[0], float(yaw_deg), rot[2]))
 
     # UE5.6 skeleton offsets (build 44394996)
     _SCENE_COMPONENT_TO_WORLD = 0x1E0          # FTransform (96B) at end of USceneComponent (0x240)
@@ -1520,7 +1555,14 @@ class MecchaESP:
 
 
     # -----------------------------------------------------------------------
-    # Camouflage — offsets verified from Dumper-7 SDK dump (post-patch 2026-06-23, re-verified 2026-06-24)
+    # Camouflage — offsets verified from Dumper-7 SDK dump
+    # 5.6.1-44394996+++UE5+Release-5.6-Chameleon (re-dumped 2026-06-28)
+    #
+    # Globals (Basic.hpp / OffsetsInfo.json):
+    #   GObjects 0x09F33450  GNames 0x09E16DF8  GWorld 0x09C7C620  ProcessEvent 0x015D0950
+    #   RuntimePaintable @ pawn+0x0B68  AlbedoRT @ comp+0x0148  DynamicMaterial @ comp+0x0168
+    #   DynamicMaterialInstance @ comp+0x0168 — do NOT write near +0x016A/+0x016B (AV crash)
+    #   AppendString 0x013B3110  ProcessEvent 0x015D0950  ProcessEventIdx 0x4C
     #
     # ABP_FirstPersonCharacter_cLeon_Character_C:
     #   pawn + 0x0B68  ->  RuntimePaintable     (URuntimePaintableComponent*)
@@ -1583,6 +1625,177 @@ class MecchaESP:
 
     def _get_local_pawn(self):
         return self._find_local_pawn()
+
+    # Mesh / actor render flags — hide local body during camo screen capture (client only).
+    PAWN_OFF_SPHERE_MESH = 0x0B60
+    PAWN_OFF_HIDE_BLOCK = 0x0C60          # local-only bool — not replicated
+    PAWN_OFF_ACTOR_FLAGS = 0x0058         # AActor::bHidden is bit 7
+    ACTOR_HIDDEN_BIT = 7
+    SCENE_COMP_VISIBLE_OFF = 0x01A0        # USceneComponent — bVisible is bit 5
+    SCENE_VISIBLE_BIT = 5
+    SCENE_COMP_RENDER_FLAGS_OFF = 0x01A1   # USceneComponent — bHiddenInGame is bit 3
+    SCENE_HIDDEN_IN_GAME_BIT = 3
+
+    def _read_scene_flag(self, mesh, byte_off, bit):
+        b = self.pm.read_bytes(mesh + byte_off, 1)[0]
+        return bool(b & (1 << bit))
+
+    def _write_scene_flag(self, mesh, byte_off, bit, on):
+        addr = mesh + byte_off
+        b = self.pm.read_bytes(addr, 1)[0]
+        if on:
+            b |= 1 << bit
+        else:
+            b &= ~(1 << bit)
+        self.pm.write_bytes(addr, bytes([b]), 1)
+
+    def _read_mesh_hidden_in_game(self, mesh):
+        return self._read_scene_flag(
+            mesh, self.SCENE_COMP_RENDER_FLAGS_OFF, self.SCENE_HIDDEN_IN_GAME_BIT,
+        )
+
+    def _write_mesh_hidden_in_game(self, mesh, hidden):
+        self._write_scene_flag(
+            mesh, self.SCENE_COMP_RENDER_FLAGS_OFF, self.SCENE_HIDDEN_IN_GAME_BIT, hidden,
+        )
+
+    def _read_mesh_visible(self, mesh):
+        return self._read_scene_flag(mesh, self.SCENE_COMP_VISIBLE_OFF, self.SCENE_VISIBLE_BIT)
+
+    def _write_mesh_visible(self, mesh, visible):
+        self._write_scene_flag(mesh, self.SCENE_COMP_VISIBLE_OFF, self.SCENE_VISIBLE_BIT, visible)
+
+    def _read_actor_hidden(self, pawn):
+        return self._read_scene_flag(pawn, self.PAWN_OFF_ACTOR_FLAGS, self.ACTOR_HIDDEN_BIT)
+
+    def _write_actor_hidden(self, pawn, hidden):
+        self._write_scene_flag(pawn, self.PAWN_OFF_ACTOR_FLAGS, self.ACTOR_HIDDEN_BIT, hidden)
+
+    def _enumerate_camo_body_meshes(self, pawn):
+        """Body meshes that can appear in the camo screen-capture region."""
+        meshes = []
+        seen = set()
+
+        def add(label, mesh, allow_widget=False):
+            if mesh and mesh > 0x100000 and mesh not in seen:
+                cn = self.objects.class_name(mesh)
+                if (
+                    "Mesh" in cn
+                    or "MeshComponent" in cn
+                    or (allow_widget and "Widget" in cn)
+                ):
+                    seen.add(mesh)
+                    meshes.append((label, mesh, cn))
+
+        comp = rp(self.pm, pawn + 0x0B68)
+        if comp:
+            mesh, _ = self._get_paint_mesh(pawn, comp)
+            add("paint_target", mesh)
+        add("sphere", rp(self.pm, pawn + self.PAWN_OFF_SPHERE_MESH))
+        for off, label in (
+            (0x0418, "body_sk"),
+            (0x04C8, "fp_mesh"),
+            (0x0490, "hand_bone"),
+        ):
+            add(label, rp(self.pm, pawn + off))
+        add("nameplate", rp(self.pm, pawn + 0x0B48), allow_widget=True)
+        sk = self.get_skeletal_mesh(pawn)
+        add("skeletal", sk)
+        return meshes
+
+    def hide_local_character_for_camo(self, pawn):
+        """
+        Hide local body meshes while sampling screen pixels for camouflage.
+
+        Uses bHiddenInGame + bVisible on scene components, actor bHidden, and the
+        local-only HideBlock flag.  Does NOT touch BodyVisibility (replicated).
+        """
+        token = {
+            "pawn": pawn,
+            "meshes": [],
+            "actor_hidden": None,
+            "hide_block": None,
+        }
+        if not pawn:
+            return token
+        try:
+            token["actor_hidden"] = self._read_actor_hidden(pawn)
+            self._write_actor_hidden(pawn, True)
+        except Exception as e:
+            print(f"[CAMO-HIDE] actor bHidden failed: {e}")
+        try:
+            token["hide_block"] = bool(self.pm.read_bytes(pawn + self.PAWN_OFF_HIDE_BLOCK, 1)[0])
+            self.pm.write_bytes(pawn + self.PAWN_OFF_HIDE_BLOCK, b"\x01", 1)
+        except Exception as e:
+            print(f"[CAMO-HIDE] HideBlock failed: {e}")
+
+        for label, mesh, cn in self._enumerate_camo_body_meshes(pawn):
+            try:
+                prev_h = self._read_mesh_hidden_in_game(mesh)
+                prev_v = self._read_mesh_visible(mesh)
+                token["meshes"].append((label, mesh, prev_h, prev_v))
+                self._write_mesh_hidden_in_game(mesh, True)
+                self._write_mesh_visible(mesh, False)
+                print(f"[CAMO-HIDE] {label} 0x{mesh:X} class={cn}")
+            except Exception as e:
+                print(f"[CAMO-HIDE] {label} 0x{mesh:X} failed: {e}")
+        print(f"[CAMO-HIDE] hid {len(token['meshes'])} local mesh(es) for sampling")
+        return token
+
+    def restore_local_character_after_camo(self, token):
+        if not token:
+            return
+        for label, mesh, prev_h, prev_v in token.get("meshes", []):
+            try:
+                self._write_mesh_hidden_in_game(mesh, prev_h)
+                self._write_mesh_visible(mesh, prev_v)
+            except Exception as e:
+                print(f"[CAMO-HIDE] restore {label} failed: {e}")
+        pawn = token.get("pawn")
+        if pawn:
+            if token.get("hide_block") is not None:
+                try:
+                    self.pm.write_bytes(
+                        pawn + self.PAWN_OFF_HIDE_BLOCK,
+                        b"\x01" if token["hide_block"] else b"\x00",
+                        1,
+                    )
+                except Exception as e:
+                    print(f"[CAMO-HIDE] restore HideBlock failed: {e}")
+            if token.get("actor_hidden") is not None:
+                try:
+                    self._write_actor_hidden(pawn, token["actor_hidden"])
+                except Exception as e:
+                    print(f"[CAMO-HIDE] restore actor bHidden failed: {e}")
+        if token.get("meshes"):
+            print("[CAMO-HIDE] restored local body meshes")
+
+    @contextmanager
+    def camo_sampling_hide_local(self, pawn, enabled=True, settle_ms=200, pump_frame=None):
+        """
+        Hide the local body so screen sampling skips the player model.
+
+        pump_frame: optional callable (e.g. QApplication.processEvents) invoked
+        between short sleeps so the game can render a frame without the body.
+        """
+        token = None
+        if enabled and pawn:
+            token = self.hide_local_character_for_camo(pawn)
+            import time
+            base = max(0.05, settle_ms / 1000.0)
+            time.sleep(base * 0.4)
+            for _ in range(6):
+                if pump_frame:
+                    try:
+                        pump_frame()
+                    except Exception:
+                        pass
+                time.sleep(max(0.025, base / 6.0))
+        try:
+            yield
+        finally:
+            if token is not None:
+                self.restore_local_character_after_camo(token)
 
     def is_paintable_pawn(self, pawn):
         """True when pawn is a playable character with RuntimePaintableComponent."""
@@ -1648,8 +1861,8 @@ class MecchaESP:
     # -----------------------------------------------------------------------
     # Remote function call (no anti-cheat — call game functions directly)
     # -----------------------------------------------------------------------
-    # RVAs from Dumper-7 Dumpspace/FunctionsInfo.json — verified for build 44394996
-    # (re-dumped 2026-06-24; build number unchanged, all RVAs and offsets confirmed identical)
+    # RVAs from Dumper-7 Dumpspace/FunctionsInfo.json — build 44394996
+    # (re-dumped 2026-06-28; FunctionsInfo natives in 0x50E1xxx band unchanged vs 06-27)
     #
     # CRITICAL: The RVAs that Dumper-7 lists for these UFUNCTIONs are the Blueprint
     # VM *exec thunks* (execPaintAtUV, etc.) — NOT directly callable native funcs.
@@ -1660,56 +1873,88 @@ class MecchaESP:
     # crashing the game on every camo attempt (the corruption surfaces a moment
     # later on the game thread, hence "ok=True" then crash).
     #
-    # The real native implementations are the leaf functions each thunk tail-calls
-    # after marshaling (verified by disassembly). Those take ordinary register args
-    # and are what we call directly below.
-    #
-    #   exec thunk            -> real native worker (call THIS one)
-    #   ----------------------------------------------------------------
-    #   execPaintAtUV 0x50E20A0  -> 0x50FCCE0  PaintAtUV(this, &Uv, &ChannelData, Ch)
-    #   execSetBrushRadius       -> 0x51009C0  (just: movss [this+0x170], radius)
-    #   execSetBrushOpacity      -> 0x51009A0  (just: clamp; movss [this+0x178])
-    #
-    # SetBrushRadius/Opacity workers are pure single-field memory writes, so we set
-    # those via direct writes instead of a remote call. PaintAtUV's worker records a
-    # stroke on the CPU side and enqueues the GPU paint; it reads CurrentBrushSettings
-    # straight from this+0x170 (which we populate by direct write beforehand).
-    RVA_PAINT_AT_UV_NATIVE = 0x50FCCE0   # real URuntimePaintableComponent::PaintAtUV worker
-    RVA_PAINT_AT_UV        = 0x50E20A0   # execPaintAtUV thunk (DO NOT call directly)
-    RVA_EXEC_EXPORT_CHANNEL = 0x50E0BF0
-    RVA_EXEC_IMPORT_CHANNEL = 0x50E12E0
-    RVA_EXEC_CLEAR_CHANNEL  = 0x50E0B30
-    RVA_EXPORT_CHANNEL_NATIVE = 0x50F5620
-    RVA_IMPORT_CHANNEL_NATIVE = 0x50F8EB0
-    RVA_CLEAR_CHANNEL_NATIVE  = 0x50F2FE0
+    # FunctionsInfo lists UFUNCTION entry points in the 0x50E1xxx band; the *deep*
+    # workers that accept register-style remote calls sit ~0x1AC40–0x1E000 ahead.
+    # Always call deep worker RVAs (register-style native entry points) — never the
+    # FunctionsInfo / exec thunks directly.  Re-verify prologues at runtime because
+    # game patches shift these by small deltas (calling a stale RVA lands mid-function
+    # and corrupts the heap — "ClearChannel ok=True" then crash / inject failure).
+    RVA_PAINT_AT_UV_DUMP          = 0x50E2A70   # FunctionsInfo PaintAtUV (scan anchor / self-test)
+    RVA_PAINT_AT_UV_LEGACY        = 0x50FE600   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
+    RVA_EXEC_PAINT_AT_UV          = 0x50E2A70   # FunctionsInfo PaintAtUV (same as DUMP)
+    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F42B0   # ClearChannel native (RCX=comp, DL=channel) — clears RT pixels
+    RVA_EXPORT_CHANNEL_LEGACY     = 0x50F6AC0   # deep ExportChannelToBytes worker
+    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FA450   # Import dispatch wrapper (exec calls this, NOT 0x50FA630)
+    RVA_EXEC_IMPORT_CHANNEL       = 0x50E1B20   # exec ImportChannelFromBytes (scan anchor)
+    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E1370   # dump ClearChannel (FunctionsInfo)
+    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E1430   # dump ExportChannelToBytes
+    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E1B20   # dump ImportChannelFromBytes
+    RVA_BEGIN_STROKE_NATIVE       = 0x50E1330   # FunctionsInfo BeginStroke
+    RVA_END_STROKE_NATIVE         = 0x50E1410   # FunctionsInfo EndStroke
+    RVA_BEGIN_STROKE_LEGACY       = 0x50EF9C0   # deep worker fallback (pre-thunk layout)
+    RVA_END_STROKE_LEGACY         = 0x50F63F0   # deep worker fallback
+    RVA_IMPORT_RT_NATIVE          = 0x5104030   # copies TArray bytes into AlbedoRenderTarget
+    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D07B0   # dump RequestFullTextureSync (ProcessEvent stub — do NOT call)
+    RVA_APPLY_PAINT_TO_MATERIAL   = 0x5103270   # internal RT→material worker (do NOT call directly)
+    OFF_PAINT_CHANNELS_DIRTY      = 0x016B      # DISABLED — overlaps DynamicMaterialInstance @ +0x0168
+    RVA_REQUEST_TEXTURE_SYNC        = 0x50FCDB0   # DO NOT call from Peterhack — delayed AV crash
+    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E2830   # PaintAtScreenPosition (dump)
+    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E1960   # HitTestAtScreenPosition (dump)
+    RVA_GET_PAINT_MESH_NATIVE     = 0x50E16E0   # GetInitializedPaintMesh
+    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E2830   # FunctionsInfo PaintAtScreenPosition (scan anchor)
+    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E1960   # FunctionsInfo HitTestAtScreenPosition (scan anchor)
     EPaintChannel_Albedo = 0
+    EPaintChannel_All = 4
 
     # ---- Screen-space camouflage (true chameleon blend) -------------------
-    # URuntimePaintableComponent::PaintAtScreenPosition raycasts a screen point
-    # onto the body mesh and paints the correct UV automatically — giving real
-    # spatial correspondence (a body part over a red splat becomes red, etc.).
-    #
-    # exec-thunk RVAs verified against the CURRENT dump's IDAMappings .idmap
-    # (build 5.6.1-44394996), demangled names:
-    #   0x50E1E60  _ZN26URuntimePaintableComponent25execPaintAtScreenPositionEv
-    #   0x50E1120  _ZN26URuntimePaintableComponent27execHitTestAtScreenPositionEv
-    #   0x50E0EA0  _ZN26URuntimePaintableComponent27execGetInitializedPaintMeshEv
-    #   0x50E20A0  _ZN26URuntimePaintableComponent13execPaintAtUVEv  (self-test)
-    #
-    # These are Blueprint VM exec thunks — NOT directly callable. The real native
-    # worker each thunk tail-calls is found at RUNTIME by disassembling the thunk
-    # in the live process (the game binary is not shipped with this tool, so we
-    # cannot do it offline). _resolve_paint_screen_worker() does this and gates
-    # the result with a self-test: running the same discovery on execPaintAtUV
-    # MUST reproduce the already-proven worker sub_50FCCE0, otherwise we refuse to
-    # call anything (crash-safe).
-    RVA_EXEC_PAINT_AT_SCREEN   = 0x50E1E60
-    RVA_EXEC_HITTEST_AT_SCREEN = 0x50E1120
-    RVA_EXEC_GET_PAINT_MESH    = 0x50E0EA0
+    # PaintAtScreenPosition raycasts a screen point onto the body mesh and paints
+    # the correct UV automatically — giving real spatial correspondence.
 
     def _module_base(self):
-        mod = pymem.process.module_from_name(self.pm.process_handle, self.MODULE_NAME)
-        return mod.lpBaseOfDll if mod else 0
+        try:
+            mod = pymem.process.module_from_name(self.pm.process_handle, self.MODULE_NAME)
+            if mod and mod.lpBaseOfDll:
+                self._cached_module_base = int(mod.lpBaseOfDll)
+                return self._cached_module_base
+        except Exception:
+            pass
+        if self._cached_module_base:
+            return self._cached_module_base
+        return 0
+
+    def _inject_handle(self):
+        """Process handle with full access for VirtualAllocEx / CreateRemoteThread."""
+        if self._inject_handle_cache:
+            return self._inject_handle_cache
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        access = 0x001F0FFF  # PROCESS_ALL_ACCESS
+        h = k32.OpenProcess(access, False, int(self.pm.process_id))
+        if h:
+            self._inject_handle_cache = int(h)
+            return self._inject_handle_cache
+        return int(self.pm.process_handle)
+
+    def _game_process_alive(self):
+        """True while the attached game process is still running."""
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            code = ctypes.c_ulong()
+            k32.GetExitCodeProcess.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong),
+            ]
+            if not k32.GetExitCodeProcess(int(self.pm.process_handle), ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        except Exception:
+            return False
+
+    @staticmethod
+    def _flush_remote_code(handle, addr, size):
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.FlushInstructionCache(handle, ctypes.c_void_p(int(addr)), int(size))
 
     @staticmethod
     def _remote_alloc(handle, size):
@@ -1721,7 +1966,7 @@ class MecchaESP:
             ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t,
             ctypes.c_uint32, ctypes.c_uint32,
         ]
-        return k32.VirtualAllocEx(handle, 0, size, 0x3000, 0x40)
+        return k32.VirtualAllocEx(int(handle), 0, int(size), 0x3000, 0x40)
 
     @staticmethod
     def _remote_free(handle, addr):
@@ -1730,26 +1975,139 @@ class MecchaESP:
         k32.VirtualFreeEx.argtypes = [
             ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_uint32,
         ]
-        k32.VirtualFreeEx(handle, addr, 0, 0x8000)
+        k32.VirtualFreeEx(int(handle), int(addr), 0, 0x8000)
 
     @staticmethod
-    def _remote_thread(handle, addr, timeout_ms=5000):
+    def _remote_thread_nt_impl(handle, addr, timeout_ms=5000):
+        """Fallback when CreateRemoteThread is blocked (err=0x5)."""
         import ctypes
+        from ctypes import wintypes
+        ntdll = ctypes.windll.ntdll
+        k32 = ctypes.windll.kernel32
+        h_thread = wintypes.HANDLE()
+        nt = ntdll.NtCreateThreadEx
+        nt.restype = wintypes.LONG
+        nt.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            wintypes.LPVOID,
+        ]
+        status = nt(
+            ctypes.byref(h_thread),
+            0x1FFFFF,
+            None,
+            int(handle),
+            ctypes.c_void_p(int(addr)),
+            None,
+            0x4,  # skip thread attach — safer for injected stubs
+            0, 0, 0, None,
+        )
+        if status != 0:
+            print(f"[REMOTE] NtCreateThreadEx failed (status=0x{status & 0xFFFFFFFF:X})")
+            return False, False
+        wait = k32.WaitForSingleObject(h_thread, int(timeout_ms))
+        k32.CloseHandle(h_thread)
+        if wait != 0:
+            print(f"[REMOTE] NtCreateThreadEx wait failed (code=0x{wait & 0xFFFFFFFF:X}, "
+                  f"timeout={timeout_ms}ms)")
+            return False, True
+        return True, True
+
+    @staticmethod
+    def _remote_thread_impl(handle, addr, timeout_ms=5000):
+        import ctypes
+        import time
         k32 = ctypes.windll.kernel32
         k32.CreateRemoteThread.restype = ctypes.c_void_p
         k32.CreateRemoteThread.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
             ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
         ]
-        th = k32.CreateRemoteThread(handle, None, 0, addr, None, 0, None)
-        if not th:
-            return False
-        wait = k32.WaitForSingleObject(th, int(timeout_ms))
-        k32.CloseHandle(th)
-        if wait != 0:
-            print(f"[REMOTE] thread wait failed (code=0x{wait & 0xFFFFFFFF:X}, "
-                  f"timeout={timeout_ms}ms)")
-            return False
+        h = int(handle)
+        a = int(addr)
+        for attempt in range(3):
+            th = k32.CreateRemoteThread(h, None, 0, a, None, 0, None)
+            if th:
+                wait = k32.WaitForSingleObject(th, int(timeout_ms))
+                k32.CloseHandle(th)
+                if wait != 0:
+                    print(f"[REMOTE] thread wait failed (code=0x{wait & 0xFFFFFFFF:X}, "
+                          f"timeout={timeout_ms}ms)")
+                    return False, True
+                return True, True
+            err = k32.GetLastError()
+            if attempt < 2 and err == 5:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            print(f"[REMOTE] CreateRemoteThread failed (err=0x{err:X}, addr=0x{a:X})")
+            if err == 5:
+                ok, started = MecchaESP._remote_thread_nt_impl(h, a, timeout_ms)
+                if ok or started:
+                    if ok:
+                        print("[REMOTE] NtCreateThreadEx fallback ok")
+                    return ok, started
+            return False, False
+        return False, False
+
+    @staticmethod
+    def _remote_thread(handle, addr, timeout_ms=5000):
+        ok, _started = MecchaESP._remote_thread_impl(handle, addr, timeout_ms)
+        return ok
+
+    def _remote_thread_resilient(self, handle, addr, timeout_ms=5000):
+        """Inject while game is frozen — resume briefly so natives run on live threads."""
+        handle = self._inject_handle()
+        handles = self._active_freeze_handles
+        if handles:
+            self._resume_game_threads(handles)
+            self._active_freeze_handles = None
+            if self._paint_keep_unfrozen:
+                self._paint_session_resumed = True
+            try:
+                ok, _started = self._remote_thread_impl(handle, addr, timeout_ms)
+                return ok
+            finally:
+                if not self._paint_keep_unfrozen:
+                    new_handles = self._suspend_game_threads()
+                    self._active_freeze_handles = new_handles if new_handles else None
+        ok, _ = self._remote_thread_impl(handle, addr, timeout_ms)
+        return ok
+
+    def _run_remote_shellcode(self, handle, addr, timeout_ms=5000):
+        """
+        Run injected shellcode in the target process.
+
+        While _game_frozen is active, inject directly into the suspended process
+        (CreateRemoteThread still works — do NOT resume/suspend per batch; that
+        caused CreateRemoteThread err=0x5 on the second inject).
+        """
+        handle = self._inject_handle()
+        if getattr(self, "_active_freeze_handles", None):
+            ok, _ = self._remote_thread_impl(handle, int(addr), timeout_ms)
+            return ok
+        return self._remote_thread_resilient(handle, int(addr), timeout_ms=timeout_ms)
+
+    def _sync_paint_to_render_target(self, comp, label="PAINT", settle_ms=350):
+        """
+        After stamp injects return, resume briefly so the render thread can apply
+        strokes.  Do NOT re-suspend — _game_frozen must exit with threads running.
+        """
+        import time
+        del comp
+        handles = self._active_freeze_handles
+        if handles:
+            self._resume_game_threads(handles)
+            self._active_freeze_handles = None
+        print(f"[{label}] stamp inject complete — syncing render target ({settle_ms}ms)...")
+        time.sleep(max(0.05, settle_ms / 1000.0))
         return True
 
     def _finish_remote_mem(self, handle, mem, ok, label=""):
@@ -1811,6 +2169,57 @@ class MecchaESP:
                 k32.ResumeThread(th)
             finally:
                 k32.CloseHandle(th)
+
+    def _resume_all_process_threads(self, label="PAINT"):
+        """Resume every thread in the game process (clears stale suspend counts)."""
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        TH32CS_SNAPTHREAD = 0x00000004
+        THREAD_SUSPEND_RESUME = 0x0002
+
+        class THREADENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        pid = self.pm.process_id
+        resumed = 0
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+        if snap in (-1, 0xFFFFFFFF):
+            return resumed
+        try:
+            te = THREADENTRY32()
+            te.dwSize = ctypes.sizeof(THREADENTRY32)
+            if not k32.Thread32First(snap, ctypes.byref(te)):
+                return resumed
+            while True:
+                if te.th32OwnerProcessID == pid:
+                    th = k32.OpenThread(THREAD_SUSPEND_RESUME, False, te.th32ThreadID)
+                    if th:
+                        try:
+                            while True:
+                                prev = k32.ResumeThread(th)
+                                if prev <= 1:
+                                    if prev == 1:
+                                        resumed += 1
+                                    break
+                        finally:
+                            k32.CloseHandle(th)
+                if not k32.Thread32Next(snap, ctypes.byref(te)):
+                    break
+        finally:
+            k32.CloseHandle(snap)
+        if resumed:
+            print(f"[{label}] safety resume ({resumed} threads were still suspended)")
+        return resumed
 
     def start_fps_tracker(self):
         """
@@ -1927,12 +2336,19 @@ class MecchaESP:
             return False
 
     @contextmanager
+    def _paint_live(self, label="PAINT"):
+        """Run paint injects without suspending game threads (inject-safe on current build)."""
+        print(f"[{label}] live paint session (no thread suspend)")
+        yield True
+
+    @contextmanager
     def _game_frozen(self, label="PAINT"):
         """
         Freeze the game while paint natives run (same idea as in-game paint mods).
         Existing game threads are suspended; our CreateRemoteThread worker still runs.
         """
         handles = self._suspend_game_threads()
+        self._active_freeze_handles = handles if handles else None
         if handles:
             print(f"[{label}] froze game ({len(handles)} threads)")
         else:
@@ -1940,19 +2356,43 @@ class MecchaESP:
         try:
             yield bool(handles)
         finally:
-            if handles:
+            pending = self._active_freeze_handles
+            self._active_freeze_handles = None
+            if pending:
+                self._resume_game_threads(pending)
+                print(f"[{label}] unfroze game ({len(pending)} threads)")
+            elif handles and not self._paint_keep_unfrozen:
                 self._resume_game_threads(handles)
-                print(f"[{label}] unfroze game")
+                print(f"[{label}] unfroze game ({len(handles)} threads)")
+            elif handles and self._paint_keep_unfrozen:
+                if not self._paint_session_resumed:
+                    self._resume_game_threads(handles)
+                print(f"[{label}] paint session ended (threads running)")
+            self._resume_all_process_threads(label)
+
+    def _emergency_unfreeze_game(self, label="CAMO"):
+        """Resume all game threads — safe to call from Stop / abort paths."""
+        pending = getattr(self, "_active_freeze_handles", None)
+        if pending:
+            try:
+                self._resume_game_threads(pending)
+                print(f"[{label}] emergency unfreeze ({len(pending)} suspended handles)")
+            except Exception as exc:
+                print(f"[{label}] emergency unfreeze error: {exc}")
+            self._active_freeze_handles = None
+        n = self._resume_all_process_threads(label)
+        if n:
+            print(f"[{label}] cleared {n} stale thread suspend(s)")
 
     def _call_paint_at_uv_grid(self, comp, r_lin, g_lin, b_lin):
         """
         Paint the albedo render target at 5 UV grid points (centre + 4 quadrants)
         in a single remote thread.
 
-        IMPORTANT: we call the *real native* PaintAtUV worker (RVA_PAINT_AT_UV_NATIVE,
-        sub_50FCCE0) directly — NOT the Dumper-7 execPaintAtUV thunk. The thunk parses
-        its params from an FFrame and corrupts the heap when fed native-style args,
-        which is what crashed the game on every prior camo attempt.
+        IMPORTANT: we call the *real native* PaintAtUV worker (resolved at runtime
+        via _resolve_paint_at_uv_worker — NOT the FunctionsInfo dump address).
+        The execPaintAtUV thunk parses params from FFrame bytecode; calling it with
+        register-style args corrupts the heap and crashes the game.
 
         The worker reads CurrentBrushSettings from comp+0x170, so brush Radius/Hardness/
         Opacity are written directly to memory beforehand (those setters are themselves
@@ -1967,7 +2407,10 @@ class MecchaESP:
         base = self._module_base()
         if not base:
             return False
-        fn = base + self.RVA_PAINT_AT_UV_NATIVE
+        worker = self._resolve_paint_at_uv_worker()
+        if not worker:
+            return False
+        fn = base + worker
 
         # FPaintChannelData (32 bytes):
         #   AlbedoColor  FLinearColor {r,g,b,1.0}  16 bytes
@@ -2161,15 +2604,20 @@ class MecchaESP:
         print("[CAMO] FAILED")
         return False
 
-    def _call_paint_pattern(self, comp, points, channel=4):
+    def _call_paint_pattern(self, comp, points, channel=4, quiet=False):
         """
         Call the native PaintAtUV worker once per point in a single remote thread.
         channel: EPaintChannel — 0=Albedo, 4=All (default for camo).
         """
         base = self._module_base()
         if not base:
+            print("[CAMO] PaintAtUV: module base unavailable")
             return False
-        fn = base + self.RVA_PAINT_AT_UV_NATIVE
+        worker = self._resolve_paint_at_uv_worker()
+        if not worker:
+            print("[CAMO] PaintAtUV worker unresolved — refusing to paint")
+            return False
+        fn = base + worker
         n = len(points)
 
         # Per-point FPaintChannelData (32 bytes) and UV (16 bytes).
@@ -2191,9 +2639,15 @@ class MecchaESP:
         uv_off  = SC_SIZE + len(cd_block)
         total   = SC_SIZE + len(cd_block) + len(uv_block)
 
-        mem = self._remote_alloc(self.pm.process_handle, total)
+        inj = self._inject_handle()
+        mem = self._remote_alloc(inj, total)
         if not mem:
-            print("[CAMO] VirtualAllocEx failed")
+            if not self._game_process_alive():
+                print("[CAMO] VirtualAllocEx failed — game process exited")
+            else:
+                import ctypes
+                err = ctypes.windll.kernel32.GetLastError()
+                print(f"[CAMO] VirtualAllocEx failed (GetLastError={err})")
             return False
         mem_i = int(mem)
 
@@ -2211,7 +2665,7 @@ class MecchaESP:
             sc += b'\x48\xB9' + q(comp)            # mov rcx, comp
             sc += b'\x48\xBA' + q(uv_ptr)          # mov rdx, &UV
             sc += b'\x49\xB8' + q(cd_ptr)          # mov r8,  &ChannelData
-            sc += b'\x41\xB9' + struct.pack("<I", int(channel) & 0xFF)
+            sc += b'\x41\xB1' + bytes([channel & 0xFF])  # mov r9b, channel
             sc += b'\x48\xB8' + q(fn)              # mov rax, fn
             sc += b'\xFF\xD0'                      # call rax
 
@@ -2221,7 +2675,7 @@ class MecchaESP:
         sc += b'\xC3'                       # ret
 
         if len(sc) > SC_SIZE:
-            self._remote_free(self.pm.process_handle, mem)
+            self._remote_free(inj, mem)
             print(f"[CAMO] shellcode {len(sc)} exceeds SC_SIZE {SC_SIZE}")
             return False
 
@@ -2230,17 +2684,19 @@ class MecchaESP:
 
         try:
             self.pm.write_bytes(mem_i, payload, len(payload))
+            self._flush_remote_code(inj, mem_i, len(payload))
         except Exception as e:
             print(f"[CAMO] write shellcode failed: {e}")
-            self._remote_free(self.pm.process_handle, mem)
+            self._remote_free(inj, mem)
             return False
 
-        ok = self._remote_thread(
-            self.pm.process_handle, mem_i,
+        ok = self._run_remote_shellcode(
+            inj, mem_i,
             timeout_ms=max(60000, n * 100),
         )
-        self._finish_remote_mem(self.pm.process_handle, mem, ok, f"PaintAtUV x{n}")
-        print(f"[CAMO] PaintAtUV pattern x{n} ok={ok}")
+        self._remote_free(inj, mem)
+        if not quiet or not ok:
+            print(f"[CAMO] PaintAtUV pattern x{n} ok={ok}")
         return ok
 
     # =======================================================================
@@ -2369,12 +2825,24 @@ class MecchaESP:
             i += 1
         return out
 
-    # The exec-thunk band is a contiguous cluster of UFUNCTION thunks. Real
-    # native workers live far away in .text (UV: thunk 0x50E20A0 -> worker
-    # 0x50FCCE0, a 0x1AC40 jump). A target only a few hundred bytes from the
-    # thunk is an intra-thunk local call, NOT the worker, so require the
-    # worker to be well outside the thunk band.
+    # Native UFUNCTION implementations from the dump sit in a contiguous band
+    # around 0x50E1xxx. Older builds used separate exec thunks + far workers;
+    # runtime disassembly fallback is kept for forward compatibility.
     WORKER_FAR_BAND = 0x4000
+
+    _NATIVE_PROLOGUE_BYTES = (0x40, 0x41, 0x48, 0x4C, 0x53, 0x55, 0x56, 0x57, 0x66, 0x80)
+
+    def _native_rva_ok(self, rva):
+        """True when `rva` points at what looks like a function entry in the live module."""
+        if not rva:
+            return False
+        base = self._module_base()
+        if not base:
+            return False
+        try:
+            return self.pm.read_bytes(base + rva, 1)[0] in self._NATIVE_PROLOGUE_BYTES
+        except Exception:
+            return False
 
     @staticmethod
     def _select_worker(transfers, exec_rva, log=False):
@@ -2386,7 +2854,7 @@ class MecchaESP:
             (n > 1);
           * the per-UFUNCTION native worker sits just AFTER the exec-thunk
             cluster, reached by a single FORWARD call/jmp (positive distance,
-            e.g. execPaintAtUV @0x50E21E3 -> 0x50FCCE0, d=+0x1AC40).
+            e.g. execPaintAtUV -> deep worker ~+0x1AC40 from exec thunk).
 
         So the worker is the LAST single-occurrence FORWARD transfer that lands
         outside the thunk band. Intra-thunk local jumps (d < band) and the
@@ -2411,17 +2879,85 @@ class MecchaESP:
             return fwd[-1][2]        # last forward call = worker dispatch
         return 0
 
+    def _select_worker_prologue(self, transfers, exec_rva):
+        """Pick a native worker with a valid prologue; prefer far forward calls over jmp tails."""
+        if not transfers:
+            return 0
+        from collections import Counter
+        cnt = Counter(t for _, _, t in transfers)
+        band = self.WORKER_FAR_BAND
+        for _pos, kind, tgt in transfers:
+            if (
+                kind == "call"
+                and cnt[tgt] == 1
+                and (tgt - exec_rva) > band
+                and self._native_rva_ok(tgt)
+            ):
+                return tgt
+        worker = self._select_worker(transfers, exec_rva)
+        if worker and self._native_rva_ok(worker):
+            return worker
+        for _pos, kind, tgt in reversed(transfers):
+            if cnt[tgt] == 1 and (tgt - exec_rva) > band and self._native_rva_ok(tgt):
+                print(f"[PAINT] worker prologue fallback 0x{tgt:X} ({kind} @ exec 0x{exec_rva:X})")
+                return tgt
+        if worker:
+            print(f"[PAINT] rejected worker 0x{worker:X} (bad prologue @ exec 0x{exec_rva:X})")
+        return 0
+
+    def _scan_deep_worker(self, anchor_rva, read_size=0x900):
+        """Disassemble an exec/dump anchor and return the far native worker RVA."""
+        base = self._module_base()
+        if not base:
+            return 0
+        try:
+            mod = pymem.process.module_from_name(self.pm.process_handle, self.MODULE_NAME)
+            text_hi = mod.SizeOfImage if mod else 0x10000000
+            code = self.pm.read_bytes(base + anchor_rva, read_size)
+        except Exception as exc:
+            print(f"[PAINT] worker scan read @0x{anchor_rva:X} failed: {exc}")
+            return 0
+        transfers = self._scan_call_jmp_targets(code, anchor_rva, 0, text_hi)
+        return self._select_worker_prologue(transfers, anchor_rva)
+
+    def _resolve_paint_at_uv_worker(self):
+        """Return the deep PaintAtUV native for the current build."""
+        if self._paint_at_uv_worker_rva:
+            return self._paint_at_uv_worker_rva
+        expected = self.RVA_PAINT_AT_UV_LEGACY
+        worker = 0
+        if self._native_rva_ok(expected):
+            worker = expected
+        if not worker:
+            worker = self._scan_deep_worker(self.RVA_PAINT_AT_UV_DUMP)
+        if not worker:
+            worker = self._scan_deep_worker(self.RVA_EXEC_PAINT_AT_UV)
+        if not worker or not self._native_rva_ok(worker):
+            print("[PAINT] PaintAtUV worker unresolved — refusing to paint")
+            self._paint_at_uv_worker_rva = 0
+            return 0
+        if worker != expected:
+            print(
+                f"[PAINT] PaintAtUV using scan worker 0x{worker:X} "
+                f"(expected 0x{expected:X})",
+            )
+        self._paint_at_uv_worker_rva = worker
+        return worker
+
     def _resolve_paint_screen_worker(self):
         """
-        Find the real native worker that execPaintAtScreenPosition tail-calls, by
-        disassembling the thunk in the live process. Gated by a self-test: the same
-        discovery run on execPaintAtUV must reproduce the proven worker sub_50FCCE0,
-        otherwise we return 0 and refuse to call (crash-safe).
-        Result is cached.
+        Return PaintAtScreenPosition native RVA.  Gated by a PaintAtUV worker
+        self-test: execPaintAtUV scan must agree with _resolve_paint_at_uv_worker
+        before we trust execPaintAtScreenPosition disassembly.
         """
         if self._paint_screen_worker_rva is not None:
             return self._paint_screen_worker_rva
-        self._paint_screen_worker_rva = 0  # default: refuse
+        self._paint_screen_worker_rva = 0
+
+        uv_worker = self._resolve_paint_at_uv_worker()
+        if not uv_worker:
+            return 0
+
         base = self._module_base()
         if not base:
             print("[CAMO] no module base — cannot resolve worker")
@@ -2429,58 +2965,64 @@ class MecchaESP:
         mod = pymem.process.module_from_name(self.pm.process_handle, self.MODULE_NAME)
         if not mod:
             return 0
-        text_lo = 0                                    # RVA space (relative to base)
         text_hi = mod.SizeOfImage
-        try:
-            uv_code = self.pm.read_bytes(base + self.RVA_PAINT_AT_UV, 0x600)
-            sc_code = self.pm.read_bytes(base + self.RVA_EXEC_PAINT_AT_SCREEN, 0x600)
-        except Exception as e:
-            print(f"[CAMO] thunk read failed: {e}")
-            return 0
 
-        uv_tr = self._scan_call_jmp_targets(uv_code, self.RVA_PAINT_AT_UV, text_lo, text_hi)
-        uv_worker = self._select_worker(uv_tr, self.RVA_PAINT_AT_UV)
-        if uv_worker != self.RVA_PAINT_AT_UV_NATIVE:
-            print("[CAMO] --- execPaintAtUV transfers (self-test) ---")
-            self._select_worker(uv_tr, self.RVA_PAINT_AT_UV, log=True)
-            print(f"[CAMO] worker self-test FAILED: execPaintAtUV -> 0x{uv_worker:X} "
-                  f"(expected 0x{self.RVA_PAINT_AT_UV_NATIVE:X}). Refusing to call "
-                  f"PaintAtScreenPosition to avoid a crash.")
+        # Self-test: execPaintAtUV scan must reproduce the UV worker we will call.
+        try:
+            uv_code = self.pm.read_bytes(base + self.RVA_EXEC_PAINT_AT_UV, 0x800)
+        except Exception as e:
+            print(f"[CAMO] execPaintAtUV read failed: {e}")
             return 0
-        print(f"[CAMO] worker self-test PASSED: execPaintAtUV -> sub_{uv_worker:X}")
+        uv_tr = self._scan_call_jmp_targets(uv_code, self.RVA_EXEC_PAINT_AT_UV, 0, text_hi)
+        uv_scan = self._select_worker(uv_tr, self.RVA_EXEC_PAINT_AT_UV)
+        if uv_scan and uv_scan != uv_worker:
+            print("[CAMO] --- execPaintAtUV transfers (self-test) ---")
+            self._select_worker(uv_tr, self.RVA_EXEC_PAINT_AT_UV, log=True)
+            print(f"[CAMO] UV worker self-test FAILED: scan->0x{uv_scan:X} "
+                  f"expected 0x{uv_worker:X}. Refusing PaintAtScreenPosition.")
+            return 0
+        if uv_scan:
+            print(f"[CAMO] UV worker self-test PASSED: execPaintAtUV -> 0x{uv_worker:X}")
+
+        # Prefer dump native when prologue looks valid (same band as ClearChannel).
+        dump_rva = self.RVA_PAINT_AT_SCREEN_NATIVE
+        if self._native_rva_ok(dump_rva):
+            print(f"[CAMO] PaintAtScreenPosition native RVA=0x{dump_rva:X} (dump)")
+            self._paint_screen_worker_rva = dump_rva
+            return dump_rva
+
+        try:
+            sc_code = self.pm.read_bytes(base + self.RVA_EXEC_PAINT_AT_SCREEN, 0x800)
+        except Exception as e:
+            print(f"[CAMO] execPaintAtScreen read failed: {e}")
+            return 0
 
         print("[CAMO] --- execPaintAtScreenPosition transfers ---")
-        sc_tr = self._scan_call_jmp_targets(sc_code, self.RVA_EXEC_PAINT_AT_SCREEN, text_lo, text_hi)
+        sc_tr = self._scan_call_jmp_targets(
+            sc_code, self.RVA_EXEC_PAINT_AT_SCREEN, 0, text_hi,
+        )
         worker = self._select_worker(sc_tr, self.RVA_EXEC_PAINT_AT_SCREEN, log=True)
-        if not worker:
+        if not worker or not self._native_rva_ok(worker):
             print("[CAMO] could not locate PaintAtScreenPosition worker")
             return 0
-        # The UV self-test proves a real worker lives FAR outside the exec-thunk
-        # band (~0x1AC40 away). A "worker" only a few hundred bytes from the
-        # thunk is an intra-thunk local call — calling it last time corrupted the
-        # game (delayed crash). Refuse anything inside the band.
         dist = abs(worker - self.RVA_EXEC_PAINT_AT_SCREEN)
         if dist <= self.WORKER_FAR_BAND:
-            print(f"[CAMO] rejected worker 0x{worker:X}: only 0x{dist:X} from the "
-                  f"thunk (intra-band local call, not a native worker). Refusing "
-                  f"to call to avoid a crash.")
+            print(f"[CAMO] rejected worker 0x{worker:X}: only 0x{dist:X} from thunk")
             return 0
-        # sanity: worker should look like a function entry, not random bytes
-        try:
-            head = self.pm.read_bytes(base + worker, 1)[0]
-            ok_prologue = head in (0x40, 0x41, 0x48, 0x4C, 0x53, 0x55, 0x56, 0x57)
-        except Exception:
-            ok_prologue = False
-        print(f"[CAMO] discovered PaintAtScreenPosition worker RVA=0x{worker:X} "
-              f"(dist=0x{dist:X}, prologue_ok={ok_prologue})")
+        print(f"[CAMO] PaintAtScreenPosition worker RVA=0x{worker:X} (dist=0x{dist:X})")
         self._paint_screen_worker_rva = worker
         return worker
 
     def _resolve_hittest_screen_worker(self):
-        """Discover native HitTestAtScreenPosition worker (requires paint self-test)."""
+        """Return HitTestAtScreenPosition native RVA (dump-first, scan fallback)."""
         if self._hittest_screen_worker_rva is not None:
             return self._hittest_screen_worker_rva
         self._hittest_screen_worker_rva = 0
+        dump_rva = self.RVA_HITTEST_AT_SCREEN_NATIVE
+        if self._native_rva_ok(dump_rva):
+            print(f"[PAINT] HitTest native RVA=0x{dump_rva:X} (dump)")
+            self._hittest_screen_worker_rva = dump_rva
+            return dump_rva
         if not self._resolve_paint_screen_worker():
             return 0
         base = self._module_base()
@@ -2491,18 +3033,18 @@ class MecchaESP:
             return 0
         text_hi = mod.SizeOfImage
         try:
-            ht_code = self.pm.read_bytes(base + self.RVA_EXEC_HITTEST_AT_SCREEN, 0x600)
+            ht_code = self.pm.read_bytes(base + dump_rva, 0x600)
         except Exception as e:
-            print(f"[PAINT] HitTest thunk read failed: {e}")
+            print(f"[PAINT] HitTest native read failed: {e}")
             return 0
         ht_tr = self._scan_call_jmp_targets(
-            ht_code, self.RVA_EXEC_HITTEST_AT_SCREEN, 0, text_hi,
+            ht_code, dump_rva, 0, text_hi,
         )
-        worker = self._select_worker(ht_tr, self.RVA_EXEC_HITTEST_AT_SCREEN)
-        if not worker:
+        worker = self._select_worker(ht_tr, dump_rva)
+        if not worker or not self._native_rva_ok(worker):
             print("[PAINT] could not locate HitTestAtScreenPosition worker")
             return 0
-        dist = abs(worker - self.RVA_EXEC_HITTEST_AT_SCREEN)
+        dist = abs(worker - dump_rva)
         if dist <= self.WORKER_FAR_BAND:
             print(f"[PAINT] rejected HitTest worker 0x{worker:X} (intra-band)")
             return 0
@@ -2687,7 +3229,7 @@ class MecchaESP:
 
     def _call_paint_at_uv_worker(self, comp, uv_points):
         """
-        Call the native PaintAtUV worker (RVA_PAINT_AT_UV_NATIVE = 0x50FCCE0)
+        Call the resolved PaintAtUV deep native worker for each (u, v, (r,g,b)) point.
         for each (u, v, (r,g,b)) point.
 
         ABI (MSVC x64, member function, void return — no hidden sret):
@@ -2702,7 +3244,10 @@ class MecchaESP:
         base = self._module_base()
         if not base:
             return False
-        fn = base + self.RVA_PAINT_AT_UV_NATIVE
+        worker = self._resolve_paint_at_uv_worker()
+        if not worker:
+            return False
+        fn = base + worker
 
         n = len(uv_points)
         # per-call: 5 × mov-rXX imm64 (10 bytes each) + call rax (2) = 52 bytes
@@ -2713,7 +3258,10 @@ class MecchaESP:
 
         mem = self._remote_alloc(self.pm.process_handle, total)
         if not mem:
-            print("[CAMO] VirtualAllocEx failed")
+            if not self._game_process_alive():
+                print("[PAINT] VirtualAllocEx failed — game process is dead")
+            else:
+                print("[PAINT] VirtualAllocEx failed")
             return False
         mem_i = int(mem)
 
@@ -2743,7 +3291,7 @@ class MecchaESP:
             sc += b"\x48\xB9" + q(comp)    # mov rcx, comp (this)
             sc += b"\x48\xBA" + q(uv_ptr)  # mov rdx, &Uv
             sc += b"\x49\xB8" + q(cd_ptr)  # mov r8,  &ChannelData
-            sc += b"\x49\xB9" + q(0)       # mov r9,  0 (EPaintChannel::Albedo)
+            sc += b"\x41\xB1\x04"          # mov r9b, 4 (EPaintChannel::All)
             sc += b"\x48\xB8" + q(fn)      # mov rax, fn
             sc += b"\xFF\xD0"              # call rax
 
@@ -2768,7 +3316,7 @@ class MecchaESP:
             self._remote_free(self.pm.process_handle, mem)
             return False
 
-        ok = self._remote_thread(
+        ok = self._remote_thread_resilient(
             self.pm.process_handle, mem_i, timeout_ms=max(8000, n * 4)
         )
         self._remote_free(self.pm.process_handle, mem)
@@ -2796,16 +3344,21 @@ class MecchaESP:
         sc += b"\x48\x83\xC4\x20\x48\x89\xEC\x5D\xC3"
         sc = sc.ljust(256, b"\x90")
 
-        mem = self._remote_alloc(self.pm.process_handle, len(sc))
+        mem = self._remote_alloc(self._inject_handle(), len(sc))
         if not mem:
             return False
+        inj = self._inject_handle()
         try:
             self.pm.write_bytes(int(mem), sc, len(sc))
+            self._flush_remote_code(inj, int(mem), len(sc))
         except Exception:
-            self._remote_free(self.pm.process_handle, mem)
+            self._remote_free(inj, mem)
             return False
-        ok = self._remote_thread(self.pm.process_handle, int(mem), timeout_ms=8000)
-        self._remote_free(self.pm.process_handle, mem)
+        ok = self._run_remote_shellcode(inj, int(mem), timeout_ms=8000)
+        if ok:
+            self._remote_free(inj, mem)
+        else:
+            print(f"[PAINT] ClearChannel remote thread failed — mem left allocated")
         print(f"[PAINT] ClearChannel({channel}) ok={ok}")
         return ok
 
@@ -2824,18 +3377,21 @@ class MecchaESP:
         g = max(1, int(grid))
         return (res / g) * overlap
 
-    def _white_flood_atlas(self, comp, grid=8, channel=4):
-        """Cover the full UV atlas in white before image painting."""
-        radius = self._paint_brush_radius_pixels(comp, grid, overlap=0.95)
+    def _white_flood_atlas(self, comp, grid=2, channel=4):
+        """Prime the atlas with a few white stamps before image painting."""
+        grid = max(2, int(grid))
         white = (255, 255, 255)
         pts = [
             ((gx + 0.5) / grid, (gy + 0.5) / grid, white)
             for gy in range(grid)
             for gx in range(grid)
         ]
-        self._write_brush_settings(comp, radius, 1.0, 1.0)
-        ok = self._call_paint_pattern_batched(comp, pts, channel=channel, log_prefix="PAINT")
-        print(f"[PAINT] white flood {grid}x{grid} r={radius:.1f}px ok={ok}")
+        # Legacy sessions used brush radius ≈0.35 here; huge pixel radii crash PaintAtUV.
+        self._write_brush_settings(comp, 0.35, 1.0, 1.0)
+        ok = self._call_paint_pattern_batched(
+            comp, pts, channel=channel, batch=self.PAINT_UV_BATCH_SAFE, log_prefix="PAINT",
+        )
+        print(f"[PAINT] white flood done ({len(pts)} stamps, r=0.35) ok={ok}")
         return ok
 
     def _opaque_image_average(self, bgra_bytes, resolution):
@@ -2859,7 +3415,9 @@ class MecchaESP:
             saved = self.pm.read_bytes(comp + 0x0170, 12)
         except Exception:
             pass
-        self._write_brush_settings(comp, 0.48, 1.0, 1.0)
+        res = self.get_albedo_resolution(comp=comp)
+        base_r = min(max(32.0, res * 0.22), 64.0)
+        self._write_brush_settings(comp, base_r, 1.0, 1.0)
         base = []
         if regions:
             for u0, v0, u1, v1 in regions:
@@ -2880,7 +3438,7 @@ class MecchaESP:
                 (0.50, 0.02, rgb),
                 (0.50, 0.98, rgb),
             ]
-        ok = self._call_paint_pattern(comp, base, channel=0)
+        ok = self._call_paint_pattern(comp, base, channel=self.EPaintChannel_All)
         if saved and len(saved) == 12:
             try:
                 self.pm.write_bytes(comp + 0x0170, saved, 12)
@@ -2892,6 +3450,8 @@ class MecchaESP:
         self, actor, points, log_prefix="CAMO", replace=False, brush_grid=None,
         progress_cb=None, brush_opacity=1.0, brush_hardness=1.0, freeze=True,
         base_color=None, base_regions=None, comp=None, fast_mode=False,
+        record_strokes=None, auto_flush=None, brush_overlap=None,
+        subsampling_stride=1,
     ):
         """
         Paint UV points with correct UV-space brush sizing.
@@ -2907,30 +3467,46 @@ class MecchaESP:
             print(f"[{log_prefix}] No RuntimePaintableComponent — cannot paint")
             return False
 
-        self._prepare_paint_component(paint_comp)
+        if record_strokes is None:
+            record_strokes = log_prefix not in ("PAINT", "PRESET")
+        if auto_flush is None:
+            auto_flush = log_prefix in ("PAINT", "PRESET")
+        self._prepare_paint_component(
+            paint_comp, record_strokes=record_strokes, auto_flush=auto_flush,
+        )
+        if log_prefix in ("PAINT", "PRESET"):
+            print(f"[{log_prefix}] direct UV flush mode record={record_strokes} auto_flush={auto_flush}")
 
         if brush_grid is not None:
             g = max(1, int(brush_grid))
         else:
             g = max(1, int(round(len(points) ** 0.5)))
 
-        # Brush radius is in TEXTURE PIXELS (see camo path — comp+0x0170).
-        # Old UV-fraction values (e.g. 1.5/g = 0.012 for g=128) produced sub-pixel
-        # dots — body stayed white with only tiny coloured specks visible.
-        overlap = 0.85
+        # FRuntimeBrushSettings::Radius is in texture pixels (see UV diagnostic + backup camo).
+        overlap = 0.85 if brush_overlap is None else float(brush_overlap)
         if log_prefix in ("PAINT", "PRESET"):
-            overlap = 0.90
-        radius = self._paint_brush_radius_pixels(paint_comp, g, overlap=overlap)
+            overlap = 0.90 if brush_overlap is None else float(brush_overlap)
+        atlas_res = self.get_albedo_resolution(comp=paint_comp)
+        if log_prefix in ("PAINT", "PRESET", "CAMO") and brush_grid is not None:
+            radius = self._paint_brush_radius_pixels(paint_comp, g, overlap=overlap)
+            if log_prefix == "CAMO":
+                radius = min(radius, self.CAMO_MAX_BRUSH_PX)
+            radius_label = f"{radius:.1f}px"
+        else:
+            radius = self._paint_brush_radius_pixels(paint_comp, g, overlap=overlap)
+            radius_label = f"{radius:.1f}px"
 
         hardness = brush_hardness
         if log_prefix in ("PAINT", "PRESET"):
             hardness = 0.95
+        elif log_prefix == "CAMO" and brush_grid is not None:
+            hardness = max(0.88, min(float(brush_hardness), 0.98))
         opacity = max(0.0, min(1.0, float(brush_opacity)))
         paint_channel = 4  # EPaintChannel::All — same as F10 camo (Albedo-only is invisible)
         try:
             atlas_res = self.get_albedo_resolution(comp=paint_comp)
             self._write_brush_settings(paint_comp, radius, hardness, opacity)
-            print(f"[{log_prefix}] grid~{g}x{g} brush r={radius:.1f}px "
+            print(f"[{log_prefix}] grid~{g}x{g} brush r={radius_label} "
                   f"(atlas={atlas_res}) hard={hardness:.2f} op={opacity:.2f} "
                   f"stamps={len(points)} freeze={freeze}")
         except Exception as e:
@@ -2938,7 +3514,7 @@ class MecchaESP:
 
         def _run_batches():
             import time
-            if replace and log_prefix not in ("PAINT", "PRESET"):
+            if replace and log_prefix not in ("PAINT", "PRESET", "CAMO"):
                 avg = base_color
                 if avg is None and points:
                     avg = (
@@ -2955,17 +3531,18 @@ class MecchaESP:
                 self._write_brush_settings(paint_comp, radius, hardness, opacity)
 
             total = len(points)
+            already_frozen = bool(getattr(self, "_active_freeze_handles", None))
             if log_prefix in ("PAINT", "PRESET"):
-                # Game is frozen for PAINT/PRESET.  Quality-5 fast_mode doubles the
-                # batch (256) to halve remote-call overhead; otherwise use default 128.
-                batch = self.PAINT_UV_BATCH_FAST if fast_mode else self.PAINT_UV_BATCH_SIZE
+                # Always small batches — 128-stamp injects fail with err=0x5 after probe.
+                batch = self.PAINT_UV_BATCH_SAFE
+            elif log_prefix == "CAMO":
+                # Live camo must stay at safe batch size — 96-stamp injects destabilize UE.
+                batch = self.PAINT_UV_BATCH_SAFE
             elif freeze:
                 batch = self.PAINT_UV_BATCH_SIZE
                 if log_prefix == "CAMO" and total > 4000:
                     batch = 64
             else:
-                # Live (unfrozen) camo path.  Quality-5 fast_mode: 4× bigger batches
-                # and 4× shorter inter-batch pause to spend less time sleeping.
                 if fast_mode:
                     batch = 96
                 else:
@@ -2975,18 +3552,51 @@ class MecchaESP:
                 else self.PAINT_LIVE_BATCH_PAUSE if not freeze
                 else 0.0
             )
+            n_batches = (total + batch - 1) // batch
+            quiet_batches = log_prefix in ("PAINT", "PRESET") and n_batches > 8
+            if log_prefix in ("PAINT", "PRESET"):
+                print(f"[{log_prefix}] UV batches: {n_batches}×{batch} stamps "
+                      f"(frozen={bool(already_frozen or freeze)})")
 
-            for offset in range(0, total, batch):
+            for bi, offset in enumerate(range(0, total, batch)):
+                if log_prefix == "CAMO" and self._camo_aborted():
+                    print(f"[CAMO] aborted at batch {bi + 1}/{n_batches}")
+                    return False
                 chunk = points[offset:offset + batch]
                 batch_comp = paint_comp
-                if not comp:
-                    batch_comp = self._get_runtime_paint_component(actor, quiet=True)
-                if not batch_comp:
-                    print(f"[{log_prefix}] paint component lost at offset {offset}")
+                if log_prefix == "CAMO" or not comp:
+                    fresh = self._get_runtime_paint_component(actor, quiet=True)
+                    if fresh and fresh > 0x100000:
+                        batch_comp = fresh
+                if not batch_comp or not self._paint_comp_ready(batch_comp):
+                    print(f"[{log_prefix}] paint component not ready at offset {offset}")
                     return False
-                if not self._call_paint_pattern(batch_comp, chunk, channel=paint_channel):
-                    print(f"[{log_prefix}] UV batch failed at offset {offset} — stopping")
+                if not self._call_paint_pattern(
+                    batch_comp, chunk, channel=paint_channel, quiet=quiet_batches,
+                ):
+                    if not self._game_process_alive():
+                        print(f"[{log_prefix}] UV batch failed — game crashed or exited")
+                    else:
+                        print(f"[{log_prefix}] UV batch failed at offset {offset} — stopping")
                     return False
+                if (
+                    log_prefix in ("PAINT", "PRESET")
+                    and bi == 0
+                    and batch_comp
+                    and record_strokes
+                ):
+                    n0 = self._read_recorded_stroke_count(batch_comp)
+                    print(f"[{log_prefix}] strokes after first batch: {n0}")
+                if quiet_batches and ((bi + 1) % 64 == 0 or bi + 1 == n_batches):
+                    done = min(offset + len(chunk), total)
+                    print(f"[{log_prefix}] progress {done}/{total} stamps "
+                          f"(batch {bi + 1}/{n_batches})")
+                elif (
+                    log_prefix == "CAMO"
+                    and ((bi + 1) % 8 == 0 or bi + 1 == n_batches)
+                ):
+                    done = min(offset + len(chunk), total)
+                    print(f"[CAMO] progress {done}/{total} (batch {bi + 1}/{n_batches})")
                 done = min(offset + len(chunk), total)
                 if progress_cb:
                     try:
@@ -3002,36 +3612,168 @@ class MecchaESP:
                 return _run_batches()
         return _run_batches()
 
-    def set_camouflage_screenspace(self, actor, uv_points, brush_opacity=1.0, brush_hardness=0.42, fast_paint=False):
+    def _compose_camo_atlas_from_points(self, points, atlas_res=1024, brush_radius_uv=0.02):
+        """Rasterize (u,v,rgb) camo samples into a full atlas BGRA for ImportChannel."""
+        out = bytearray(atlas_res * atlas_res * 4)  # transparent — no average prefill
+        r_px = max(4, int(brush_radius_uv * (atlas_res - 1)))
+        r2 = r_px * r_px
+        n_pts = 0
+        for u, v, rgb in points:
+            if not rgb or self._camo_aborted():
+                break
+            n_pts += 1
+            cx = int(max(0.0, min(1.0, u)) * (atlas_res - 1))
+            cy = int(max(0.0, min(1.0, v)) * (atlas_res - 1))
+            r, g, b = rgb
+            for dy in range(-r_px, r_px + 1):
+                for dx in range(-r_px, r_px + 1):
+                    d2 = dx * dx + dy * dy
+                    if d2 > r2:
+                        continue
+                    px, py = cx + dx, cy + dy
+                    if not (0 <= px < atlas_res and 0 <= py < atlas_res):
+                        continue
+                    idx = (py * atlas_res + px) * 4
+                    out[idx] = b
+                    out[idx + 1] = g
+                    out[idx + 2] = r
+                    out[idx + 3] = 255
+        half = atlas_res // 2
+        front_opaque = sum(
+            1 for y in range(atlas_res) for x in range(half)
+            if out[(y * atlas_res + x) * 4 + 3] > 8
+        )
+        back_opaque = sum(
+            1 for y in range(atlas_res) for x in range(half, atlas_res)
+            if out[(y * atlas_res + x) * 4 + 3] > 8
+        )
+        print(
+            f"[CAMO] composed atlas {atlas_res}² points={n_pts} "
+            f"front_px~{front_opaque} back_px~{back_opaque}",
+        )
+        return bytes(out)
+
+    @staticmethod
+    def _subsample_camo_points(points, max_n):
+        """Evenly subsample UV/colour points — preserves mosaic diversity better than [::stride]."""
+        if not points or len(points) <= max_n:
+            return list(points or [])
+        step = len(points) / float(max_n)
+        return [points[int(i * step)] for i in range(max_n)]
+
+    def set_camouflage_screenspace(
+        self, actor, uv_points, brush_opacity=1.0, brush_hardness=0.42,
+        fast_paint=False, brush_grid=None, brush_overlap=0.72,
+        wrap_mode=False, accumulate=False,
+    ):
         """
-        TRUE chameleon blend: paint each body part with the floor colour visible
-        at/around its on-screen position.
+        Chameleon blend via PaintAtUV stamps while the game is briefly frozen.
 
-        uv_points: list of (u, v, (r, g, b)) — u/v in [0,1] UV space,
-        colours 0..255. The UV grid maps proportionally to the body bbox on screen,
-        so each texture cell is painted with the floor colour beneath that part of
-        the body.
-
-        Calls the native PaintAtUV worker (0x50FCCE0) directly — no screen-space
-        physics trace, no PlayerController, thread-safe from a remote thread.
+        Live (unfrozen) injects race the render thread and AV at null+0x18.  One short
+        freeze for clear + all batches avoids that; total freeze is a few seconds.
         """
         if not uv_points:
             print("[CAMO] no UV points — cannot apply camo")
             return False
+        if self._camo_aborted():
+            print("[CAMO] apply aborted before start")
+            return False
 
         print(f"[CAMO] UV apply pawn=0x{actor:X} points={len(uv_points)}")
 
-        g = max(8, int(round(len(uv_points) ** 0.5)))
-        ok = self._apply_uv_paint_points(
-            actor, uv_points, log_prefix="CAMO", brush_grid=g,
-            brush_opacity=brush_opacity, brush_hardness=brush_hardness,
-            fast_mode=fast_paint,
+        comp = self._get_runtime_paint_component(actor)
+        if not comp:
+            print("[CAMO] No RuntimePaintableComponent — cannot apply camo")
+            return False
+
+        if brush_grid is not None:
+            g = max(8, int(brush_grid))
+        else:
+            g = max(8, int(round(len(uv_points) ** 0.5)))
+        overlap = float(brush_overlap)
+        atlas_res = self.get_albedo_resolution(comp=comp)
+        stamp_cap = self.CAMO_WRAP_MAX_STAMPS if wrap_mode else self.CAMO_MAX_STAMPS
+        paint_pts = list(uv_points)
+        if len(paint_pts) > stamp_cap:
+            paint_pts = self._subsample_camo_points(uv_points, stamp_cap)
+        px_brush = min((atlas_res / g) * overlap, self.CAMO_MAX_BRUSH_PX)
+        uniq = len({p[2] for p in paint_pts})
+
+        print(
+            f"[CAMO] UV apply {len(paint_pts)}/{len(uv_points)} stamps "
+            f"grid={g} unique_colors={uniq} brush~{px_brush:.1f}px "
+            f"fast={fast_paint} wrap={wrap_mode} accumulate={accumulate}",
         )
+
+        if self._camo_aborted():
+            return False
+
+        ok = False
+        with self._game_frozen("CAMO"):
+            if self._camo_aborted():
+                return False
+            live = self._get_runtime_paint_component(actor, quiet=True) or comp
+            if not self._validate_paint_ready(live, actor, label="CAMO"):
+                return False
+            self._prepare_paint_component(
+                live,
+                record_strokes=bool(accumulate),
+                auto_flush=False,
+            )
+            import time
+
+            if accumulate:
+                print("[CAMO] accumulate mode — skipping ClearChannel (layer on bridge paint)")
+                if not self._call_begin_stroke(live, label="CAMO"):
+                    print("[CAMO] BeginStroke failed — continuing without stroke session")
+            else:
+                # One ClearChannel then UV stamps only.  ImportChannel (4 MB one-shot) was
+                # rejected by the game and the follow-up clear after failure crashed UE.
+                if not self._call_clear_paint_channel(live):
+                    print("[CAMO] ClearChannel failed — aborting (avoid crash cascade)")
+                    return False
+                time.sleep(0.05)
+            if self._camo_aborted() or not self._game_process_alive():
+                return False
+
+            print(
+                f"[CAMO] UV stamp apply {len(paint_pts)}/{len(uv_points)} "
+                f"(grid={g}, wrap={wrap_mode})",
+            )
+            ok = self._apply_uv_paint_points(
+                actor, paint_pts, log_prefix="CAMO", brush_grid=g,
+                brush_opacity=brush_opacity, brush_hardness=brush_hardness,
+                freeze=False, comp=live,
+                record_strokes=bool(accumulate), auto_flush=False,
+                brush_overlap=overlap, fast_mode=False,
+                subsampling_stride=1, replace=False,
+            )
+            if ok and accumulate:
+                ok = self._flush_uv_paint_session(live, label="CAMO", settle_ms=350)
+                print(f"[CAMO] EndStroke flush ok={ok}")
+            if not ok and not self._game_process_alive():
+                print("[CAMO] game crashed during UV stamps — stopping")
+                return False
+
+        if self._camo_aborted():
+            print("[CAMO] apply aborted during UV pass")
+            return False
+
+        if not self._game_process_alive():
+            print("[CAMO] game exited during apply")
+            return False
+
         if ok:
-            print("[CAMO] UV paint executed — body should now match the floor")
-            return True
-        print("[CAMO] FAILED")
-        return False
+            ok = self._post_unfreeze_paint_finalize(live, label="CAMO", atlas_verified=False)
+            if ok:
+                print("[CAMO] UV apply complete")
+        else:
+            print("[CAMO] FAILED — no paint applied")
+
+        ok = ok and self._game_process_alive()
+        if ok:
+            print("[CAMO] full-body apply finished")
+        return ok
 
     # -----------------------------------------------------------------------
     # Custom paint — image import + save/load presets (Export/ImportChannel)
@@ -3058,56 +3800,412 @@ class MecchaESP:
             pass
         return 1024
 
-    def _prepare_paint_component(self, comp):
+    def _prepare_paint_component(self, comp, record_strokes=True, auto_flush=False):
         try:
-            self.pm.write_bytes(comp + 0x01AD, b"\x00", 1)
+            self.pm.write_bytes(comp + 0x01AC, b"\x01" if record_strokes else b"\x00", 1)
+            self.pm.write_bytes(comp + 0x01AD, b"\x01" if auto_flush else b"\x00", 1)
         except Exception:
             pass
 
+    def _validate_paint_ready(self, comp, pawn, label="PAINT"):
+        """Ensure RT, material, and mesh exist before native PaintAtUV (null+0x18 AV otherwise)."""
+        issues = []
+        rt = rp(self.pm, comp + 0x0148)
+        if not rt or rt <= 0x100000:
+            issues.append("AlbedoRenderTarget null")
+        dmi = rp(self.pm, comp + 0x0168)
+        if not dmi or dmi <= 0x100000:
+            issues.append("DynamicMaterialInstance null")
+        mesh, src = self._get_paint_mesh(pawn, comp)
+        if not mesh:
+            issues.append("TargetMeshComponent unresolved")
+        if issues:
+            print(f"[{label}] paint readiness FAILED: {', '.join(issues)}")
+            return False
+        print(
+            f"[{label}] paint ready RT=0x{rt:X} DMI=0x{dmi:X} "
+            f"mesh=0x{mesh:X} ({src})"
+        )
+        return True
+
+    def _probe_paint_uv(self, comp, label="PAINT"):
+        """Single-stamp sanity check before a large UV apply."""
+        probe = [(0.25, 0.75, (255, 32, 32))]
+        if not self._call_paint_pattern(comp, probe, channel=4):
+            if not self._game_process_alive():
+                print(f"[{label}] PaintAtUV probe crashed the game — aborting")
+            else:
+                print(f"[{label}] PaintAtUV probe failed — aborting full apply")
+            return False
+        print(f"[{label}] PaintAtUV probe ok (1 stamp)")
+        return True
+
+    def _read_recorded_stroke_count(self, comp):
+        try:
+            return struct.unpack("<i", self.pm.read_bytes(comp + 0x01F8, 4))[0]
+        except Exception:
+            return -1
+
+    def _get_albedo_render_target_size(self, comp):
+        """Read SizeX/SizeY from the live AlbedoRenderTarget (for ImportChannel validation)."""
+        try:
+            rt = rp(self.pm, comp + 0x0148)
+            if not rt or rt <= 0x100000:
+                return 0, 0
+            sx = struct.unpack("<i", self.pm.read_bytes(rt + 0x0148, 4))[0]
+            sy = struct.unpack("<i", self.pm.read_bytes(rt + 0x014C, 4))[0]
+            if 64 <= sx <= 8192 and 64 <= sy <= 8192:
+                return sx, sy
+        except Exception:
+            pass
+        res = self.get_albedo_resolution(comp=comp)
+        return res, res
+
+    def _call_comp_void_native(self, comp, worker_rva, label="PAINT", timeout_ms=8000):
+        """Call a void native(this) on RuntimePaintableComponent via remote thread."""
+        base = self._module_base()
+        if not base or not comp or not worker_rva:
+            return False
+
+        def q(v):
+            return struct.pack("<Q", v)
+
+        fn = base + worker_rva
+        sc = b"\x55\x48\x89\xE5\x48\x83\xE4\xF0\x48\x83\xEC\x20"
+        sc += b"\x48\xB9" + q(comp)
+        sc += b"\x48\xB8" + q(fn) + b"\xFF\xD0"
+        sc += b"\x48\x83\xC4\x20\x48\x89\xEC\x5D\xC3"
+        sc = sc.ljust(256, b"\x90")
+
+        inj = self._inject_handle()
+        mem = self._remote_alloc(inj, len(sc))
+        if not mem:
+            return False
+        try:
+            self.pm.write_bytes(int(mem), sc, len(sc))
+            self._flush_remote_code(inj, int(mem), len(sc))
+        except Exception:
+            self._remote_free(inj, mem)
+            return False
+        ok = self._run_remote_shellcode(inj, int(mem), timeout_ms=timeout_ms)
+        if ok:
+            self._remote_free(inj, mem)
+        print(f"[{label}] comp+void 0x{worker_rva:X} ok={ok}")
+        return ok
+
+    def _call_request_texture_sync_live(self, comp, label="PAINT", timeout_ms=20000):
+        """
+        DISABLED — same as _call_request_texture_sync.  Calling 0x50FCDB0 from an
+        external injector thread crashes the UE render/material pipeline even when
+        the remote thread returns ok=True.
+        """
+        del comp, label, timeout_ms
+        return False
+
+    def _nudge_paint_visibility(self, comp, label="PAINT"):
+        """
+        A few live PaintAtUV stamps with auto_flush to wake the game's paint pipeline
+        after bulk UV apply or ImportChannel (RT may have pixels but DMI lags).
+        """
+        if not comp or not self._game_process_alive():
+            return False
+        self._prepare_paint_component(comp, record_strokes=False, auto_flush=True)
+        self._write_brush_settings(comp, radius=2.0, hardness=1.0, opacity=0.01)
+        grey = (128, 128, 128)
+        # Front + back hemisphere probes — material may only refresh one side otherwise.
+        probes = [
+            (0.12, 0.30, grey),
+            (0.25, 0.50, grey),
+            (0.37, 0.70, grey),
+            (0.62, 0.30, grey),
+            (0.75, 0.50, grey),
+            (0.87, 0.70, grey),
+        ]
+        ok = self._call_paint_pattern(comp, probes, channel=self.EPaintChannel_All)
+        print(f"[{label}] visibility UV nudge x{len(probes)} ok={ok}")
+        return ok
+
+    def _camo_log_rt_coverage(self, comp, label="CAMO"):
+        """Export albedo after apply — diagnostic only (export often fails while frozen)."""
+        try:
+            blob = self._call_export_channel_bytes(
+                comp, self.EPaintChannel_Albedo, timeout_ms=6000,
+            )
+            if not blob:
+                print(
+                    f"[{label}] RT export empty (diagnostic — "
+                    "export can fail even when PaintAtUV wrote pixels)",
+                )
+                return
+            n = self._count_opaque_bgra(blob)
+            total = len(blob) // 4
+            print(f"[{label}] RT opaque pixels~{n}/{total} (diagnostic)")
+        except Exception as exc:
+            print(f"[{label}] RT export diagnostic failed: {exc}")
+
+    def _post_unfreeze_paint_finalize(self, comp, label="PAINT", verify_export=False, atlas_verified=False):
+        """
+        Brief settle after paint.  Never call RequestFullTextureSync or scribble on
+        comp memory — both crash the render pipeline on this build.
+        """
+        import time
+        if not comp or not self._game_process_alive():
+            return False
+        if label == "CAMO":
+            # Never PaintAtUV/export after unfreeze with auto_flush — causes null+0x18 AV.
+            time.sleep(0.35)
+            alive = self._game_process_alive()
+            print(f"[{label}] finalize settle ok={alive} (no post-unfreeze injects)")
+            return alive
+        time.sleep(0.2)
+        nudged = self._nudge_paint_visibility(comp, label=label)
+        time.sleep(0.1)
+        settled = self._wait_paint_settle(comp, label=label, settle_ms=200)
+        if not self._game_process_alive():
+            print(f"[{label}] game exited during material finalize")
+            return False
+        visible = atlas_verified or nudged or settled
+        print(
+            f"[{label}] finalize nudge={nudged} settle={settled} "
+            f"verified={atlas_verified} visible={visible}"
+        )
+        return visible
+
+    def _pick_stroke_worker(self, native_rva, legacy_rva):
+        """Prefer dump Final|Native entry; fall back to deep worker from older layouts."""
+        if self._native_rva_ok(native_rva):
+            return native_rva
+        if self._native_rva_ok(legacy_rva):
+            print(f"[PAINT] stroke worker fallback legacy 0x{legacy_rva:X} "
+                  f"(native 0x{native_rva:X} failed prologue)")
+            return legacy_rva
+        return legacy_rva
+
+    def _call_begin_stroke(self, comp, label="PAINT"):
+        worker = self._pick_stroke_worker(
+            self.RVA_BEGIN_STROKE_NATIVE, self.RVA_BEGIN_STROKE_LEGACY,
+        )
+        return self._call_comp_void_native(
+            comp, worker, label=f"{label}/BeginStroke",
+        )
+
+    def _call_end_stroke(self, comp, label="PAINT"):
+        """Flush recorded UV stamps to the albedo render target."""
+        n = self._read_recorded_stroke_count(comp)
+        if n >= 0:
+            print(f"[{label}] recorded strokes before EndStroke: {n}")
+        worker = self._pick_stroke_worker(
+            self.RVA_END_STROKE_NATIVE, self.RVA_END_STROKE_LEGACY,
+        )
+        return self._call_comp_void_native(
+            comp, worker, label=f"{label}/EndStroke",
+        )
+
+    def _flush_uv_paint_session(self, comp, label="PAINT", settle_ms=500):
+        """Enable auto-flush, EndStroke, then wait for the game to flush stamps."""
+        self._prepare_paint_component(comp, record_strokes=True, auto_flush=True)
+        self._call_end_stroke(comp, label=label)
+        return self._wait_paint_settle(comp, label=label, settle_ms=settle_ms)
+
+    def _start_paint_stroke_session(self, comp, label="PAINT", clear=True):
+        """Clear prior paint, then open a stroke session (Clear must NOT run after Begin)."""
+        self._prepare_paint_component(comp, record_strokes=True, auto_flush=False)
+        if clear:
+            self._call_clear_paint_channel(comp)
+            import time
+            time.sleep(0.08)
+        self._call_begin_stroke(comp, label=label)
+        self._prepare_paint_component(comp, record_strokes=True, auto_flush=False)
+        try:
+            stroking = self.pm.read_bytes(comp + 0x0210, 2)
+            print(f"[{label}] stroke session open stroking={stroking.hex()}")
+        except Exception:
+            pass
+
+    def _paint_comp_ready(self, comp):
+        """True when the paint component and albedo RT look usable."""
+        if not comp or comp <= 0x100000:
+            return False
+        try:
+            rt = rp(self.pm, comp + 0x0148)
+            return bool(rt and rt > 0x100000)
+        except Exception:
+            return False
+
+    def _mark_paint_channels_dirty(self, comp):
+        """No-op — guessed dirty-flag offsets (+0x016A/+0x016B) overlap DMI and caused AV."""
+        del comp
+        return True
+
+    @staticmethod
+    def _count_opaque_bgra(blob, min_alpha=8):
+        if not blob:
+            return 0
+        return sum(1 for i in range(0, len(blob), 4) if blob[i + 3] > min_alpha)
+
+    def _verify_import_rt_opaque(self, comp, label="PAINT", min_opaque=4096):
+        """Export albedo while frozen — confirms ImportChannel actually wrote pixels."""
+        if self._camo_aborted():
+            return False
+        blob = self._call_export_channel_bytes(comp, self.EPaintChannel_Albedo, timeout_ms=8000)
+        n = self._count_opaque_bgra(blob)
+        total = len(blob) // 4 if blob else 0
+        print(f"[{label}] frozen RT verify opaque~{n}/{total}")
+        return n >= min_opaque
+
+    def _try_import_atlas(self, comp, atlas_blob, label="PAINT", progress_cb=None, verify=False):
+        """
+        Write a composed atlas via ImportChannel in one inject.
+
+        Returns (ok, verified) when verify=True; legacy callers treat as bool via tuple truth.
+        """
+        import time
+        if not atlas_blob:
+            return (False, False) if verify else False
+        if progress_cb:
+            try:
+                progress_cb(1, 100)
+            except Exception:
+                pass
+        self._prepare_paint_component(comp, record_strokes=False, auto_flush=False)
+        if not self._call_clear_paint_channel(comp):
+            print(f"[{label}] ClearChannel failed before import")
+            return (False, False) if verify else False
+        time.sleep(0.05)
+        if not self._game_process_alive():
+            print(f"[{label}] game exited before import")
+            return (False, False) if verify else False
+        print(f"[{label}] ImportChannel one-shot ({len(atlas_blob)} bytes)")
+        ok = self._call_import_channel_bytes(comp, atlas_blob, self.EPaintChannel_Albedo)
+        verified = False
+        if ok:
+            time.sleep(0.08)
+            if verify:
+                if self._camo_aborted():
+                    ok = False
+                else:
+                    verified = self._verify_import_rt_opaque(comp, label=label)
+                    if not verified:
+                        print(
+                            f"[{label}] ImportChannel native ok=True but RT still empty — "
+                            "treating as failure",
+                        )
+                        ok = False
+            else:
+                print(f"[{label}] import complete — RT verify skipped")
+        if progress_cb:
+            try:
+                progress_cb(100, 100)
+            except Exception:
+                pass
+        if verify:
+            return ok, verified
+        return ok
+
+    def _call_request_texture_sync(self, comp, label="PAINT", timeout_ms=12000):
+        """
+        DISABLED — RequestFullTextureSync / ApplyToMaterial (0x50FCDB0 / 0x5103270)
+        cannot be called from an external injector thread. Doing so causes delayed
+        EXCEPTION_ACCESS_VIOLATION crashes in the UE render/material pipeline.
+        Visible paint must go through PaintAtUV + EndStroke instead.
+        """
+        del comp, label, timeout_ms
+        return False
+
+    def _wait_paint_settle(self, comp, label="PAINT", settle_ms=350):
+        """Brief pause so EndStroke / auto-flush can finish on the game thread."""
+        self._mark_paint_channels_dirty(comp)
+        import time
+        print(f"[{label}] waiting for stroke flush ({settle_ms}ms)...")
+        time.sleep(max(0.1, settle_ms / 1000.0))
+        return True
+
+    def _defer_paint_material_sync(self, comp, label="PAINT", settle_ms=350, sync=False):
+        """Legacy alias — never calls material-sync natives."""
+        del sync
+        return self._wait_paint_settle(comp, label=label, settle_ms=settle_ms)
+
+    def _call_apply_paint_to_material(self, comp, label="PAINT"):
+        """Disabled — see _call_request_texture_sync."""
+        del comp, label
+        return False
+
+    def _verify_paint_build_offsets(self):
+        """Log dump vs live prologue checks for the current game build."""
+        dump_globals = (
+            ("GObjects", 0x09F33450),
+            ("GNames", 0x09E16DF8),
+            ("GWorld", 0x09C7C620),
+            ("ProcessEvent", 0x015D0950),
+        )
+        workers = (
+            ("PaintAtUV", self.RVA_PAINT_AT_UV_LEGACY),
+            ("ClearChannel", self.RVA_CLEAR_CHANNEL_LEGACY),
+            ("ExportChannel", self.RVA_EXPORT_CHANNEL_LEGACY),
+            ("ImportDispatch", self.RVA_IMPORT_CHANNEL_LEGACY),
+            ("ImportRT", self.RVA_IMPORT_RT_NATIVE),
+            ("ApplyToMaterial", self.RVA_APPLY_PAINT_TO_MATERIAL),
+            ("BeginStroke", self.RVA_BEGIN_STROKE_NATIVE),
+            ("BeginStrokeLegacy", self.RVA_BEGIN_STROKE_LEGACY),
+            ("EndStroke", self.RVA_END_STROKE_NATIVE),
+            ("EndStrokeLegacy", self.RVA_END_STROKE_LEGACY),
+        )
+        parts = [f"{n}=0x{v:X}" for n, v in dump_globals]
+        print(f"[PAINT] dump globals: {', '.join(parts)}")
+        ok_n = sum(1 for _, rva in workers if self._native_rva_ok(rva))
+        bad = [n for n, rva in workers if not self._native_rva_ok(rva)]
+        print(f"[PAINT] worker prologues {ok_n}/{len(workers)} ok"
+              + (f" FAILED: {', '.join(bad)}" if bad else ""))
+
+    def _verify_import_on_comp(self, comp, expected_len, label="PAINT"):
+        """After import, export albedo and log whether non-clear pixels came back."""
+        blob = self._call_export_channel_bytes(comp, self.EPaintChannel_Albedo)
+        if not blob:
+            print(f"[{label}] post-import export failed — cannot verify RT")
+            return False
+        if len(blob) != expected_len:
+            print(f"[{label}] post-import export size {len(blob)} (expected {expected_len})")
+        opaque = sum(1 for i in range(0, min(len(blob), expected_len), 4) if blob[i + 3] > 8)
+        print(f"[{label}] post-import export opaque-ish pixels~{opaque}/{expected_len // 4}")
+        return opaque > 64
+
     def _resolve_channel_io_workers(self):
-        """Resolve Export/Import native workers; cache after first successful read."""
+        """Resolve deep channel I/O workers (never call dump thunks directly)."""
         if self._channel_io_resolved:
             return self._export_worker_rva, self._import_worker_rva
+
+        def _pick(fallback, anchor):
+            if self._native_rva_ok(fallback):
+                return fallback
+            scanned = self._scan_deep_worker(anchor)
+            return scanned if scanned else fallback
+
+        self._clear_worker_rva = _pick(
+            self.RVA_CLEAR_CHANNEL_LEGACY, self.RVA_CLEAR_CHANNEL_NATIVE,
+        )
+        self._export_worker_rva = _pick(
+            self.RVA_EXPORT_CHANNEL_LEGACY, self.RVA_EXPORT_CHANNEL_NATIVE,
+        )
+        self._import_worker_rva = _pick(
+            self.RVA_IMPORT_CHANNEL_LEGACY, self.RVA_EXEC_IMPORT_CHANNEL,
+        )
+        for label, rva in (
+            ("clear", self._clear_worker_rva),
+            ("export", self._export_worker_rva),
+            ("import", self._import_worker_rva),
+        ):
+            if not self._native_rva_ok(rva):
+                print(f"[PAINT] {label} worker 0x{rva:X} FAILED prologue check — abort I/O")
+                self._clear_worker_rva = self._export_worker_rva = self._import_worker_rva = 0
+                break
+
         self._channel_io_resolved = True
-        self._export_worker_rva = self.RVA_EXPORT_CHANNEL_NATIVE
-        self._import_worker_rva = self.RVA_IMPORT_CHANNEL_NATIVE
-        self._clear_worker_rva = self.RVA_CLEAR_CHANNEL_NATIVE
-        base = self._module_base()
-        if not base:
-            return self._export_worker_rva, self._import_worker_rva
-        mod = pymem.process.module_from_name(self.pm.process_handle, self.MODULE_NAME)
-        if not mod:
-            return self._export_worker_rva, self._import_worker_rva
-        text_hi = mod.SizeOfImage
-        try:
-            uv_code = self.pm.read_bytes(base + self.RVA_PAINT_AT_UV, 0x600)
-            ex_code = self.pm.read_bytes(base + self.RVA_EXEC_EXPORT_CHANNEL, 0x600)
-            im_code = self.pm.read_bytes(base + self.RVA_EXEC_IMPORT_CHANNEL, 0x600)
-        except Exception:
-            return self._export_worker_rva, self._import_worker_rva
-        uv_tr = self._scan_call_jmp_targets(uv_code, self.RVA_PAINT_AT_UV, 0, text_hi)
-        if self._select_worker(uv_tr, self.RVA_PAINT_AT_UV) != self.RVA_PAINT_AT_UV_NATIVE:
-            print("[PAINT] channel IO worker self-test failed — using dump RVAs")
-            return self._export_worker_rva, self._import_worker_rva
-        ex_tr = self._scan_call_jmp_targets(ex_code, self.RVA_EXEC_EXPORT_CHANNEL, 0, text_hi)
-        im_tr = self._scan_call_jmp_targets(im_code, self.RVA_EXEC_IMPORT_CHANNEL, 0, text_hi)
-        cl_code = self.pm.read_bytes(base + self.RVA_EXEC_CLEAR_CHANNEL, 0x600)
-        cl_tr = self._scan_call_jmp_targets(cl_code, self.RVA_EXEC_CLEAR_CHANNEL, 0, text_hi)
-        ex_w = self._select_worker(ex_tr, self.RVA_EXEC_EXPORT_CHANNEL)
-        im_w = self._select_worker(im_tr, self.RVA_EXEC_IMPORT_CHANNEL)
-        cl_w = self._select_worker(cl_tr, self.RVA_EXEC_CLEAR_CHANNEL)
-        if ex_w and abs(ex_w - self.RVA_EXEC_EXPORT_CHANNEL) > self.WORKER_FAR_BAND:
-            self._export_worker_rva = ex_w
-        if im_w and abs(im_w - self.RVA_EXEC_IMPORT_CHANNEL) > self.WORKER_FAR_BAND:
-            self._import_worker_rva = im_w
-        if cl_w and abs(cl_w - self.RVA_EXEC_CLEAR_CHANNEL) > self.WORKER_FAR_BAND:
-            self._clear_worker_rva = cl_w
         print(f"[PAINT] export worker=0x{self._export_worker_rva:X} "
               f"import worker=0x{self._import_worker_rva:X} "
               f"clear worker=0x{self._clear_worker_rva:X}")
         return self._export_worker_rva, self._import_worker_rva
 
-    def _call_export_channel_bytes(self, comp, channel=None):
+    def _call_export_channel_bytes(self, comp, channel=None, timeout_ms=60000):
         """Export one paint channel via the native ExportChannelToBytes worker."""
         channel = self.EPaintChannel_Albedo if channel is None else channel
         export_rva, _ = self._resolve_channel_io_workers()
@@ -3139,23 +4237,31 @@ class MecchaESP:
 
         try:
             self.pm.write_bytes(mem_i, sc + b"\x00" * 16, total)
+            self._flush_remote_code(self._inject_handle(), mem_i, total)
         except Exception as e:
             print(f"[PAINT] export shellcode write failed: {e}")
-            self._remote_free(self.pm.process_handle, mem)
+            self._remote_free(self._inject_handle(), mem)
             return None
 
-        self._remote_thread(self.pm.process_handle, mem_i)
-        try:
-            data_ptr, count, _cap = struct.unpack("<QII", self.pm.read_bytes(tarray_ptr, 16))
-        except Exception:
-            data_ptr, count = 0, 0
+        inj = self._inject_handle()
+        thread_ok = self._run_remote_shellcode(inj, mem_i, timeout_ms=timeout_ms)
         blob = None
-        if count and data_ptr:
+        if thread_ok:
             try:
-                blob = bytes(self.pm.read_bytes(data_ptr, count))
-            except Exception as e:
-                print(f"[PAINT] export read failed: {e}")
-        self._remote_free(self.pm.process_handle, mem)
+                data_ptr, count, _cap = struct.unpack(
+                    "<QII", self.pm.read_bytes(tarray_ptr, 16),
+                )
+            except Exception:
+                data_ptr, count = 0, 0
+            if count and data_ptr:
+                try:
+                    blob = bytes(self.pm.read_bytes(data_ptr, count))
+                except Exception as e:
+                    print(f"[PAINT] export read failed: {e}")
+        else:
+            print("[PAINT] export thread failed or timed out — not freeing remote mem")
+        if thread_ok:
+            self._remote_free(inj, mem)
         if blob:
             print(f"[PAINT] exported {len(blob)} bytes (channel={channel})")
         return blob
@@ -3165,15 +4271,25 @@ class MecchaESP:
         if not data:
             return False
         channel = self.EPaintChannel_Albedo if channel is None else channel
-        _, import_rva = self._resolve_channel_io_workers()
-        if not import_rva:
+        self._resolve_channel_io_workers()
+        sx, sy = self._get_albedo_render_target_size(comp)
+        expected = sx * sy * 4
+        if expected > 0 and len(data) != expected:
+            print(
+                f"[PAINT] import size mismatch: got {len(data)} bytes, "
+                f"RT expects {sx}x{sy} ({expected} bytes)"
+            )
             return False
         base = self._module_base()
         if not base:
             return False
-        fn = base + import_rva
+        inj = self._inject_handle()
+        rt_ptr = rp(self.pm, comp + 0x0148)
+        if not rt_ptr or rt_ptr <= 0x100000:
+            print("[PAINT] import aborted — no AlbedoRenderTarget on component")
+            return False
 
-        data_mem = self._remote_alloc(self.pm.process_handle, len(data))
+        data_mem = self._remote_alloc(inj, len(data))
         if not data_mem:
             return False
         data_i = int(data_mem)
@@ -3181,49 +4297,73 @@ class MecchaESP:
             self.pm.write_bytes(data_i, data, len(data))
         except Exception as e:
             print(f"[PAINT] import data write failed: {e}")
-            self._remote_free(self.pm.process_handle, data_mem)
+            self._remote_free(inj, data_mem)
             return False
 
         SC_SIZE = 512
         tarray_off = SC_SIZE
-        total = SC_SIZE + 16
-        mem = self._remote_alloc(self.pm.process_handle, total)
+        result_off = SC_SIZE + 16
+        total = SC_SIZE + 24
+        mem = self._remote_alloc(inj, total)
         if not mem:
-            self._remote_free(self.pm.process_handle, data_mem)
+            self._remote_free(inj, data_mem)
             return False
         mem_i = int(mem)
         tarray_ptr = mem_i + tarray_off
+        result_ptr = mem_i + result_off
         tarray = struct.pack("<QII", data_i, len(data), len(data))
 
         def q(v):
             return struct.pack("<Q", v)
 
+        dispatch_fn = base + self.RVA_IMPORT_CHANNEL_LEGACY
+
         sc = b"\x55\x48\x89\xE5\x48\x83\xE4\xF0\x48\x83\xEC\x20"
         sc += b"\x48\xB9" + q(comp)
         sc += bytes([0xB2, channel & 0xFF])
         sc += b"\x49\xB8" + q(tarray_ptr)
-        sc += b"\x48\xB8" + q(fn) + b"\xFF\xD0"
+        sc += b"\x48\xB8" + q(dispatch_fn) + b"\xFF\xD0"
+        sc += b"\x48\xB8" + q(result_ptr)
+        sc += b"\x88\x00"
         sc += b"\x48\x83\xC4\x20\x48\x89\xEC\x5D\xC3"
         sc = sc.ljust(SC_SIZE, b"\x90")
 
         try:
-            self.pm.write_bytes(mem_i, sc + tarray, total)
+            self.pm.write_bytes(mem_i, sc + tarray + b"\x00" * 8, total)
         except Exception as e:
             print(f"[PAINT] import shellcode write failed: {e}")
-            self._remote_free(self.pm.process_handle, mem)
-            self._remote_free(self.pm.process_handle, data_mem)
+            self._remote_free(inj, mem)
+            self._remote_free(inj, data_mem)
             return False
 
-        ok = self._remote_thread(
-            self.pm.process_handle, mem_i, timeout_ms=30000,
-        )
-        ok = self._finish_remote_mem(self.pm.process_handle, mem, ok, "ImportChannel")
-        if ok:
-            self._remote_free(self.pm.process_handle, data_mem)
-        else:
-            print("[PAINT] import data memory kept allocated after failed thread")
-        print(f"[PAINT] import {len(data)} bytes ok={ok}")
-        return ok
+        thread_ok = self._run_remote_shellcode(inj, mem_i, timeout_ms=30000)
+        native_ok = False
+        if thread_ok:
+            try:
+                native_ok = bool(self.pm.read_bytes(result_ptr, 1)[0])
+            except Exception:
+                native_ok = False
+        self._finish_remote_mem(inj, mem, thread_ok, "ImportChannel")
+        if not thread_ok:
+            self._remote_free(inj, data_mem)
+            print("[PAINT] import thread failed")
+            return False
+        if not native_ok:
+            self._remote_free(inj, data_mem)
+            diag = ""
+            try:
+                rt_flags = struct.unpack("<I", self.pm.read_bytes(rt_ptr + 8, 4))[0]
+                diag = f", RT+8=0x{rt_flags:08X}"
+            except Exception:
+                pass
+            print(
+                f"[PAINT] import rejected by game (native returned False, "
+                f"RT={sx}x{sy}, bytes={len(data)}{diag})"
+            )
+            return False
+        print(f"[PAINT] import {len(data)} bytes ok=True (RT={sx}x{sy})")
+        self._remote_free(inj, data_mem)
+        return True
 
     def export_paint_albedo(self, pawn=None):
         """Read the current albedo paint texture bytes from the local character."""
@@ -3261,6 +4401,7 @@ class MecchaESP:
         self._prepare_paint_component(comp)
         ok = self._call_import_channel_bytes(comp, data, self.EPaintChannel_Albedo)
         if ok:
+            self._wait_paint_settle(comp)
             self._last_paint_bgra = bytes(data)
             self._last_paint_resolution = resolution or self.get_albedo_resolution(comp)
         return ok
@@ -3695,7 +4836,7 @@ class MecchaESP:
         or None to fall back to full-range defaults.
 
         The previous implementation called the native HitTestAtScreenPosition
-        worker (RVA 0x50F8D20) to ray-cast screen points onto the paint mesh
+        worker (resolved at runtime via exec-thunk scan) to ray-cast screen points onto the paint mesh
         and read back UV coordinates.  That worker has a different ABI from what
         we assumed — it dereferences its 6th argument (passed as null) at
         offset +0x38, causing EXCEPTION_ACCESS_VIOLATION reading 0x38 every time,
@@ -4097,6 +5238,87 @@ class MecchaESP:
                 points.append((u, v, rgb))
         return points
 
+    def _compose_centered_island_texture(
+        self, bgra_bytes, img_res, atlas_res, opacity, img_aspect=1.0,
+    ):
+        """Build a full atlas BGRA buffer for ImportChannel (centered island layout)."""
+        import math
+        out = bytearray(atlas_res * atlas_res * 4)
+        all_islands = list(self.PAINT_FRONT_ISLANDS) + list(self.PAINT_BACK_ISLANDS)
+        pixels = 0
+        for u0, v0, u1, v1, iy0, iy1 in all_islands:
+            x0 = int(u0 * atlas_res)
+            x1 = min(atlas_res, max(x0 + 1, int(math.ceil(u1 * atlas_res))))
+            y0 = int(v0 * atlas_res)
+            y1 = min(atlas_res, max(y0 + 1, int(math.ceil(v1 * atlas_res))))
+            for py in range(y0, y1):
+                v_atlas = (py + 0.5) / atlas_res
+                fv_island = (v_atlas - v0) / max(1e-6, v1 - v0)
+                img_fy = iy0 + fv_island * (iy1 - iy0)
+                for px in range(x0, x1):
+                    u_atlas = (px + 0.5) / atlas_res
+                    fu_island = (u_atlas - u0) / max(1e-6, u1 - u0)
+                    ix, iy = self._image_frac_from_paint_frac(
+                        fu_island, img_fy, img_aspect,
+                    )
+                    sx = min(img_res - 1, max(0, int(ix * (img_res - 1))))
+                    sy = min(img_res - 1, max(0, int(iy * (img_res - 1))))
+                    off = (sy * img_res + sx) * 4
+                    alpha = bgra_bytes[off + 3]
+                    if alpha < self.MIN_PAINT_ALPHA:
+                        continue
+                    dst_a = int(alpha * (opacity / 255.0))
+                    if dst_a < self.MIN_PAINT_ALPHA:
+                        continue
+                    scale = dst_a / 255.0
+                    dst = (py * atlas_res + px) * 4
+                    out[dst] = int(bgra_bytes[off] * scale)
+                    out[dst + 1] = int(bgra_bytes[off + 1] * scale)
+                    out[dst + 2] = int(bgra_bytes[off + 2] * scale)
+                    out[dst + 3] = dst_a
+                    pixels += 1
+        print(f"[PAINT] composed centered atlas {atlas_res}x{atlas_res} pixels={pixels}")
+        return bytes(out)
+
+    def _compose_projector_wrap_texture(
+        self, bgra_bytes, img_res, atlas_res, opacity, v_head=None, v_feet=None,
+        img_aspect=1.0,
+    ):
+        """Build full atlas BGRA for projector wrap (matches _build_front_back_image_uv_points)."""
+        _v_head = v_head if v_head is not None else 0.0
+        _v_feet = v_feet if v_feet is not None else 1.0
+        _v_range = _v_feet - _v_head
+        if abs(_v_range) < 0.05:
+            _v_head = 0.0
+            _v_range = 1.0
+        out = bytearray(atlas_res * atlas_res * 4)
+        op_scale = opacity / 255.0
+        pixels = 0
+        for py in range(atlas_res):
+            v = (py + 0.5) / atlas_res
+            fv_img = max(0.0, min(1.0, (v - _v_head) / _v_range))
+            for px in range(atlas_res):
+                u = (px + 0.5) / atlas_res
+                ix, iy = self._image_frac_from_paint_frac(u, fv_img, img_aspect)
+                sx = min(img_res - 1, max(0, int(ix * (img_res - 1))))
+                sy = min(img_res - 1, max(0, int(iy * (img_res - 1))))
+                off = (sy * img_res + sx) * 4
+                alpha = bgra_bytes[off + 3]
+                if alpha < self.MIN_PAINT_ALPHA:
+                    continue
+                dst_a = int(alpha * op_scale)
+                if dst_a < self.MIN_PAINT_ALPHA:
+                    continue
+                scale = dst_a / 255.0
+                dst = (py * atlas_res + px) * 4
+                out[dst] = int(bgra_bytes[off] * scale)
+                out[dst + 1] = int(bgra_bytes[off + 1] * scale)
+                out[dst + 2] = int(bgra_bytes[off + 2] * scale)
+                out[dst + 3] = dst_a
+                pixels += 1
+        print(f"[PAINT] composed projector atlas {atlas_res}x{atlas_res} pixels={pixels}")
+        return bytes(out)
+
     def _build_centered_island_uv_points(
         self, bgra_bytes, resolution, grid, opacity, img_aspect=1.0,
     ):
@@ -4358,11 +5580,13 @@ class MecchaESP:
 
         grid = self.parse_grid_value(grid)
         imported = False
-        with self._game_frozen("PRESET"):
+        with self._paint_live("PRESET"):
             self._prepare_paint_component(comp)
             imported = self._call_import_channel_bytes(
-                comp, bgra_bytes, self.EPaintChannel_Albedo
+                comp, bgra_bytes, self.EPaintChannel_Albedo,
             )
+            if imported:
+                self._wait_paint_settle(comp, label="PRESET")
         if imported:
             self._last_paint_bgra = bytes(bgra_bytes)
             self._last_paint_resolution = resolution
@@ -4544,12 +5768,19 @@ class MecchaESP:
         return pts
 
     def _call_paint_pattern_batched(self, comp, points, channel=4, batch=None, log_prefix="DIAG"):
-        batch = batch or self.UV_DIAG_BATCH
+        if batch is None:
+            batch = (
+                self.PAINT_UV_BATCH_SAFE if log_prefix in ("PAINT", "PRESET")
+                else self.UV_DIAG_BATCH
+            )
         total = len(points)
         n_batches = (total + batch - 1) // batch
+        quiet = log_prefix in ("PAINT", "PRESET") and n_batches > 1
         for bi, off in enumerate(range(0, total, batch)):
             chunk = points[off:off + batch]
-            if not self._call_paint_pattern(comp, chunk, channel=channel):
+            if not self._call_paint_pattern(
+                comp, chunk, channel=channel, quiet=quiet,
+            ):
                 print(f"[{log_prefix}] batch {bi + 1}/{n_batches} failed at offset {off}")
                 return False
         print(f"[{log_prefix}] batched {total} stamps in {n_batches} calls (batch={batch})")
@@ -4631,6 +5862,14 @@ class MecchaESP:
         if len(bgra_bytes) != expected:
             print(f"[PAINT] image bytes {len(bgra_bytes)} != {expected}")
             return False
+        import time
+        mode_key = (wrap_mode or "projector").strip().lower()
+        mode_label = self.image_wrap_mode_label(mode_key)
+        print(f"[PAINT] Apply Image mode: {mode_label}  (wrap_mode={mode_key})")
+        print(
+            f"[PAINT] paint_image_bgra start grid={grid} "
+            f"res={resolution} opacity={opacity} fast={fast_paint}"
+        )
         pawn = pawn or self.wait_for_paintable_pawn()
         if not pawn:
             print("[PAINT] no paintable pawn")
@@ -4641,7 +5880,18 @@ class MecchaESP:
             print("[PAINT] no RuntimePaintableComponent")
             return False
 
+        # Resolve native workers before painting — clears stale cached RVAs.
+        self._paint_at_uv_worker_rva = None
+        self._resolve_paint_at_uv_worker()
+        self._resolve_channel_io_workers()
+        self._verify_paint_build_offsets()
+
         atlas_res = self.get_albedo_resolution(comp, pawn=pawn)
+        rt_w, rt_h = self._get_albedo_render_target_size(comp)
+        if rt_w > 0 and rt_h > 0:
+            if rt_w != rt_h:
+                print(f"[PAINT] non-square RT {rt_w}x{rt_h} — using max dimension for atlas")
+            atlas_res = max(rt_w, rt_h)
 
         # Auto-calculate grid from texture resolution when not specified (grid=0).
         # atlas_res / 4  →  1024 / 4 = 256  →  256×256 = 65 536 stamps total.
@@ -4676,89 +5926,147 @@ class MecchaESP:
         #   front legs  → YELLOW/RED  (u 0.5-1 / 0-0.5, v 0.5-1)
         # Image is split into vertical thirds mapped onto each island.
         if wrap_mode == "centered":
-            uv_points = self._build_centered_island_uv_points(
-                bgra_bytes, resolution, grid, opacity, img_aspect=img_aspect,
+            print(f"[PAINT] using Centered island path ({mode_label})")
+            atlas_blob = self._compose_centered_island_texture(
+                bgra_bytes, resolution, atlas_res, opacity, img_aspect=img_aspect,
             )
-            if not uv_points:
-                print("[PAINT] no opaque pixels in image")
-                return False
 
             ok = False
-            with self._game_frozen("PAINT"):
-                live_comp = rp(self.pm, pawn + 0x0B68)
-                if not live_comp or live_comp <= 0x100000:
-                    print("[PAINT] paint component lost before apply")
-                    return False
-                self._prepare_paint_component(live_comp)
-                self._call_clear_paint_channel(live_comp)
-                self._white_flood_atlas(live_comp, grid=8, channel=4)
+            applied_comp = 0
+            uv_points = None
+            try:
+                with self._game_frozen("PAINT"):
+                    live_comp = rp(self.pm, pawn + 0x0B68)
+                    if not live_comp or live_comp <= 0x100000:
+                        print("[PAINT] paint component lost before apply")
+                        return False
+                    if not self._validate_paint_ready(live_comp, pawn, label="PAINT"):
+                        return False
 
-                ok = self._apply_uv_paint_points(
-                    pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
-                    progress_cb=progress_cb, freeze=False, base_color=base_color,
-                    base_regions=self.PAINT_HEMI_RECTS,
-                    comp=live_comp, fast_mode=fast_paint,
-                )
+                    print("[PAINT] apply method: ImportChannel (one-shot)")
+                    ok = self._try_import_atlas(
+                        live_comp, atlas_blob, label="PAINT", progress_cb=progress_cb,
+                    )
+                    if ok:
+                        applied_comp = live_comp
+                        print("[PAINT] centered import apply done")
+                    elif uv_points is None:
+                        uv_points = self._build_centered_island_uv_points(
+                            bgra_bytes, resolution, grid, opacity, img_aspect=img_aspect,
+                        )
+                    if not ok and uv_points:
+                        batch_sz = self.PAINT_UV_BATCH_SAFE
+                        n_batches = (len(uv_points) + batch_sz - 1) // batch_sz
+                        print(
+                            f"[PAINT] apply method: UV stamps (fallback) "
+                            f"{len(uv_points)} stamps ~{n_batches}×{batch_sz}"
+                        )
+                        self._call_clear_paint_channel(live_comp)
+                        time.sleep(0.08)
+                        if not self._probe_paint_uv(live_comp, label="PAINT"):
+                            return False
+                        ok = self._apply_uv_paint_points(
+                            pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
+                            progress_cb=progress_cb, freeze=False, base_color=base_color,
+                            base_regions=self.PAINT_HEMI_RECTS,
+                            comp=live_comp, fast_mode=False,
+                            record_strokes=False, auto_flush=False,
+                        )
+                        if ok:
+                            applied_comp = live_comp
+                            time.sleep(0.15)
+            finally:
+                pass
+
+            if ok and not self._game_process_alive():
+                print("[PAINT] game exited during apply")
+                return False
+            if ok and applied_comp:
+                if not self._post_unfreeze_paint_finalize(applied_comp, label="PAINT"):
+                    print("[PAINT] import wrote RT but material did not update")
+                    ok = False
 
             if ok:
                 self._last_paint_bgra = bytes(bgra_bytes)
                 self._last_paint_resolution = resolution
                 self._last_paint_grid = grid
-                print("[PAINT] centered island apply done")
             return ok
 
         # ── Projector mode: UV wrap across the full atlas ──────────────────────
+        print(f"[PAINT] using Projector full-atlas path ({mode_label})")
         # The image is stretched across u=[0,1] so it wraps continuously from the
         # front-side seam, over the chest, across the back, and back to the seam.
         uv_cal = self._calibrate_body_uv_vertical(pawn)
         v_head_cal = uv_cal[0] if uv_cal else None
         v_feet_cal = uv_cal[1] if uv_cal else None
 
-        uv_points = self._build_front_back_image_uv_points(
-            bgra_bytes, resolution, grid, opacity,
-            layout=layout, img_aspect=img_aspect, wrap_mode="projector",
-            v_head=v_head_cal, v_feet=v_feet_cal,
-        )
-        if not uv_points:
-            print("[PAINT] no opaque pixels in image")
-            return False
-
-        print(
-            f"[PAINT] UV stamping {len(uv_points)} points "
-            f"({grid}×{grid} per side, batch={self.PAINT_UV_BATCH_SAFE})"
+        atlas_blob = self._compose_projector_wrap_texture(
+            bgra_bytes, resolution, atlas_res, opacity,
+            v_head=v_head_cal, v_feet=v_feet_cal, img_aspect=img_aspect,
         )
 
         ok = False
-        with self._game_frozen("PAINT"):
-            live_comp = rp(self.pm, pawn + 0x0B68)
-            if not live_comp or live_comp <= 0x100000:
-                print("[PAINT] paint component lost before apply")
-                return False
-            self._prepare_paint_component(live_comp)
+        applied_comp = 0
+        try:
+            with self._game_frozen("PAINT"):
+                live_comp = rp(self.pm, pawn + 0x0B68)
+                if not live_comp or live_comp <= 0x100000:
+                    print("[PAINT] paint component lost before apply")
+                    return False
+                if not self._validate_paint_ready(live_comp, pawn, label="PAINT"):
+                    return False
 
-            self._call_clear_paint_channel(live_comp)
+                print("[PAINT] apply method: ImportChannel (one-shot)")
+                ok = self._try_import_atlas(
+                    live_comp, atlas_blob, label="PAINT", progress_cb=progress_cb,
+                )
+                if ok:
+                    applied_comp = live_comp
+                if not ok:
+                    uv_points = self._build_front_back_image_uv_points(
+                        bgra_bytes, resolution, grid, opacity,
+                        layout=layout, img_aspect=img_aspect, wrap_mode="projector",
+                        v_head=v_head_cal, v_feet=v_feet_cal,
+                    )
+                    if not uv_points:
+                        print("[PAINT] no opaque pixels in image")
+                        return False
+                    batch_sz = self.PAINT_UV_BATCH_SAFE
+                    n_batches = (len(uv_points) + batch_sz - 1) // batch_sz
+                    print(
+                        f"[PAINT] apply method: UV stamps (fallback) "
+                        f"{len(uv_points)} stamps ~{n_batches}×{batch_sz}"
+                    )
+                    self._call_clear_paint_channel(live_comp)
+                    time.sleep(0.08)
+                    if not self._probe_paint_uv(live_comp, label="PAINT"):
+                        return False
+                    ok = self._apply_uv_paint_points(
+                        pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
+                        progress_cb=progress_cb, freeze=False, base_color=base_color,
+                        base_regions=paint_regions, comp=live_comp, fast_mode=False,
+                        record_strokes=False, auto_flush=False,
+                    )
+                    if ok:
+                        applied_comp = live_comp
+                        time.sleep(0.15)
+                        print("[PAINT] projector UV fallback done")
+                else:
+                    print("[PAINT] projector import apply done")
+        finally:
+            pass
 
-            self._white_flood_atlas(live_comp, grid=8, channel=4)
+        if ok and not self._game_process_alive():
+            print("[PAINT] game exited during apply")
+            return False
+        if ok and applied_comp:
+            if not self._post_unfreeze_paint_finalize(applied_comp, label="PAINT"):
+                print("[PAINT] paint data written but material did not update")
+                ok = False
 
-            ok = self._apply_uv_paint_points(
-                pawn, uv_points, log_prefix="PAINT", replace=True, brush_grid=grid,
-                progress_cb=progress_cb, freeze=False, base_color=base_color,
-                base_regions=paint_regions, comp=live_comp, fast_mode=fast_paint,
-            )
-            if ok:
-                self._last_paint_bgra = bytes(bgra_bytes)
-                self._last_paint_resolution = resolution
-                self._last_paint_grid = grid
-                print("[PAINT] UV stamp path completed")
-            else:
-                print("[PAINT] UV stamp path failed")
-
-        if ok and layout:
-            composed = self._compose_front_back_texture_fitted(
-                bgra_bytes, resolution, atlas_res, opacity, layout, img_aspect,
-            )
-            if composed:
-                self._last_paint_bgra = composed
-                self._last_paint_resolution = atlas_res
-            print(f"[PAINT] projector apply done ({grid}×{grid} per side)")
+        if ok:
+            self._last_paint_bgra = bytes(atlas_blob) if atlas_blob else bytes(bgra_bytes)
+            self._last_paint_resolution = atlas_res
+            self._last_paint_grid = grid
+            print(f"[PAINT] projector apply done ({grid}×{grid} grid setting)")
         return ok

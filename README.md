@@ -31,9 +31,15 @@ Paint any PNG/JPG directly onto your character's texture atlas with two wrap mod
 - Game process priority is lowered while painting to free CPU (restores automatically)
 
 ### Camouflage (F10)
-- Samples the environment *behind* your character using a directed edge walk
-- Copies those colors directly onto your body so you blend into the surroundings
-- Independent **Camo Quality** slider (1–5)
+- **Standard mode:** SilentJMA bridge (`meccha-camouflage.exe`) paints from the camera view with proper material sync — best for the side facing the camera (back in 3rd person).
+- **360° wrap:** Samples the floor in a ring around your body, bridge-paints the back once, then UV-stamps the front and sides on top.
+- Start / Stop buttons in the CAMOUFLAGE tab; F10 to apply, F9 to stop.
+- Requires bridge TCP — if setup fails, click into the game and press F10 once, then retry.
+- Independent **Camo Quality** slider (1–20)
+- Logs: `C:\peterhack\logs\latest.log`
+
+### Trainer
+- TRAINER tab: No Gun CD, No Recoil, and related toggles with `[TRAINER:TAG]` debug lines in `latest.log`.
 
 ### Launcher
 - `Peterhack.bat` — auto-elevates to Administrator, no manual "Run as Admin" needed
@@ -69,8 +75,8 @@ pip install -r requirements.txt
 
 | Key | Action |
 |---|---|
-| F9 | Toggle ESP |
-| F10 | Toggle Camouflage |
+| F9 | Stop camouflage / toggle ESP (overlay poll) |
+| F10 | Apply camouflage (overlay poll; bridge EXE also listens globally) |
 | MB5 (default) | Aimbot hold |
 
 ---

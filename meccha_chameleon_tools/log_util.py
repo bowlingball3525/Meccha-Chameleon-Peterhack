@@ -131,6 +131,32 @@ def shutdown_file_logging():
     _log_files = []
 
 
+def _purge_old_logs(log_dir: str, max_age_days: int = 1) -> None:
+    """Delete *.log files in log_dir that are older than max_age_days.
+
+    latest.log is always skipped since it is the mirror of the current session.
+    Errors on individual files are silently ignored so a locked file never
+    prevents the app from starting.
+    """
+    import time
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        for name in os.listdir(log_dir):
+            if not name.endswith(".log"):
+                continue
+            if name == "latest.log":
+                continue
+            path = os.path.join(log_dir, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    sys.__stderr__.write(f"[LOG] Purged old log: {name}\n")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def setup_file_logging():
     """Redirect stdout/stderr to session + latest log files under LOG_DIR."""
     global _session_path, _original_stdout, _original_stderr, _original_excepthook
@@ -150,6 +176,7 @@ def setup_file_logging():
             f"[LOG] Using fallback: {log_dir}\n"
         )
     log_dir = LOG_DIR
+    _purge_old_logs(log_dir)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     _session_path = os.path.join(log_dir, f"peterhack_{stamp}.log")
     latest_path = os.path.join(log_dir, "latest.log")

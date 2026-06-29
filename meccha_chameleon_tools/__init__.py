@@ -170,15 +170,26 @@ def main():
     config = _enable_camouflage(config)
 
     wait = GameWaitWindow()
+    _esp_holder = []
 
     def _on_game_ready(esp):
+        _esp_holder.append(esp)
         menu = Menu(config, esp)
         overlay = Overlay(esp, config, menu=menu)
         menu.attach_overlay(overlay)
         overlay.show()
         menu.show()
         wait.finish()
-        app.aboutToQuit.connect(lambda: save_config(config))
+
+    def _on_quit():
+        save_config(config)
+        if _esp_holder:
+            try:
+                _esp_holder[0].camo_cleanup()
+            except Exception:
+                pass
+
+    app.aboutToQuit.connect(_on_quit)
 
     wait.start(_on_game_ready)
     wait.show()
