@@ -561,7 +561,7 @@ class Menu(QWidget):
         points = None
         try:
             if self._overlay and not self._camo_stop_event.is_set():
-                camo_q = max(1, min(10, getattr(self.config, "paint_quality", 8)))
+                camo_q = max(1, min(20, getattr(self.config, "paint_quality", 8)))
                 sz, cq = _quality_to_camo_settings(camo_q)
                 self.config.camouflage_sample_size = sz
                 self.config.camouflage_quality = cq
@@ -598,7 +598,7 @@ class Menu(QWidget):
             print("[CAMO] wrap ON — use Start with 'Wrap around full body' checked (bridge)", flush=True)
             return False
 
-        camo_q = max(1, min(10, getattr(self.config, "paint_quality", 8)))
+        camo_q = max(1, min(20, getattr(self.config, "paint_quality", 8)))
         sz, cq = _quality_to_camo_settings(camo_q)
         self.config.camouflage_sample_size = sz
         self.config.camouflage_quality = cq
@@ -633,7 +633,7 @@ class Menu(QWidget):
             pawn,
             points,
             brush_opacity=self.config.camouflage_opacity / 255.0,
-            brush_hardness=0.42,
+            brush_hardness=1.0,
             fast_paint=(camo_q >= 6),
             wrap_mode=full_body,
             accumulate=False,
@@ -662,7 +662,6 @@ class Menu(QWidget):
 
     def _camo_menu_worker(self):
         ok = False
-        used_bridge = False
         try:
             full_wrap = getattr(self.config, "camo_full_body_wrap", False)
             print(
@@ -670,24 +669,17 @@ class Menu(QWidget):
                 f"({'wrap ON' if full_wrap else 'wrap OFF'})",
                 flush=True,
             )
-            if full_wrap:
-                used_bridge = True
-                ok = self._camo_apply_bridge_wrap()
-            else:
-                try:
-                    self.esp.camo_kill_bridge_competition()
-                except Exception as exc:
-                    print(f"[CAMO] kill bridge: {exc}", flush=True)
-                ok = self._camo_apply_native(full_body=False)
+            try:
+                self.esp.camo_kill_bridge_competition()
+            except Exception as exc:
+                print(f"[CAMO] kill bridge: {exc}", flush=True)
+            ok = self._camo_apply_native(full_body=full_wrap)
         except Exception as exc:
             print(f"[CAMO] worker exception: {exc}", flush=True)
             ok = False
         finally:
             try:
-                if used_bridge:
-                    pass  # camo_apply_multi_angle already halted the in-game loop
-                else:
-                    self.esp.stop_injected_bridge_paint(pulses=3)
+                self.esp.stop_injected_bridge_paint(pulses=3)
             except Exception as exc:
                 print(f"[CAMO] post-apply cleanup: {exc}", flush=True)
             self.camo_job_finished.emit(ok)
@@ -1276,15 +1268,15 @@ class Menu(QWidget):
             "camo_full_body_wrap",
         )
         self.cb_camo_wrap.setToolTip(
-            "360° wrap: bridge paints front, rotates pawn 180°, paints back.\n"
-            "Unchecked: Peterhack native screen-sample (camera-facing only)."
+            "360° wrap: dense dot grid around full body (UV ring sampling).\n"
+            "Unchecked: camera-facing dot grid only."
         )
         lo.addWidget(self.cb_camo_wrap)
 
         info = QLabel(
-            "Wrap ON: bridge front pass, rotate 180° (K2_SetActorRotation), back pass.\n"
-            "Wrap OFF: Peterhack native screen-sample + UV/import paint.\n"
-            "Run as Administrator. Restart the game if you see solid-colour flicker."
+            "Hard dot-grid camo — each UV cell gets a crisp circular stamp (no streaks).\n"
+            "Wrap ON: full-body ring sample. Wrap OFF: camera-facing body only.\n"
+            "Raise Image Quality / camo quality slider for denser grids."
         )
         info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 0;")
         info.setWordWrap(True)
@@ -2578,7 +2570,7 @@ class Overlay(QWidget):
         ok = self.esp.set_camouflage_screenspace(
             local_pawn, pattern,
             brush_opacity=self.config.camouflage_opacity / 255.0,
-            brush_hardness=0.42,
+            brush_hardness=1.0,
             fast_paint=(camo_q >= 6),  # fast batches from Low+ upward
         )
         self.set_paint_throttle(False)

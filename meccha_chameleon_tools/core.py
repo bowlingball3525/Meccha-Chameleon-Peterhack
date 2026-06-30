@@ -469,7 +469,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     PAINT_UV_BATCH_SAFE = 24     # max stamps per shellcode (avoids timeout use-after-free)
     CAMO_MAX_BRUSH_PX = 32.0     # huge brushes corrupt RT / crash on unfreeze flush
     CAMO_MAX_STAMPS = 16384      # paint full grid when possible — subsampling causes gaps
-    CAMO_WRAP_MAX_STAMPS = 1024  # sparse UV fallback — overlap causes solid-colour mud
+    CAMO_WRAP_MAX_STAMPS = 16384 # wrap uses same dense dot grid as camera-facing
+    CAMO_DOT_OVERLAP = 0.46      # brush radius ≈ half UV cell → hard dots tile, not streaks
+    CAMO_DOT_HARDNESS = 1.0      # crisp circular stamps (no soft smear)
     PAINT_LIVE_BATCH_PAUSE = 0.022  # seconds between live batches (camo unfrozen path)
     MIN_PAINT_ALPHA = 24         # skip transparent PNG pixels (avoid black stamps)
     IMAGE_WRAP_MODE_LABELS = {
@@ -3663,7 +3665,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         progress_cb=None, brush_opacity=1.0, brush_hardness=1.0, freeze=True,
         base_color=None, base_regions=None, comp=None, fast_mode=False,
         record_strokes=None, auto_flush=None, brush_overlap=None,
-        subsampling_stride=1,
+        subsampling_stride=1, brush_radius_px=None,
     ):
         """
         Paint UV points with correct UV-space brush sizing.
@@ -3699,7 +3701,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if log_prefix in ("PAINT", "PRESET"):
             overlap = 0.90 if brush_overlap is None else float(brush_overlap)
         atlas_res = self.get_albedo_resolution(comp=paint_comp)
-        if log_prefix in ("PAINT", "PRESET", "CAMO") and brush_grid is not None:
+        if brush_radius_px is not None:
+            radius = max(1.0, min(float(brush_radius_px), self.CAMO_MAX_BRUSH_PX))
+            radius_label = f"{radius:.1f}px"
+        elif log_prefix in ("PAINT", "PRESET", "CAMO") and brush_grid is not None:
             radius = self._paint_brush_radius_pixels(paint_comp, g, overlap=overlap)
             if log_prefix == "CAMO":
                 radius = min(radius, self.CAMO_MAX_BRUSH_PX)
@@ -3711,8 +3716,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         hardness = brush_hardness
         if log_prefix in ("PAINT", "PRESET"):
             hardness = 0.95
-        elif log_prefix == "CAMO" and brush_grid is not None:
-            hardness = max(0.88, min(float(brush_hardness), 0.98))
+        elif log_prefix == "CAMO":
+            hardness = max(0.98, min(float(brush_hardness), 1.0))
         opacity = max(0.0, min(1.0, float(brush_opacity)))
         paint_channel = 4  # EPaintChannel::All — same as F10 camo (Albedo-only is invisible)
         try:
@@ -3824,11 +3829,22 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 return _run_batches()
         return _run_batches()
 
-    def _compose_camo_atlas_from_points(self, points, atlas_res=1024, brush_radius_uv=0.02):
-        """Rasterize (u,v,rgb) camo samples into a full atlas BGRA for ImportChannel."""
-        out = bytearray(atlas_res * atlas_res * 4)  # transparent — no average prefill
-        r_px = max(4, int(brush_radius_uv * (atlas_res - 1)))
-        r2 = r_px * r_px
+    def _camo_grid_size_from_points(self, uv_points, brush_grid=None):
+        if brush_grid is not None:
+            return max(8, int(brush_grid))
+        return max(8, int(round(len(uv_points) ** 0.5)))
+
+    def _camo_dot_radius_px(self, atlas_res, grid):
+        """Brush radius in texture pixels for one dot per UV grid cell."""
+        cell = float(atlas_res) / max(1, int(grid))
+        return max(1.5, min(self.CAMO_MAX_BRUSH_PX, cell * self.CAMO_DOT_OVERLAP))
+
+    def _compose_camo_atlas_dot_grid(self, points, atlas_res=1024, grid=None):
+        """Rasterize UV samples as a hard dot grid (no soft overlap streaks)."""
+        g = grid or self._camo_grid_size_from_points(points)
+        dot_r = max(1, int(round(self._camo_dot_radius_px(atlas_res, g))))
+        r2 = dot_r * dot_r
+        out = bytearray(atlas_res * atlas_res * 4)
         n_pts = 0
         for u, v, rgb in points:
             if not rgb or self._camo_aborted():
@@ -3836,34 +3852,28 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             n_pts += 1
             cx = int(max(0.0, min(1.0, u)) * (atlas_res - 1))
             cy = int(max(0.0, min(1.0, v)) * (atlas_res - 1))
-            r, g, b = rgb
-            for dy in range(-r_px, r_px + 1):
-                for dx in range(-r_px, r_px + 1):
-                    d2 = dx * dx + dy * dy
-                    if d2 > r2:
+            r, g_c, b = rgb
+            for dy in range(-dot_r, dot_r + 1):
+                for dx in range(-dot_r, dot_r + 1):
+                    if dx * dx + dy * dy > r2:
                         continue
                     px, py = cx + dx, cy + dy
-                    if not (0 <= px < atlas_res and 0 <= py < atlas_res):
-                        continue
-                    idx = (py * atlas_res + px) * 4
-                    out[idx] = b
-                    out[idx + 1] = g
-                    out[idx + 2] = r
-                    out[idx + 3] = 255
-        half = atlas_res // 2
-        front_opaque = sum(
-            1 for y in range(atlas_res) for x in range(half)
-            if out[(y * atlas_res + x) * 4 + 3] > 8
-        )
-        back_opaque = sum(
-            1 for y in range(atlas_res) for x in range(half, atlas_res)
-            if out[(y * atlas_res + x) * 4 + 3] > 8
-        )
+                    if 0 <= px < atlas_res and 0 <= py < atlas_res:
+                        idx = (py * atlas_res + px) * 4
+                        out[idx] = b
+                        out[idx + 1] = g_c
+                        out[idx + 2] = r
+                        out[idx + 3] = 255
         print(
-            f"[CAMO] composed atlas {atlas_res}² points={n_pts} "
-            f"front_px~{front_opaque} back_px~{back_opaque}",
+            f"[CAMO] dot-grid atlas {atlas_res}² grid~{g} dot_r={dot_r}px points={n_pts}",
+            flush=True,
         )
         return bytes(out)
+
+    def _compose_camo_atlas_from_points(self, points, atlas_res=1024, brush_radius_uv=0.02):
+        """Legacy soft-circle compose — prefer _compose_camo_atlas_dot_grid for camo."""
+        grid = self._camo_grid_size_from_points(points)
+        return self._compose_camo_atlas_dot_grid(points, atlas_res=atlas_res, grid=grid)
 
     @staticmethod
     def _subsample_camo_points(points, max_n):
@@ -3910,26 +3920,23 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if brush_grid is not None:
             g = max(8, int(brush_grid))
         else:
-            g = max(8, int(round(len(uv_points) ** 0.5)))
-        atlas_res = self.get_albedo_resolution(comp=comp)
-        compose_cap = 16384 if wrap_mode else 8192
-        compose_pts = list(uv_points)
-        if len(compose_pts) > compose_cap:
-            compose_pts = self._subsample_camo_points(uv_points, compose_cap)
-        brush_r_uv = max(0.008, min(0.022, 0.55 / g))
-        uniq = len({p[2] for p in compose_pts})
+            g = self._camo_grid_size_from_points(uv_points, brush_grid)
 
-        stamp_cap = self.CAMO_WRAP_MAX_STAMPS if wrap_mode else min(self.CAMO_MAX_STAMPS, 1024)
+        atlas_res = self.get_albedo_resolution(comp=comp)
+        stamp_cap = self.CAMO_WRAP_MAX_STAMPS if wrap_mode else self.CAMO_MAX_STAMPS
         paint_pts = list(uv_points)
         if len(paint_pts) > stamp_cap:
             paint_pts = self._subsample_camo_points(uv_points, stamp_cap)
-        g_fallback = max(8, int(round(len(paint_pts) ** 0.5)))
-        overlap = 0.30 if wrap_mode else 0.34
-        hardness = 1.0
+
+        dot_radius = self._camo_dot_radius_px(atlas_res, g)
+        hardness = self.CAMO_DOT_HARDNESS
+        overlap = self.CAMO_DOT_OVERLAP
+        uniq = len({p[2] for p in paint_pts})
 
         print(
-            f"[CAMO] plan compose={len(compose_pts)} fallback_uv={len(paint_pts)} "
-            f"grid~{g_fallback} unique_colors={uniq} atlas={atlas_res} wrap={wrap_mode}",
+            f"[CAMO] plan dot-grid UV={len(paint_pts)}/{len(uv_points)} "
+            f"grid~{g} dot_r={dot_radius:.1f}px hard={hardness} "
+            f"unique_colors={uniq} atlas={atlas_res} wrap={wrap_mode}",
             flush=True,
         )
 
@@ -3937,12 +3944,6 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return False
 
         import time
-        atlas_blob = None
-        if not accumulate:
-            atlas_blob = self._compose_camo_atlas_from_points(
-                compose_pts, atlas_res=atlas_res, brush_radius_uv=brush_r_uv,
-            )
-
         ok = False
         live = comp
         with self._game_frozen("CAMO"):
@@ -3963,12 +3964,37 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if self._camo_aborted():
             return False
 
-        expected_bytes = atlas_res * atlas_res * 4
-        import_native = False
-        if atlas_blob and not accumulate and self._game_process_alive():
+        # Primary path: dense hard-dot UV grid (no soft stroke streaks).
+        if self._game_process_alive() and not self._camo_aborted():
             live = self._get_runtime_paint_component(actor, quiet=True) or live
             self._quiesce_paint_component(live)
-            print(f"[CAMO] live ImportChannel ({len(atlas_blob)} bytes)", flush=True)
+            self._write_brush_settings(live, dot_radius, hardness, brush_opacity)
+            print(
+                f"[CAMO] dot-grid UV apply {len(paint_pts)} stamps "
+                f"r={dot_radius:.1f}px",
+                flush=True,
+            )
+            ok = self._apply_uv_paint_points(
+                actor, paint_pts, log_prefix="CAMO", brush_grid=g,
+                brush_opacity=brush_opacity, brush_hardness=hardness,
+                freeze=False, comp=live,
+                record_strokes=False, auto_flush=False,
+                brush_overlap=overlap, fast_mode=bool(fast_paint),
+                subsampling_stride=1, replace=False,
+                brush_radius_px=dot_radius,
+            )
+            self._quiesce_paint_component(live)
+
+        # Fallback: import a dot-grid atlas if live UV stamping failed.
+        import_native = False
+        if not ok and not accumulate and self._game_process_alive() and not self._camo_aborted():
+            atlas_blob = self._compose_camo_atlas_dot_grid(
+                paint_pts, atlas_res=atlas_res, grid=g,
+            )
+            expected_bytes = atlas_res * atlas_res * 4
+            live = self._get_runtime_paint_component(actor, quiet=True) or live
+            self._quiesce_paint_component(live)
+            print(f"[CAMO] dot-grid ImportChannel fallback ({len(atlas_blob)} bytes)", flush=True)
             import_native = bool(
                 self._call_import_channel_bytes(live, atlas_blob, self.EPaintChannel_Albedo)
             )
@@ -3976,50 +4002,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 ok = True
                 time.sleep(0.15)
                 self._call_end_stroke(live, label="CAMO")
-                time.sleep(0.08)
-                verified = self._verify_import_on_comp(live, expected_bytes, label="CAMO")
-                if verified:
-                    print("[CAMO] live import verified on RT", flush=True)
-                else:
-                    print(
-                        "[CAMO] live import native ok — syncing material "
-                        "(export verify unreliable on this build)",
-                        flush=True,
-                    )
-                    self._nudge_paint_visibility(live, label="CAMO")
-                    self._call_end_stroke(live, label="CAMO")
-            else:
-                print("[CAMO] live import native failed — sparse UV fallback", flush=True)
+                self._nudge_paint_visibility(live, label="CAMO")
             self._quiesce_paint_component(live)
-
-        if not ok and not import_native and self._game_process_alive() and not self._camo_aborted():
-            with self._game_frozen("CAMO"):
-                live = self._get_runtime_paint_component(actor, quiet=True) or comp
-                if not self._validate_paint_ready(live, actor, label="CAMO"):
-                    return False
-                self._quiesce_paint_component(live)
-                if not accumulate:
-                    self._call_clear_paint_channel(live)
-                    time.sleep(0.05)
-                radius = min(
-                    self._paint_brush_radius_pixels(live, g_fallback, overlap=overlap) * 0.85,
-                    self.CAMO_MAX_BRUSH_PX,
-                )
-                self._write_brush_settings(live, radius, hardness, brush_opacity)
-                print(
-                    f"[CAMO] sparse UV apply {len(paint_pts)}/{len(uv_points)} "
-                    f"r={radius:.1f}px hard={hardness} overlap={overlap}",
-                    flush=True,
-                )
-                ok = self._apply_uv_paint_points(
-                    actor, paint_pts, log_prefix="CAMO", brush_grid=g_fallback,
-                    brush_opacity=brush_opacity, brush_hardness=hardness,
-                    freeze=False, comp=live,
-                    record_strokes=False, auto_flush=False,
-                    brush_overlap=overlap, fast_mode=bool(fast_paint),
-                    subsampling_stride=1, replace=False,
-                )
-                self._quiesce_paint_component(live)
 
         if self._camo_aborted():
             print("[CAMO] apply aborted during paint pass")
