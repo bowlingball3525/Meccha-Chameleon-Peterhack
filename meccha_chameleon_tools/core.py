@@ -3982,10 +3982,12 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     print("[CAMO] live import verified on RT", flush=True)
                 else:
                     print(
-                        "[CAMO] live import native ok — trusting RT "
-                        "(export verify broken; NOT running UV fallback)",
+                        "[CAMO] live import native ok — syncing material "
+                        "(export verify unreliable on this build)",
                         flush=True,
                     )
+                    self._nudge_paint_visibility(live, label="CAMO")
+                    self._call_end_stroke(live, label="CAMO")
             else:
                 print("[CAMO] live import native failed — sparse UV fallback", flush=True)
             self._quiesce_paint_component(live)
@@ -4088,17 +4090,92 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         except Exception:
             pass
 
+    def _list_game_modules(self):
+        """Yield (name_lower, base_addr) for modules in the attached game process."""
+        h_process = getattr(getattr(self, "pm", None), "process_handle", None)
+        if not h_process:
+            return
+
+        import ctypes
+        from ctypes import wintypes
+
+        psapi = ctypes.windll.psapi
+        kernel32 = ctypes.windll.kernel32
+        hmods = (wintypes.HMODULE * 1024)()
+        cb_needed = wintypes.DWORD()
+
+        if psapi.EnumProcessModules(
+            h_process,
+            ctypes.byref(hmods),
+            ctypes.sizeof(hmods),
+            ctypes.byref(cb_needed),
+        ):
+            count = cb_needed.value // ctypes.sizeof(wintypes.HMODULE)
+            name_buf = ctypes.create_unicode_buffer(512)
+            for i in range(count):
+                base = int(hmods[i] or 0)
+                if base <= 0x10000:
+                    continue
+                name = ""
+                if psapi.GetModuleBaseNameW(h_process, hmods[i], name_buf, 512):
+                    name = name_buf.value
+                elif psapi.GetModuleFileNameExW(h_process, hmods[i], name_buf, 512):
+                    name = os.path.basename(name_buf.value)
+                if name:
+                    yield name.lower(), base
+            return
+
+        # Toolhelp32 fallback when psapi fails (older pymem / permissions).
+        TH32CS_SNAPMODULE = 0x00000008
+        TH32CS_SNAPMODULE32 = 0x00000010
+        pid = kernel32.GetProcessId(h_process)
+        if not pid:
+            return
+
+        class MODULEENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("th32ModuleID", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("GlblcntUsage", wintypes.DWORD),
+                ("ProccntUsage", wintypes.DWORD),
+                ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+                ("modBaseSize", wintypes.DWORD),
+                ("hModule", wintypes.HMODULE),
+                ("szModule", wintypes.WCHAR * 256),
+                ("szExePath", wintypes.WCHAR * 260),
+            ]
+
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+        if snap in (-1, 0xFFFFFFFF):
+            return
+        try:
+            entry = MODULEENTRY32W()
+            entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+            if not kernel32.Module32FirstW(snap, ctypes.byref(entry)):
+                return
+            while True:
+                base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
+                if base > 0x10000 and entry.szModule:
+                    yield entry.szModule.lower(), int(base)
+                if not kernel32.Module32NextW(snap, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snap)
+
     def _unload_bridge_dll_from_game(self):
         """Eject meccha-xenos-bridge.dll — F9 alone does not stop its 16 ms paint tick."""
         unloaded = []
         if not getattr(self, "pm", None):
             return unloaded
+
+        modules = []
         try:
             import pymem.process
-            modules = pymem.process.list_modules(self.pm.process_handle)
-        except Exception as exc:
-            print(f"[CAMO] in-game module scan failed: {exc}", flush=True)
-            return unloaded
+            if hasattr(pymem.process, "list_modules"):
+                modules = pymem.process.list_modules(self.pm.process_handle)
+        except Exception:
+            modules = []
 
         fragments = ("meccha-xenos-bridge", "xenos-bridge", "meccha_camouflage")
         kernel32 = ctypes.windll.kernel32
@@ -4109,21 +4186,31 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if not free_lib:
             return unloaded
 
-        for mod in modules:
-            name = (getattr(mod, "name", "") or "").lower()
-            if not any(frag in name for frag in fragments):
-                continue
-            base = int(getattr(mod, "lpBaseOfDll", 0) or 0)
-            if base <= 0x10000:
-                continue
-            print(f"[CAMO] unloading in-game DLL {mod.name} @ 0x{base:X}", flush=True)
+        seen_bases = set()
+
+        def _try_unload(name, base):
+            base = int(base or 0)
+            if base <= 0x10000 or base in seen_bases:
+                return
+            if not any(frag in (name or "").lower() for frag in fragments):
+                return
+            seen_bases.add(base)
+            print(f"[CAMO] unloading in-game DLL {name} @ 0x{base:X}", flush=True)
             h_thread = kernel32.CreateRemoteThread(
                 h_process, None, 0, free_lib, base, 0, None,
             )
             if h_thread:
                 kernel32.WaitForSingleObject(h_thread, 8000)
                 kernel32.CloseHandle(h_thread)
-                unloaded.append(mod.name)
+                unloaded.append(name)
+
+        if modules:
+            for mod in modules:
+                _try_unload(getattr(mod, "name", ""), getattr(mod, "lpBaseOfDll", 0))
+        else:
+            for name, base in self._list_game_modules():
+                _try_unload(name, base)
+
         if unloaded:
             print(f"[CAMO] unloaded {len(unloaded)} bridge DLL(s): {', '.join(unloaded)}", flush=True)
         return unloaded
@@ -4299,7 +4386,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if label == "CAMO":
             time.sleep(0.35)
             alive = self._game_process_alive()
-            if alive:
+            if alive and comp:
+                self._nudge_paint_visibility(comp, label=label)
+                self._quiesce_paint_component(comp)
                 res = self.get_albedo_resolution(comp=comp)
                 self._verify_import_on_comp(comp, res * res * 4, label=label)
             print(f"[{label}] finalize settle ok={alive}", flush=True)

@@ -209,27 +209,38 @@ class CamoBridgeMixin:
     def stop_injected_bridge_paint(self, pulses=5):
         """
         Halt template_brush_paint inside the game if a prior bridge session injected
-        the DLL.  Killing the EXE alone does not unload the DLL — F9 stops the tick.
-
-        The DLL averages the viewport to one colour every ~16 ms (solid flicker).
+        the DLL.  Killing the EXE alone does not unload the DLL — F9 + FreeLibrary.
         """
+        return self._halt_bridge_paint_loop(
+            pulses=pulses, close_exe=True, label="stop injected paint",
+        )
+
+    def _halt_bridge_paint_loop(self, pulses=5, close_exe=False, label="halt"):
+        """TCP cancel_paint, F9 pulses, FreeLibrary, then optionally close bridge EXE."""
         try:
-            self._stop_all_camo_exes()
+            if self._bridge_ping(quiet=True).get("success"):
+                resp = self._bridge_request("cancel_paint", {}, timeout=2, quiet=True)
+                print(f"[CAMO] cancel_paint ({label})={resp}", flush=True)
         except Exception:
             pass
         try:
             unloaded = self._unload_bridge_dll_from_game()
             if not unloaded:
                 print(
-                    f"[CAMO] F9 x{pulses} — stop in-game bridge paint loop (if any)",
+                    f"[CAMO] F9 x{pulses} — halt in-game bridge paint loop ({label})",
                     flush=True,
                 )
                 for i in range(max(1, int(pulses))):
                     self._send_f9_pulse()
                     time.sleep(0.35 if i + 1 < pulses else 0.15)
         except Exception as exc:
-            print(f"[CAMO] bridge stop failed: {exc}", flush=True)
-        self._reset_bridge_state("stop injected paint")
+            print(f"[CAMO] bridge halt failed: {exc}", flush=True)
+        if close_exe:
+            try:
+                self._stop_all_camo_exes()
+            except Exception:
+                pass
+            self._reset_bridge_state(label)
         return True
 
     def camo_kill_bridge_competition(self):
@@ -247,8 +258,9 @@ class CamoBridgeMixin:
                 print(f"[CAMO] cancel_paint (pre-apply) response={resp}")
         except Exception:
             pass
-        self.camo_stop_exe()
-        return self.stop_injected_bridge_paint()
+        return self._halt_bridge_paint_loop(
+            pulses=5, close_exe=True, label="kill bridge competition",
+        )
 
     @classmethod
     def _bridge_request(cls, command, payload=None, timeout=30, quiet=False, abort_check=None):
@@ -489,36 +501,22 @@ class CamoBridgeMixin:
 
     def camo_stop_paint_loop(self, keep_bridge=True):
         """
-        Stop the in-game template_brush_paint tick without tearing down TCP.
+        Stop the in-game template_brush_paint tick.
 
-        keep_bridge=True leaves meccha-camouflage.exe running so the next
-        camo apply reconnects instantly instead of waiting for F10 again.
+        keep_bridge=True leaves meccha-camouflage.exe running for the next apply.
         """
-        stopped = False
-        try:
-            if self._bridge_ping(quiet=True).get("success"):
-                resp = self._bridge_request(
-                    "cancel_paint", {}, timeout=2, quiet=True,
-                )
-                stopped = bool(resp.get("success"))
-                print(f"[CAMO] cancel_paint (stop loop)={resp}")
-        except Exception:
-            pass
-        if not stopped and self._bridge_ping(quiet=True).get("success"):
-            try:
-                print("[CAMO] F9 pulse — stop in-game bridge paint loop")
-                self._send_f9_pulse()
-                time.sleep(0.15)
-            except Exception as exc:
-                print(f"[CAMO] F9 pulse failed: {exc}")
-        if not keep_bridge:
-            self.camo_stop_exe()
-            self._reset_bridge_state("stop paint + close EXE")
+        self._halt_bridge_paint_loop(
+            pulses=3,
+            close_exe=not keep_bridge,
+            label="stop paint loop",
+        )
         return True
 
     def camo_stop_injected_paint(self):
         """Halt DLL template_brush_paint loop (F9) and close bridge EXE."""
-        return self.camo_stop_paint_loop(keep_bridge=False)
+        return self._halt_bridge_paint_loop(
+            pulses=5, close_exe=True, label="stop injected paint",
+        )
 
     def _send_f10_pulse(self):
         """Wake the bridge EXE — it injects the DLL and opens TCP on F10."""
@@ -634,55 +632,57 @@ class CamoBridgeMixin:
 
         import time as _time
         _time.sleep(2.0)
-        user32 = ctypes.windll.user32
-        vk_f10 = 0x79
         self._focus_game_window()
-        for attempt in range(5):
-            if self._camo_aborted():
-                return False
-            self._send_vk_key(vk_f10)
-            _time.sleep(0.15)
-            if self._bridge_ping(quiet=True).get("success"):
-                print(f"[CAMO] bridge TCP ready after F10 attempt {attempt + 1}", flush=True)
-                self._bridge_game_pid = pid
-                return True
+        # One F10 inject pulse — repeated F10 starts new paint loops that never stop
+        # if TCP never connects (solid-colour flicker every ~16 ms).
+        self._send_vk_key(0x79)
+        _time.sleep(0.5)
+        if self._bridge_ping(quiet=True).get("success"):
+            print("[CAMO] bridge TCP ready after F10 inject", flush=True)
+            self._bridge_game_pid = pid
+            return True
 
         deadline = _time.monotonic() + post_inject_wait
         i = 0
+        retried_f10 = False
         while _time.monotonic() < deadline:
             if self._camo_aborted():
+                self._halt_bridge_paint_loop(pulses=5, close_exe=True, label="bridge aborted")
                 return False
             proc = getattr(self, "_bridge_proc", None)
             if proc and proc.poll() is not None:
                 print(f"[CAMO] bridge EXE exited code={proc.poll()}", flush=True)
+                self._halt_bridge_paint_loop(pulses=5, close_exe=True, label="bridge exe died")
                 return False
             if self._bridge_ping(quiet=True).get("success"):
-                print(f"[CAMO] bridge TCP ready after {i * 0.25 + 2:.1f}s", flush=True)
+                print(f"[CAMO] bridge TCP ready after {i * 0.25 + 2.5:.1f}s", flush=True)
                 self._bridge_game_pid = pid
                 return True
-            if i > 0 and i % 40 == 39:
-                print(f"[CAMO] retry F10 for bridge inject ({i // 40 + 1})", flush=True)
+            if not retried_f10 and i >= 24:
+                retried_f10 = True
+                print("[CAMO] one retry F10 for bridge inject", flush=True)
                 self._focus_game_window()
-                self._send_vk_key(vk_f10)
+                self._send_vk_key(0x79)
             if i % 16 == 15:
                 print(f"[CAMO] waiting for bridge TCP… ({(i + 1) // 16}/10)", flush=True)
             _time.sleep(0.25)
             i += 1
 
-        print("[CAMO] bridge never came alive — click game and press F10 once", flush=True)
+        print("[CAMO] bridge never came alive — halting injected paint loop", flush=True)
+        self._halt_bridge_paint_loop(pulses=5, close_exe=True, label="bridge setup failed")
         return False
 
     def _build_paint_payload_single_pass(self, pid):
-        """One template_brush_paint pass via bridge TCP."""
+        """One template_brush_paint pass via bridge TCP (no continuous tick)."""
         return {
             "native_apply_mode": "template_brush_paint",
             "route": "f10_template_brush_paint",
             "process": {"pid": pid, "name": self.PROCESS_NAME},
-            "max_paints_per_tick": 256,
-            "paint_tick_budget_ms": 16,
+            "max_paints_per_tick": 64,
+            "paint_tick_budget_ms": 8,
             "brush_radius": 4.0,
             "template_min_direct_points": 1000,
-            "auto_flush_during_paint": True,
+            "auto_flush_during_paint": False,
             "single_pass_enabled": True,
             "two_pass_enabled": False,
         }
@@ -704,43 +704,54 @@ class CamoBridgeMixin:
         self._camo_status("Starting bridge wrap…")
 
         if not self._ensure_bridge_ready():
-            self._camo_status("Bridge failed — press F10 in game once")
+            self._camo_status("Bridge failed — click game, press F10 once, retry")
             return False
 
         try:
-            self._bridge_request("cancel_paint", {}, timeout=2, quiet=True)
-        except Exception:
-            pass
+            try:
+                self._bridge_request("cancel_paint", {}, timeout=2, quiet=True)
+            except Exception:
+                pass
 
-        for pass_idx, yaw in enumerate([0, 180]):
-            if self._camo_aborted():
-                return False
-            if yaw != 0:
-                print(f"[CAMO] rotate +{yaw}° (K2_SetActorRotation)", flush=True)
-                self._camo_status(f"Rotating {yaw}° for back pass…")
-                rot = self._bridge_request("rotate", {"yaw": float(yaw)}, timeout=10)
-                if not rot.get("success"):
-                    print(f"[CAMO] rotate failed: {rot}", flush=True)
+            for pass_idx, yaw in enumerate([0, 180]):
+                if self._camo_aborted():
                     return False
-                time.sleep(1.5)
+                if yaw != 0:
+                    print(f"[CAMO] rotate +{yaw}° (K2_SetActorRotation)", flush=True)
+                    self._camo_status(f"Rotating {yaw}° for back pass…")
+                    rot = self._bridge_request("rotate", {"yaw": float(yaw)}, timeout=10)
+                    if not rot.get("success"):
+                        print(f"[CAMO] rotate failed: {rot}", flush=True)
+                        return False
+                    time.sleep(1.5)
 
-            label = "front" if yaw == 0 else "back"
-            self._camo_status(f"Painting {label} pass…")
-            print(f"[CAMO] paint_full_route pass={label}", flush=True)
-            payload = self._build_paint_payload_single_pass(pid)
-            resp = self._bridge_request(
-                "paint_full_route",
-                payload,
-                timeout=120,
-                abort_check=self._camo_aborted,
+                label = "front" if yaw == 0 else "back"
+                self._camo_status(f"Painting {label} pass…")
+                print(f"[CAMO] paint_full_route pass={label}", flush=True)
+                payload = self._build_paint_payload_single_pass(pid)
+                resp = self._bridge_request(
+                    "paint_full_route",
+                    payload,
+                    timeout=120,
+                    abort_check=self._camo_aborted,
+                )
+                print(f"[CAMO] {label} pass response success={resp.get('success')}", flush=True)
+                if not resp.get("success"):
+                    print(f"[CAMO] {label} pass failed: {resp}", flush=True)
+                    return False
+                try:
+                    self._bridge_request("cancel_paint", {}, timeout=2, quiet=True)
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+            self._camo_status("Wrap camo complete")
+            return True
+        finally:
+            # Always stop the in-game 16 ms template_brush_paint tick after wrap.
+            self._halt_bridge_paint_loop(
+                pulses=5, close_exe=True, label="multi-angle done",
             )
-            print(f"[CAMO] {label} pass response success={resp.get('success')}", flush=True)
-            if not resp.get("success"):
-                print(f"[CAMO] {label} pass failed: {resp}", flush=True)
-                return False
-
-        self._camo_status("Wrap camo complete")
-        return True
 
     def camo_apply_full_body_wrap(self):
         """Public entry — 360° multi-angle bridge camo."""
@@ -810,18 +821,10 @@ class CamoBridgeMixin:
             return False
 
     def camo_stop(self):
-        """Cancel bridge setup or paint, then stop meccha-camouflage.exe."""
+        """Cancel bridge paint, halt in-game DLL loop, stop meccha-camouflage.exe."""
         self._camo_abort = True
         if hasattr(self, "_emergency_unfreeze_game"):
             self._emergency_unfreeze_game("CAMO-STOP")
-        try:
-            if self._bridge_ping(quiet=True).get("success"):
-                resp = self._bridge_request("cancel_paint", {}, timeout=2, quiet=True)
-                print(f"[CAMO] cancel_paint response={resp}")
-            else:
-                print("[CAMO] bridge not connected — skip cancel_paint")
-        except Exception as exc:
-            print(f"[CAMO] cancel_paint failed: {exc}")
-        self.camo_stop_exe()
-        self._reset_bridge_state("camo_stop")
-        return True
+        return self._halt_bridge_paint_loop(
+            pulses=5, close_exe=True, label="camo_stop",
+        )

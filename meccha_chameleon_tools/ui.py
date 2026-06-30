@@ -685,9 +685,9 @@ class Menu(QWidget):
         finally:
             try:
                 if used_bridge:
-                    self.esp.camo_stop()
+                    pass  # camo_apply_multi_angle already halted the in-game loop
                 else:
-                    self.esp.stop_injected_bridge_paint(pulses=5)
+                    self.esp.stop_injected_bridge_paint(pulses=3)
             except Exception as exc:
                 print(f"[CAMO] post-apply cleanup: {exc}", flush=True)
             self.camo_job_finished.emit(ok)
