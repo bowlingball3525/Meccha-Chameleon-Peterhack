@@ -30,12 +30,15 @@ Paint any PNG/JPG directly onto your character's texture atlas with two wrap mod
 - Independent **Image Quality** slider (1 = Draft → 5 = Ultra)
 - Game process priority is lowered while painting to free CPU (restores automatically)
 
-### Camouflage (F10)
-- **Standard mode:** SilentJMA bridge (`meccha-camouflage.exe`) paints from the camera view with proper material sync — best for the side facing the camera (back in 3rd person).
-- **360° wrap:** Samples the floor in a ring around your body, bridge-paints the back once, then UV-stamps the front and sides on top.
-- Start / Stop buttons in the CAMOUFLAGE tab; F10 to apply, F9 to stop.
-- Requires bridge TCP — if setup fails, click into the game and press F10 once, then retry.
-- Independent **Camo Quality** slider (1–20)
+### Camouflage
+| Mode | Engine | Description |
+|---|---|---|
+| **Wrap ON** | Bridge | Front `paint_full_route`, rotate pawn +180° via `K2_SetActorRotation`, back pass. |
+| **Wrap OFF** | Peterhack native | Screen-sample + UV/import paint (camera-facing only). |
+
+- Bridge binaries live in `meccha_chameleon_tools/camo/` (bundled with Peterhack).
+- First wrap apply: Peterhack auto-pulses F10 to inject the DLL; click the game if prompted.
+- **Stop** closes the bridge EXE and cancels paint (F9).
 - Logs: `C:\peterhack\logs\latest.log`
 
 ### Trainer

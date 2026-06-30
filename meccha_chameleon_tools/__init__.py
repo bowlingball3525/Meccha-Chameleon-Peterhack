@@ -173,6 +173,10 @@ def main():
     _esp_holder = []
 
     def _on_game_ready(esp):
+        try:
+            esp.stop_injected_bridge_paint(pulses=5)
+        except Exception:
+            pass
         _esp_holder.append(esp)
         menu = Menu(config, esp)
         overlay = Overlay(esp, config, menu=menu)

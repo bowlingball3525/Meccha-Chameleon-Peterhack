@@ -555,7 +555,9 @@ class Menu(QWidget):
         self._update_camo_buttons()
 
     def _on_camo_wrap_sample(self):
-        """Main-thread screen capture + UV colour sampling for full-body wrap."""
+        """Main-thread screen capture + UV colour sampling for camo apply."""
+        holder = getattr(self, "_camo_sample_holder", None) or {}
+        full_body = bool(holder.get("full_body", False))
         points = None
         try:
             if self._overlay and not self._camo_stop_event.is_set():
@@ -565,149 +567,129 @@ class Menu(QWidget):
                 self.config.camouflage_quality = cq
                 if self._overlay:
                     self._overlay.set_paint_throttle(True, quality=camo_q)
-                points = self._overlay._sample_screenspace_pattern(full_body=True)
+                points = self._overlay._sample_screenspace_pattern(full_body=full_body)
         except Exception as exc:
-            print(f"[CAMO] wrap sample failed: {exc}", flush=True)
+            print(f"[CAMO] sample failed: {exc}", flush=True)
         finally:
             if self._overlay:
                 self._overlay.set_paint_throttle(False)
-        holder = getattr(self, "_camo_sample_holder", None)
         if holder is not None:
             holder["points"] = points
             ev = holder.get("event")
             if ev:
                 ev.set()
 
-    def _camo_apply_via_bridge(self, full_wrap=False):
-        """Apply camo through meccha-camouflage.exe (game-thread template_brush_paint)."""
-        if self._camo_stop_event.is_set():
-            return False
-        mode = "full-body wrap" if full_wrap else "standard"
-        print(f"[CAMO] bridge apply ({mode})", flush=True)
-        self.esp._camo_full_body_wrap = bool(full_wrap)
-        try:
-            self.esp.camo_launch_exe()
-        except Exception as exc:
-            print(f"[CAMO] exe launch failed: {exc}", flush=True)
-        if self._camo_stop_event.is_set():
-            return False
-        self.camo_status_update.emit(
-            "Applying camo (back pass)..." if full_wrap else "Applying camo...",
-        )
-        return self.esp.camo_apply()
-
-    def _camo_apply_full_body_wrap(self):
+    def _camo_apply_native(self, full_body=False):
         """
-        Hybrid 360° wrap:
-          1) Atlas-wrap sample (main thread) — no bridge running yet.
-          2) Single bridge TCP paint (camera-visible back, once).
-          3) UV stamps on front hemisphere only, layered without ClearChannel.
+        Peterhack screen-sample + UV stamp camo.
 
-        Never runs UV full-body fallback — that path does not sync material and
-        looks like one solid colour swapping.  Never spam F10 during bridge setup.
+        Avoids meccha-camouflage.exe template_brush_paint, which averages the
+        viewport to one solid colour and can keep repainting on a 16 ms tick.
         """
         if self._camo_stop_event.is_set():
-            return False
-
-        if not self._overlay:
-            print("[CAMO] wrap needs overlay for atlas sampling", flush=True)
             return False
 
         try:
             self.esp.camo_kill_bridge_competition()
         except Exception as exc:
-            print(f"[CAMO] pre-wrap bridge kill: {exc}", flush=True)
+            print(f"[CAMO] kill bridge: {exc}", flush=True)
+
+        if full_body:
+            print("[CAMO] wrap ON — use Start with 'Wrap around full body' checked (bridge)", flush=True)
+            return False
 
         camo_q = max(1, min(10, getattr(self.config, "paint_quality", 8)))
         sz, cq = _quality_to_camo_settings(camo_q)
         self.config.camouflage_sample_size = sz
         self.config.camouflage_quality = cq
 
-        print("[CAMO] hybrid wrap: sample → bridge back → UV front", flush=True)
-        self.camo_status_update.emit("Sampling front/sides (360°)...")
-        ev = threading.Event()
-        self._camo_sample_holder = {"points": None, "event": ev}
+        wrap_label = "ENABLED (360° full-body atlas ring)" if full_body else "DISABLED (camera-facing only)"
+        print(f"[CAMO] wrap mode: {wrap_label}", flush=True)
+        mode = "360° wrap" if full_body else "camera-facing"
+        print(f"[CAMO] native apply ({mode})", flush=True)
+        self.camo_status_update.emit(f"Sampling environment ({mode})…")
+
+        holder = {"points": None, "event": threading.Event(), "full_body": full_body}
+        self._camo_sample_holder = holder
+        holder["event"].clear()
         self.camo_do_wrap_sample.emit()
-        if not ev.wait(120):
-            print("[CAMO] wrap sample timed out", flush=True)
-            return False
-        if self._camo_stop_event.is_set():
+        if not holder["event"].wait(timeout=45):
+            print("[CAMO] native sample timed out", flush=True)
             return False
 
-        points = self._camo_sample_holder.get("points")
-        if not points:
-            print("[CAMO] wrap sample returned no points", flush=True)
-            return False
-
-        seam = self.esp.PAINT_UV_SEAM
-        front_pts = [p for p in points if p[0] < seam]
-        if len(front_pts) < 4:
-            print(f"[CAMO] too few front-hemi points ({len(front_pts)})", flush=True)
-            return False
-
-        print(
-            f"[CAMO] sampled {len(points)} pts (front={len(front_pts)} "
-            f"back={len(points) - len(front_pts)})",
-            flush=True,
-        )
-
-        print("[CAMO] bridge back-pass (single TCP paint)", flush=True)
-        bridge_ok = self._camo_apply_via_bridge(full_wrap=True)
-        if self._camo_stop_event.is_set():
-            return False
-
-        try:
-            self.esp.camo_kill_bridge_competition()
-        except Exception as exc:
-            print(f"[CAMO] bridge kill before UV front: {exc}", flush=True)
-
-        if not bridge_ok:
-            print(
-                "[CAMO] bridge TCP failed — skipping UV front "
-                "(full-body UV fallback causes solid-colour flicker)",
-                flush=True,
-            )
+        points = holder.get("points")
+        if not points or len(points) < 4:
+            print("[CAMO] native sample returned no points", flush=True)
             return False
 
         pawn = self.esp._get_local_pawn()
         if not pawn:
-            print("[CAMO] wrap UV apply: no local pawn", flush=True)
-            return bridge_ok
+            print("[CAMO] native: no local pawn", flush=True)
+            return False
 
-        print(
-            f"[CAMO] UV front-hemi layer {len(front_pts)} points "
-            f"(grid={sz} accumulate=True)",
-            flush=True,
-        )
-        self.camo_status_update.emit("Painting front & sides...")
-        uv_ok = self.esp.set_camouflage_screenspace(
+        self.camo_status_update.emit("Applying camo atlas…")
+        print(f"[CAMO] native paint {len(points)} UV points", flush=True)
+        ok = self.esp.set_camouflage_screenspace(
             pawn,
-            front_pts,
+            points,
             brush_opacity=self.config.camouflage_opacity / 255.0,
+            brush_hardness=0.42,
             fast_paint=(camo_q >= 6),
-            brush_grid=sz,
-            brush_overlap=0.82,
-            wrap_mode=True,
-            accumulate=True,
+            wrap_mode=full_body,
+            accumulate=False,
         )
-        return bridge_ok and uv_ok
+        print(f"[CAMO] native apply ok={ok}", flush=True)
+        return ok
+
+    def _camo_apply_via_bridge(self, full_wrap=False):
+        """Legacy bridge entry — redirects to native screen-sample camo."""
+        del full_wrap
+        return self._camo_apply_native(full_body=False)
+
+    def _camo_apply_full_body_wrap(self):
+        """360° camo via bridge multi-angle paint."""
+        return self._camo_apply_bridge_wrap()
 
     def _camo_apply_bridge_only(self):
-        """Standard bridge camo — faster single-pass template paint."""
-        return self._camo_apply_via_bridge(full_wrap=False)
+        """Standard camo — camera-facing screen bbox sample + UV paint."""
+        return self._camo_apply_native(full_body=False)
+
+    def _camo_apply_bridge_wrap(self):
+        """360° wrap via bridge (front + rotate 180° + back)."""
+        self.camo_status_update.emit("Bridge wrap…")
+        print("[CAMO] mode: bridge multi-angle wrap", flush=True)
+        return self.esp.camo_apply_full_body_wrap()
 
     def _camo_menu_worker(self):
         ok = False
+        used_bridge = False
         try:
-            full_wrap = getattr(self.config, "camo_full_body_wrap", True)
+            full_wrap = getattr(self.config, "camo_full_body_wrap", False)
+            print(
+                f"[CAMO] config camo_full_body_wrap={full_wrap} "
+                f"({'wrap ON' if full_wrap else 'wrap OFF'})",
+                flush=True,
+            )
             if full_wrap:
-                ok = self._camo_apply_full_body_wrap()
+                used_bridge = True
+                ok = self._camo_apply_bridge_wrap()
             else:
-                ok = self._camo_apply_bridge_only()
+                try:
+                    self.esp.camo_kill_bridge_competition()
+                except Exception as exc:
+                    print(f"[CAMO] kill bridge: {exc}", flush=True)
+                ok = self._camo_apply_native(full_body=False)
         except Exception as exc:
             print(f"[CAMO] worker exception: {exc}", flush=True)
             ok = False
         finally:
+            try:
+                if used_bridge:
+                    self.esp.camo_stop()
+                else:
+                    self.esp.stop_injected_bridge_paint(pulses=5)
+            except Exception as exc:
+                print(f"[CAMO] post-apply cleanup: {exc}", flush=True)
             self.camo_job_finished.emit(ok)
 
     def _camo_menu_done(self, ok):
@@ -794,6 +776,24 @@ class Menu(QWidget):
         if self.isVisible():
             self.raise_()
             self.activateWindow()
+
+    def _toggle_esp(self):
+        self.config.enabled = not self.config.enabled
+        self._sync_esp_toggle_ui()
+
+    def _sync_esp_toggle_ui(self):
+        on = bool(self.config.enabled)
+        if hasattr(self, "btn_esp"):
+            self.btn_esp.setText(f"ESP: {'ON' if on else 'OFF'}")
+            self.btn_esp.setStyleSheet(
+                "QPushButton { background-color: #1a3a14; border-color: #389020; color: #b8e8a0; }"
+                if on else
+                "QPushButton { background-color: #3a1a1a; border-color: #5a2a2a; color: #e8a0a0; }"
+            )
+        if hasattr(self, "cb_enabled"):
+            self.cb_enabled.blockSignals(True)
+            self.cb_enabled.setChecked(on)
+            self.cb_enabled.blockSignals(False)
 
     def _on_hotkey_f9(self):
         self._stop_camo_now()
@@ -1010,7 +1010,11 @@ class Menu(QWidget):
 
         hint = QLabel("Ins/F1 toggle | Drag to move")
         hint.setStyleSheet("color: #5a7a4a; font-size: 9px;")
+        self.btn_esp = QPushButton()
+        self.btn_esp.clicked.connect(self._toggle_esp)
+        self._sync_esp_toggle_ui()
         bar.addWidget(self.btn_save)
+        bar.addWidget(self.btn_esp)
         bar.addWidget(self.btn_close)
         bar.addStretch()
         bar.addWidget(hint)
@@ -1040,6 +1044,9 @@ class Menu(QWidget):
         lo = QVBoxLayout(p)
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
+        self.cb_enabled = self._chk("ESP Enabled", "enabled")
+        self.cb_enabled.stateChanged.connect(lambda _s: self._sync_esp_toggle_ui())
+        lo.addWidget(self.cb_enabled)
         row = QHBoxLayout()
         row.setSpacing(6)
         self.cb_dot = self._chk("Dot","dot_esp")
@@ -1257,7 +1264,7 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
 
-        hdr = QLabel("CAMOUFLAGE (SilentJMA bridge)")
+        hdr = QLabel("CAMOUFLAGE")
         hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
         lo.addWidget(hdr)
 
@@ -1269,16 +1276,15 @@ class Menu(QWidget):
             "camo_full_body_wrap",
         )
         self.cb_camo_wrap.setToolTip(
-            "360° wrap: sample floor in a ring, bridge paints your back once,\n"
-            "then UV-stamps front/sides on top. Requires bridge TCP (F10 in-game once).\n"
-            "Unchecked = faster single-pass bridge camo (camera-facing only)."
+            "360° wrap: bridge paints front, rotates pawn 180°, paints back.\n"
+            "Unchecked: Peterhack native screen-sample (camera-facing only)."
         )
         lo.addWidget(self.cb_camo_wrap)
 
         info = QLabel(
-            "Start → launches EXE + applies camo. Status shows each step.\n"
-            "Wait for Done! before starting again. Stop closes the EXE anytime.\n"
-            "Run Peterhack as Administrator."
+            "Wrap ON: bridge front pass, rotate 180° (K2_SetActorRotation), back pass.\n"
+            "Wrap OFF: Peterhack native screen-sample + UV/import paint.\n"
+            "Run as Administrator. Restart the game if you see solid-colour flicker."
         )
         info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 0;")
         info.setWordWrap(True)
@@ -1291,7 +1297,7 @@ class Menu(QWidget):
         self.btn_camo_apply = QPushButton("Start Camouflage")
         self.btn_camo_apply.setFixedHeight(32)
         self.btn_camo_apply.setToolTip(
-            "Start meccha-camouflage.exe and apply via bridge (same as F10)."
+            "Sample the environment and UV-stamp camouflage onto your character."
         )
         self.btn_camo_apply.setStyleSheet(
             "QPushButton { background-color: #2a4a1a; border: 1px solid #3a6a2a;"
@@ -1316,14 +1322,6 @@ class Menu(QWidget):
         )
         self.btn_camo_stop.clicked.connect(self._stop_camo_now)
         lo.addWidget(self.btn_camo_stop)
-
-        legacy = QLabel(
-            "Previous Peterhack screen-sampling camo is backed up in\n"
-            "backup/camo_peterhack_pre_silentjma/ — see RESTORE.md to revert."
-        )
-        legacy.setStyleSheet("color: #666; font-size: 10px;")
-        legacy.setWordWrap(True)
-        lo.addWidget(legacy)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -1633,23 +1631,11 @@ class Menu(QWidget):
             "\n"
             "--- Jun 29, 2026 (latest) ---\n"
             "\n"
-            "[Camouflage — SilentJMA bridge + hybrid 360° wrap]\n"
-            "  + Standard camo uses meccha-camouflage.exe TCP bridge\n"
-            "    (template_brush_paint) for proper in-game material sync.\n"
-            "  + 'Wrap around full body' checkbox: hybrid 360° path —\n"
-            "      1) Atlas-wrap screen sample (ring around body)\n"
-            "      2) Single bridge TCP paint (camera-visible back)\n"
-            "      3) UV stamps on front hemisphere only (no ClearChannel)\n"
-            "    Rotating the character does not help in 3rd person — the\n"
-            "    camera follows and still sees the back.\n"
-            "  + Fixed bridge setup spamming F10 (each pulse repainted the\n"
-            "    back via the injected DLL even when TCP was not connected).\n"
-            "    Now: inject once, wait for TCP, at most one F10 if needed.\n"
-            "  + Removed UV full-body fallback when bridge TCP fails — that\n"
-            "    path logged success but looked like one solid colour swapping.\n"
-            "  + Start / Stop Camouflage buttons; F10 apply, F9 stop (polled).\n"
-            "  + Bundled camo/ binaries: meccha-camouflage.exe, xenos DLL,\n"
-            "    injector (place alongside Peterhack in camo/ folder).\n"
+            "[Camouflage — bridge wrap + native camera-facing]\n"
+            "  + Wrap ON: bridge multi-angle paint (front, rotate 180°, back).\n"
+            "  + Wrap OFF: native screen-sample + UV/import paint.\n"
+            "  + Start / Stop Camouflage buttons; F9 stop (polled).\n"
+            "  + Bundled camo/ binaries ship with Peterhack.\n"
             "\n"
             "[Trainer tab]\n"
             "  + Ported trainer toggles (No Gun CD, No Recoil, etc.) with\n"
@@ -2458,32 +2444,15 @@ class Overlay(QWidget):
             self._key_states[name] = bool(state)
 
         if self.config.camouflage_enabled and menu:
-            VK_F10 = 0x79
-            f10_raw = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F10) & 0x8000)
-            if f10_raw:
-                self._f10_down_count += 1
-            else:
-                self._f10_down_count = 0
             now_ms = int(time.time() * 1000)
-            if (
-                self._f10_down_count >= 2
-                and (now_ms - self._f10_last_fire_ms) > 3000
-                and (time.monotonic() - self._camo_last_apply) >= 3.0
-            ):
-                menu._on_hotkey_f10()
-                self._f10_last_fire_ms = now_ms
-                self._f10_down_count = 0
+            # F10 camo apply removed — Windows/games use F10; re-apply caused solid flicker.
 
             VK_F9 = 0x78
-            f9_raw = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F9) & 0x8000)
-            if f9_raw:
-                self._f9_down_count += 1
-            else:
-                self._f9_down_count = 0
-            if self._f9_down_count >= 2 and (now_ms - self._f9_last_fire_ms) > 1000:
+            f9_down = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F9) & 0x8000)
+            if f9_down and not self._key_states.get("f9") and (now_ms - self._f9_last_fire_ms) > 1000:
                 menu._on_hotkey_f9()
                 self._f9_last_fire_ms = now_ms
-                self._f9_down_count = 0
+            self._key_states["f9"] = f9_down
 
     def _toggle_camouflage(self):
         """Delegate to Menu — F10 polling and legacy callers."""
@@ -2496,10 +2465,7 @@ class Overlay(QWidget):
             self.menu._stop_camo_now()
 
     def _toggle_camouflage_legacy_sampling(self):
-        """
-        LEGACY — Peterhack screen-sampling chameleon (not used; kept for reference).
-        See backup/camo_peterhack_pre_silentjma/ui.py to restore.
-        """
+        """Legacy Peterhack screen-sampling chameleon (reference only; not used)."""
         local_pawn = self.esp._get_local_pawn()
         if not local_pawn:
             self._camo_feedback = "NO PAWN FOUND"
@@ -2559,28 +2525,8 @@ class Overlay(QWidget):
             self._camo_feedback_count = 60
 
     def _auto_refresh_camo(self):
-        """Silently re-apply the blend every 1.5 s while camo is active.
-        Keeps the character blended as they move over new floor splatters."""
-        if self._camouflage_active and self.config.camouflage_enabled:
-            local_pawn = self.esp._get_local_pawn()
-            if not local_pawn:
-                return
-            try:
-                pattern = self._sample_screenspace_pattern()
-            except Exception:
-                return
-            if not pattern:
-                return
-            ok = self.esp.set_camouflage_screenspace(
-            local_pawn, pattern,
-            brush_opacity=self.config.camouflage_opacity / 255.0,
-            brush_hardness=0.42,
-        )
-            if ok:
-                ar = sum(p[2][0] for p in pattern) // len(pattern)
-                ag = sum(p[2][1] for p in pattern) // len(pattern)
-                ab = sum(p[2][2] for p in pattern) // len(pattern)
-                self._camouflage_color = (ar, ag, ab)
+        """Disabled — re-applying camo on a timer caused solid-colour flicker."""
+        return
 
     def _sample_environment_pattern(self):
         """
@@ -3310,172 +3256,193 @@ class Overlay(QWidget):
         except Exception as exc:
             print(f"[TRAINER:TICK] overlay error: {exc}", flush=True)
 
-        # Sticky player cache in core.get_players() — survives empty/partial reads (max 24).
-        all_players = self.esp.get_players(
-            include_local=self.config.show_local,
-            team_filter=self.config.team_filter,
-        )
+        if not self.config.enabled:
+            _draw_label(painter, 10, 20, "ESP OFF", QColor(200, 200, 200))
+        else:
+            # Player list from core.get_players() — living players only; cache clears on leave/end.
+            all_players = self.esp.get_players(
+                include_local=self.config.show_local,
+                team_filter=self.config.team_filter,
+            )
 
-        # Get local player position for radar
-        local_pos = None
-        if all_players:
-            for p in all_players:
-                if p["is_local"]:
-                    local_pos = p["pos"]
-                    break
+            # Get local player position for radar
+            local_pos = None
+            if all_players:
+                for p in all_players:
+                    if p["is_local"]:
+                        local_pos = p["pos"]
+                        break
 
-        # Draw each player — wrapped so one bad player never kills the whole frame
-        for pdata in all_players:
-          try:
-            is_local = pdata["is_local"]
-            pos = pdata["pos"]
-            actor = pdata["actor"]
-            ps = pdata["player_state"]
-            idx = pdata["idx"]
+            # Draw each player — wrapped so one bad player never kills the whole frame
+            for pdata in all_players:
+              try:
+                is_local = pdata["is_local"]
+                pos = pdata["pos"]
+                actor = pdata["actor"]
+                ps = pdata["player_state"]
+                idx = pdata["idx"]
 
-            # Distance scaling
-            d = dist(pos, cam["loc"])
-            scale = 1.0
-            if self.config.distance_scaling and d > 0:
-                scale = self.config.scale_reference_dist / d
-                scale = max(0.3, min(scale, 3.0))
+                # Distance scaling
+                d = dist(pos, cam["loc"])
+                scale = 1.0
+                if self.config.distance_scaling and d > 0:
+                    scale = self.config.scale_reference_dist / d
+                    scale = max(0.3, min(scale, 3.0))
 
-            # Project center position — always returns (sx, sy, on_screen)
-            screen_center = w2s(pos, cam, w, h)
-            sx, sy, on_screen = screen_center
-            sy += self.config.box_y_offset
+                # Project center position — always returns (sx, sy, on_screen)
+                screen_center = w2s(pos, cam, w, h)
+                sx, sy, on_screen = screen_center
+                sy += self.config.box_y_offset
 
-            if is_local:
-                color = self.config.local_color
-            else:
-                # Determine base color by team
-                is_hunter = pdata.get("is_hunter")
-                if is_hunter is True:
-                    base_color = self.config.hunter_color
-                elif is_hunter is False:
-                    base_color = self.config.survivor_color
+                if is_local:
+                    color = self.config.local_color
                 else:
-                    base_color = self.config.enemy_color  # unknown team fallback
-
-                color = base_color
-
-            # --- Off-screen indicator: triangle arrow pointing toward player ---
-            if not on_screen:
-                ex, ey, ux, uy = oof_indicator_pos(
-                    sx, sy, w, h, self.config.oof_arrow_radius)
-                # Perpendicular to arrow direction
-                px, py = -uy, ux
-                # Triangle: tip at edge, two base points behind
-                SZ = 10
-                tip  = (int(ex + ux * SZ), int(ey + uy * SZ))
-                base1 = (int(ex - ux * SZ + px * SZ), int(ey - uy * SZ + py * SZ))
-                base2 = (int(ex - ux * SZ - px * SZ), int(ey - uy * SZ - py * SZ))
-                tri = QPolygonF([QPointF(*tip), QPointF(*base1), QPointF(*base2)])
-                painter.setPen(QPen(QColor(0, 0, 0), 1))
-                painter.setBrush(QColor(*color))
-                painter.drawPolygon(tri)
-                # OOF label — toggles for name / distance / health number
-                oof_parts = []
-                player_name = pdata.get("player_name", "").strip()
-                if is_hunter is True:
-                    team_tag = "H"
-                elif is_hunter is False:
-                    team_tag = "S"
-                else:
-                    team_tag = "?"
-                if self.config.oof_show_names:
-                    if player_name:
-                        oof_parts.append(f"[{team_tag}] {player_name}")
+                    # Determine base color by team
+                    is_hunter = pdata.get("is_hunter")
+                    if is_hunter is True:
+                        base_color = self.config.hunter_color
+                    elif is_hunter is False:
+                        base_color = self.config.survivor_color
                     else:
-                        oof_parts.append(f"[{team_tag}]")
-                if self.config.oof_show_distance:
-                    d_m = int(d / 100.0)
-                    oof_parts.append(f"{d_m}m")
-                if self.config.oof_show_health and actor:
+                        base_color = self.config.enemy_color  # unknown team fallback
+
+                    color = base_color
+
+                # --- Off-screen indicator: triangle arrow pointing toward player ---
+                if not on_screen:
+                    ex, ey, ux, uy = oof_indicator_pos(
+                        sx, sy, w, h, self.config.oof_arrow_radius)
+                    # Perpendicular to arrow direction
+                    px, py = -uy, ux
+                    # Triangle: tip at edge, two base points behind
+                    SZ = 10
+                    tip  = (int(ex + ux * SZ), int(ey + uy * SZ))
+                    base1 = (int(ex - ux * SZ + px * SZ), int(ey - uy * SZ + py * SZ))
+                    base2 = (int(ex - ux * SZ - px * SZ), int(ey - uy * SZ - py * SZ))
+                    tri = QPolygonF([QPointF(*tip), QPointF(*base1), QPointF(*base2)])
+                    painter.setPen(QPen(QColor(0, 0, 0), 1))
+                    painter.setBrush(QColor(*color))
+                    painter.drawPolygon(tri)
+                    # OOF label — toggles for name / distance / health number
+                    oof_parts = []
+                    player_name = pdata.get("player_name", "").strip()
+                    if is_hunter is True:
+                        team_tag = "H"
+                    elif is_hunter is False:
+                        team_tag = "S"
+                    else:
+                        team_tag = "?"
+                    if self.config.oof_show_names:
+                        if player_name:
+                            oof_parts.append(f"[{team_tag}] {player_name}")
+                        else:
+                            oof_parts.append(f"[{team_tag}]")
+                    if self.config.oof_show_distance:
+                        d_m = int(d / 100.0)
+                        oof_parts.append(f"{d_m}m")
+                    if self.config.oof_show_health and actor:
+                        try:
+                            health_info = self.esp.get_health(actor, ps)
+                            if health_info and health_info[0] is not None:
+                                oof_parts.append(f"{int(health_info[0])} HP")
+                        except Exception:
+                            pass
+                    if oof_parts:
+                        _draw_label(painter, int(ex + ux * 14), int(ey + uy * 14),
+                                    " | ".join(oof_parts), QColor(*color))
+                    continue  # skip on-screen rendering for this player
+
+                # Clamped coords for on-screen elements (dots, bars, labels)
+                # Snap lines use raw sx/sy so they reach screen edges
+                dsx, dsy = clamp_screen(sx, sy - self.config.box_y_offset, w, h)
+                dsy += self.config.box_y_offset
+
+                # Dot ESP
+                if self.config.dot_esp:
+                    radius = int(self.config.dot_radius * scale)
+                    self._draw_dot(painter, dsx, dsy, max(2, radius), color)
+
+                # 2D Box ESP
+                if self.config.box_esp:
+                    rot = self.esp.get_actor_root_rotation(actor) if actor else None
+                    hw = self.config.box_height_world / 3.0
+                    draw_2d_box(painter, pos, cam, w, h,
+                                self.config.box_height_world, hw, rot, color, scale)
+
+                # Skeleton ESP — isolated so bone-read failures never affect dot/box/labels
+                if self.config.skeleton_esp and actor and not is_local:
                     try:
-                        health_info = self.esp.get_health(actor, ps)
-                        if health_info and health_info[0] is not None:
-                            oof_parts.append(f"{int(health_info[0])} HP")
+                        bones = self.esp.get_skeleton_positions_by_indices(
+                            actor, self.config.bone_indices)
+                        if not bones:
+                            bones = self.esp.get_skeleton_positions(actor)
+                        if bones:
+                            draw_skeleton(
+                                painter, bones, cam, w, h, self.config.skeleton_color)
                     except Exception:
                         pass
-                if oof_parts:
-                    _draw_label(painter, int(ex + ux * 14), int(ey + uy * 14),
-                                " | ".join(oof_parts), QColor(*color))
-                continue  # skip on-screen rendering for this player
 
-            # Clamped coords for on-screen elements (dots, bars, labels)
-            # Snap lines use raw sx/sy so they reach screen edges
-            dsx, dsy = clamp_screen(sx, sy - self.config.box_y_offset, w, h)
-            dsy += self.config.box_y_offset
+                # Health / Shield bars
+                if self.config.health_bar or self.config.shield_bar:
+                    health_info = self.esp.get_health(actor, ps)
+                    if health_info and health_info[0] is not None:
+                        hp, sh = health_info
+                        bar_x = dsx - 12 * scale
+                        bar_y = dsy - 20 * scale
+                        draw_health_bar(painter, bar_x, bar_y, 24 * scale, 4, hp, sh if self.config.shield_bar else None)
 
-            # Dot ESP
-            if self.config.dot_esp:
-                radius = int(self.config.dot_radius * scale)
-                self._draw_dot(painter, dsx, dsy, max(2, radius), color)
+                # Snap lines
+                if self.config.snap_lines:
+                    painter.setPen(QPen(QColor(*color), 1))
+                    painter.drawLine(int(w / 2), int(h), int(sx), int(sy))
 
-            # 2D Box ESP
-            if self.config.box_esp:
-                rot = self.esp.get_actor_root_rotation(actor) if actor else None
-                hw = self.config.box_height_world / 3.0
-                draw_2d_box(painter, pos, cam, w, h,
-                            self.config.box_height_world, hw, rot, color, scale)
-
-            # Skeleton ESP — isolated so bone-read failures never affect dot/box/labels
-            if self.config.skeleton_esp and actor and not is_local:
-                try:
-                    bones = self.esp.get_skeleton_positions_by_indices(
-                        actor, self.config.bone_indices)
-                    if not bones:
-                        bones = self.esp.get_skeleton_positions(actor)
-                    if bones:
-                        draw_skeleton(
-                            painter, bones, cam, w, h, self.config.skeleton_color)
-                except Exception:
-                    pass
-
-            # Health / Shield bars
-            if self.config.health_bar or self.config.shield_bar:
-                health_info = self.esp.get_health(actor, ps)
-                if health_info and health_info[0] is not None:
-                    hp, sh = health_info
-                    bar_x = dsx - 12 * scale
-                    bar_y = dsy - 20 * scale
-                    draw_health_bar(painter, bar_x, bar_y, 24 * scale, 4, hp, sh if self.config.shield_bar else None)
-
-            # Snap lines
-            if self.config.snap_lines:
-                painter.setPen(QPen(QColor(*color), 1))
-                painter.drawLine(int(w / 2), int(h), int(sx), int(sy))
-
-            # Labels
-            label_parts = []
-            if self.config.show_names:
-                if is_local:
-                    label_parts.append("YOU")
-                else:
-                    is_hunter   = pdata.get("is_hunter")
-                    player_name = pdata.get("player_name", "").strip()
-                    team_str    = "Hunter" if is_hunter is True else ("Survivor" if is_hunter is False else "Player")
-                    if player_name:
-                        label_parts.append(f"[{team_str}] {player_name}")
+                # Labels
+                label_parts = []
+                if self.config.show_names:
+                    if is_local:
+                        label_parts.append("YOU")
                     else:
-                        label_parts.append(f"[{team_str}]")
-            if self.config.show_distance:
-                dm = int(d / 100)
-                label_parts.append(f"{dm}m")
-            if label_parts:
-                painter.setPen(QPen(QColor(*color)))
-                text = " | ".join(label_parts)
-                label_x = int(dsx + self.config.dot_radius * scale + 4)
-                label_y = int(dsy)
-                painter.drawText(label_x, label_y, text)
+                        is_hunter   = pdata.get("is_hunter")
+                        player_name = pdata.get("player_name", "").strip()
+                        team_str    = "Hunter" if is_hunter is True else ("Survivor" if is_hunter is False else "Player")
+                        if player_name:
+                            label_parts.append(f"[{team_str}] {player_name}")
+                        else:
+                            label_parts.append(f"[{team_str}]")
+                if self.config.show_distance:
+                    dm = int(d / 100)
+                    label_parts.append(f"{dm}m")
+                if label_parts:
+                    painter.setPen(QPen(QColor(*color)))
+                    text = " | ".join(label_parts)
+                    label_x = int(dsx + self.config.dot_radius * scale + 4)
+                    label_y = int(dsy)
+                    painter.drawText(label_x, label_y, text)
 
-          except Exception:
-            pass  # never let one bad player crash the whole frame
+              except Exception:
+                pass  # never let one bad player crash the whole frame
 
-        # Player count
-        non_local = [p for p in all_players if not p["is_local"]]
-        _draw_label(painter, 10, 20, f"Players: {len(non_local)}", QColor(255, 255, 255))
+            # Player count
+            non_local = [p for p in all_players if not p["is_local"]]
+            _draw_label(painter, 10, 20, f"Players: {len(non_local)}", QColor(255, 255, 255))
+
+            # Radar
+            if self.config.radar_enabled and local_pos:
+                radar_x = w - self.config.radar_size - 20
+                radar_y = 20 + self.config.radar_size // 2
+                enemy_list = [p for p in all_players if not p["is_local"]]
+                for p in enemy_list:
+                    is_hunter = p.get("is_hunter")
+                    if is_hunter is True:
+                        p["color"] = self.config.hunter_color
+                    elif is_hunter is False:
+                        p["color"] = self.config.survivor_color
+                    else:
+                        p["color"] = self.config.enemy_color
+                draw_radar(painter, cam, local_pos, enemy_list,
+                           radar_x, radar_y,
+                           self.config.radar_size, self.config.radar_range,
+                           self.config.radar_color, self.config.radar_opacity)
 
         # FPS counters — overlay (timer-derived) + in-game (500 Hz camera tracker)
         overlay_fps = round(1000 / max(1, self.timer.interval()))
@@ -3527,24 +3494,6 @@ class Overlay(QWidget):
             best_target = self._find_best_target(cam, w, h)
             if best_target and self._aim_key_held():
                 self._aim_at(best_target)
-
-        # Radar
-        if self.config.radar_enabled and local_pos:
-            radar_x = w - self.config.radar_size - 20
-            radar_y = 20 + self.config.radar_size // 2
-            enemy_list = [p for p in all_players if not p["is_local"]]
-            for p in enemy_list:
-                is_hunter = p.get("is_hunter")
-                if is_hunter is True:
-                    p["color"] = self.config.hunter_color
-                elif is_hunter is False:
-                    p["color"] = self.config.survivor_color
-                else:
-                    p["color"] = self.config.enemy_color
-            draw_radar(painter, cam, local_pos, enemy_list,
-                       radar_x, radar_y,
-                       self.config.radar_size, self.config.radar_range,
-                       self.config.radar_color, self.config.radar_opacity)
 
     def _draw_dot(self, painter, cx, cy, r, color):
         painter.setPen(Qt.NoPen)

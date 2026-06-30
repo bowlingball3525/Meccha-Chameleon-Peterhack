@@ -32,3 +32,7 @@ Desktop.ini
 
 # Secrets / personal config
 esp_config.json
+
+# Local dev / vendored source (not shipped)
+runtime/
+backup/

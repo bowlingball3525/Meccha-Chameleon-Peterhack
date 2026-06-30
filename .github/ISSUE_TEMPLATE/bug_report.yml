@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         Thanks for taking the time to fill out this bug report!
-        Please check that you are on the [latest release](https://github.com/SilentJMA/Meccha-Chameleon-Tools/releases) before submitting.
+        Please check that you are on the [latest release](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/releases) before submitting.
 
   - type: input
     id: summary

@@ -8,6 +8,7 @@ import struct
 import math
 import os
 import ctypes
+import threading
 import pymem
 from contextlib import contextmanager
 
@@ -468,7 +469,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     PAINT_UV_BATCH_SAFE = 24     # max stamps per shellcode (avoids timeout use-after-free)
     CAMO_MAX_BRUSH_PX = 32.0     # huge brushes corrupt RT / crash on unfreeze flush
     CAMO_MAX_STAMPS = 16384      # paint full grid when possible — subsampling causes gaps
-    CAMO_WRAP_MAX_STAMPS = 8192  # wrap 360° — fewer injects, still covers both hemispheres
+    CAMO_WRAP_MAX_STAMPS = 1024  # sparse UV fallback — overlap causes solid-colour mud
     PAINT_LIVE_BATCH_PAUSE = 0.022  # seconds between live batches (camo unfrozen path)
     MIN_PAINT_ALPHA = 24         # skip transparent PNG pixels (avoid black stamps)
     IMAGE_WRAP_MODE_LABELS = {
@@ -556,7 +557,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         (bytes([0x48, 0x8D, 0x3D, 0x00, 0x00, 0x00, 0x00]),
          bytes([1, 1, 1, 0, 0, 0, 0])),
     )
-    FNAMEPOOL_DELTA = 0x11CB58   # GObjects − GNames (dump 5.6.1-44394996)
+    FNAMEPOOL_DELTA = 0x11C658   # GObjects − GNames (dump 5.6.1-44394996)
 
     OFFSET_MAP = {
         "UWorld::GameState": ("World", "GameState"),
@@ -685,7 +686,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._active_freeze_handles = None     # set while _game_frozen() is active
         self._paint_keep_unfrozen = False      # stay unfrozen after first inject in a session
         self._paint_session_resumed = False    # avoid double-resume in _game_frozen finally
-        self._players_cache = []               # sticky ESP player list; survives empty reads
+        self._players_cache = []               # ESP player list; brief fallback on empty reads
+        self._esp_session_key = None           # (world_ptr, gamestate_ptr) — change clears cache
+        self._esp_session_ready = False
+        self._esp_last_player_array_count = 0
         self._export_worker_rva = None
         self._import_worker_rva = None
         self._clear_worker_rva = None
@@ -697,6 +701,13 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._last_paint_grid = 32
         self._bridge_proc = None
         self._bridge_dll_injected = False
+        self._bridge_tcp_ready = False
+        self._bridge_game_pid = 0
+        self._camo_bridge_waiting = False
+        self._bridge_f10_seen = threading.Event()
+        self._bridge_hotkey_paint_done = threading.Event()
+        self._bridge_tcp_event = threading.Event()
+        self._camo_allow_f10_wake = True
         self._camo_abort = False
         self._init_trainer_state()
 
@@ -915,6 +926,32 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return False
         rot = rvec3(self.pm, root + 0x158)
         return wvec3(self.pm, root + 0x158, (rot[0], float(yaw_deg), rot[2]))
+
+    def get_control_rotation(self):
+        """Read player controller ControlRotation (pitch, yaw, roll degrees)."""
+        world = self._get_world()
+        if not world:
+            return None
+        pc = self._get_local_controller(world)
+        if not pc:
+            return None
+        addr = pc + self.offsets.get("AController::ControlRotation", 0x320)
+        rot = rvec3(self.pm, addr)
+        if not all(math.isfinite(v) for v in rot):
+            return None
+        return rot
+
+    def set_control_yaw(self, yaw_deg):
+        """Set controller yaw while keeping pitch/roll."""
+        world = self._get_world()
+        if not world:
+            return False
+        pc = self._get_local_controller(world)
+        if not pc:
+            return False
+        addr = pc + self.offsets.get("AController::ControlRotation", 0x320)
+        rot = rvec3(self.pm, addr)
+        return wvec3(self.pm, addr, (rot[0], float(yaw_deg), rot[2]))
 
     # UE5.6 skeleton offsets (build 44394996)
     _SCENE_COMPONENT_TO_WORLD = 0x1E0          # FTransform (96B) at end of USceneComponent (0x240)
@@ -1374,12 +1411,85 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return True
         return False
 
-    def get_players(self, include_local=False, team_filter=False):
-        """Return up to MAX_ESP_PLAYERS entries with a sticky cache.
+    def clear_players_cache(self, reason=""):
+        if self._players_cache:
+            msg = f"[ESP] player cache cleared"
+            if reason:
+                msg += f" ({reason})"
+            print(msg, flush=True)
+        self._players_cache = []
 
-        A transient empty or partial memory read no longer clears ESP — cached
-        players are kept until replaced by a fresh read for the same actor.
+    def _is_pawn_alive(self, pawn, player_state=0):
+        """False for confirmed dead pawns. Dead flag only on FirstPersonCharacter."""
+        if not pawn:
+            return False
+        cls_name = self.objects.class_name(pawn) or ""
+        if "BP_FirstPersonCharacter" in cls_name:
+            try:
+                return self.pm.read_bytes(pawn + self.PAWN_OFF_DEAD, 1)[0] == 0
+            except Exception:
+                return True
+        try:
+            hp, _sh = self.get_health(pawn, player_state)
+            if hp is not None and hp <= 0.0:
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _esp_session_snapshot(self):
+        """Return (world_ptr, gamestate_ptr, player_array_count) for cache invalidation."""
+        world = self._get_world()
+        if not world:
+            return 0, 0, 0
+        gs = rp(self.pm, world + self.offsets["UWorld::GameState"]) or 0
+        pa_count = 0
+        if gs:
+            _data, pa_count, _ = read_array(
+                self.pm, gs + self.offsets["AGameStateBase::PlayerArray"],
+            )
+        return world, gs, pa_count or 0
+
+    def _tick_esp_session(self):
         """
+        Clear ESP cache when leaving a server or when the match ends.
+
+        Detects world / GameState pointer changes, empty PlayerArray after a
+        populated match, and total loss of the UWorld (disconnect / main menu).
+        """
+        world, gs, pa_count = self._esp_session_snapshot()
+        key = (world, gs)
+
+        if not world:
+            if self._players_cache:
+                self.clear_players_cache("left world / disconnected")
+            self._esp_session_key = None
+            self._esp_session_ready = False
+            self._esp_last_player_array_count = 0
+            return False
+
+        if self._esp_session_ready and key != self._esp_session_key:
+            self.clear_players_cache("server or map changed")
+
+        prev_pa = self._esp_last_player_array_count
+        if self._esp_session_ready and prev_pa >= 2 and pa_count == 0:
+            self.clear_players_cache("match ended (PlayerArray empty)")
+
+        self._esp_session_key = key
+        self._esp_session_ready = True
+        self._esp_last_player_array_count = pa_count
+        return True
+
+    def get_players(self, include_local=False, team_filter=False):
+        """Return up to MAX_ESP_PLAYERS entries.
+
+        Uses a short-lived cache only when a frame read returns nobody — never
+        re-adds stale cached players over a fresh read. Dead pawns are excluded.
+        Cache clears on disconnect, server change, or match end.
+        """
+        if not self._tick_esp_session():
+            return []
+
         cap = self.MAX_ESP_PLAYERS
         try:
             fresh = list(self.iter_players(
@@ -1390,38 +1500,24 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             fresh = []
 
         if fresh:
-            merged = []
-            seen = set()
-            for p in fresh:
-                if len(merged) >= cap:
-                    break
-                merged.append(p)
-                actor = p.get("actor")
-                if actor:
-                    seen.add(actor)
-            if len(merged) < len(self._players_cache):
-                for p in self._players_cache:
-                    if len(merged) >= cap:
-                        break
-                    actor = p.get("actor")
-                    if actor and actor not in seen:
-                        merged.append(p)
-                        seen.add(actor)
-            self._players_cache = merged[:cap]
+            self._players_cache = fresh[:cap]
         elif self._players_cache:
-            # Refresh positions for cached actors when a full read briefly fails.
+            # Brief read failure — keep last known living players with fresh positions.
             updated = []
             for p in self._players_cache[:cap]:
                 actor = p.get("actor")
                 if not actor:
                     continue
+                ps = p.get("player_state", 0)
+                if not self._is_pawn_alive(actor, ps):
+                    continue
                 pos = self.get_actor_root_pos(actor)
-                if pos:
-                    entry = dict(p)
-                    entry["pos"] = pos
-                    updated.append(entry)
-            if updated:
-                self._players_cache = updated
+                if not pos:
+                    continue
+                entry = dict(p)
+                entry["pos"] = pos
+                updated.append(entry)
+            self._players_cache = updated
 
         return self._players_cache[:cap]
 
@@ -1487,6 +1583,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                             continue
                         if "Spectate" in pawn_cls:
                             continue
+                    if not self._is_pawn_alive(pawn, ps):
+                        continue
                     pos = self.get_actor_root_pos(pawn)
                     if not pos:
                         continue
@@ -1538,6 +1636,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                             continue
                         if "Spectate" in cls_name:
                             continue
+                    if not self._is_pawn_alive(actor, 0):
+                        continue
                     pos = self.get_actor_root_pos(actor)
                     if not pos:
                         continue
@@ -1554,15 +1654,12 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     }
 
 
-    # -----------------------------------------------------------------------
-    # Camouflage — offsets verified from Dumper-7 SDK dump
-    # 5.6.1-44394996+++UE5+Release-5.6-Chameleon (re-dumped 2026-06-28)
+    # Camouflage — offsets from Dumper-7 dump
+    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-06-29)
     #
     # Globals (Basic.hpp / OffsetsInfo.json):
     #   GObjects 0x09F33450  GNames 0x09E16DF8  GWorld 0x09C7C620  ProcessEvent 0x015D0950
-    #   RuntimePaintable @ pawn+0x0B68  AlbedoRT @ comp+0x0148  DynamicMaterial @ comp+0x0168
-    #   DynamicMaterialInstance @ comp+0x0168 — do NOT write near +0x016A/+0x016B (AV crash)
-    #   AppendString 0x013B3110  ProcessEvent 0x015D0950  ProcessEventIdx 0x4C
+    #   FNAMEPOOL_DELTA 0x11C658  AppendString 0x013B3110  ProcessEventIdx 0x4C
     #
     # ABP_FirstPersonCharacter_cLeon_Character_C:
     #   pawn + 0x0B68  ->  RuntimePaintable     (URuntimePaintableComponent*)
@@ -1627,6 +1724,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         return self._find_local_pawn()
 
     # Mesh / actor render flags — hide local body during camo screen capture (client only).
+    PAWN_OFF_DEAD = 0x05AA                    # ABP_FirstPersonCharacter_Main_C::Dead
     PAWN_OFF_SPHERE_MESH = 0x0B60
     PAWN_OFF_HIDE_BLOCK = 0x0C60          # local-only bool — not replicated
     PAWN_OFF_ACTOR_FLAGS = 0x0058         # AActor::bHidden is bit 7
@@ -1879,30 +1977,30 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     # FunctionsInfo / exec thunks directly.  Re-verify prologues at runtime because
     # game patches shift these by small deltas (calling a stale RVA lands mid-function
     # and corrupts the heap — "ClearChannel ok=True" then crash / inject failure).
-    RVA_PAINT_AT_UV_DUMP          = 0x50E2A70   # FunctionsInfo PaintAtUV (scan anchor / self-test)
-    RVA_PAINT_AT_UV_LEGACY        = 0x50FE600   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
-    RVA_EXEC_PAINT_AT_UV          = 0x50E2A70   # FunctionsInfo PaintAtUV (same as DUMP)
-    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F42B0   # ClearChannel native (RCX=comp, DL=channel) — clears RT pixels
-    RVA_EXPORT_CHANNEL_LEGACY     = 0x50F6AC0   # deep ExportChannelToBytes worker
-    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FA450   # Import dispatch wrapper (exec calls this, NOT 0x50FA630)
-    RVA_EXEC_IMPORT_CHANNEL       = 0x50E1B20   # exec ImportChannelFromBytes (scan anchor)
-    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E1370   # dump ClearChannel (FunctionsInfo)
-    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E1430   # dump ExportChannelToBytes
-    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E1B20   # dump ImportChannelFromBytes
-    RVA_BEGIN_STROKE_NATIVE       = 0x50E1330   # FunctionsInfo BeginStroke
-    RVA_END_STROKE_NATIVE         = 0x50E1410   # FunctionsInfo EndStroke
-    RVA_BEGIN_STROKE_LEGACY       = 0x50EF9C0   # deep worker fallback (pre-thunk layout)
-    RVA_END_STROKE_LEGACY         = 0x50F63F0   # deep worker fallback
+    RVA_PAINT_AT_UV_DUMP          = 0x50E2AA0   # FunctionsInfo PaintAtUV exec
+    RVA_PAINT_AT_UV_LEGACY        = 0x50FE7A0   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
+    RVA_EXEC_PAINT_AT_UV          = 0x50E2AA0   # exec anchor for scan / self-test
+    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F4400   # deep ClearChannel native (RCX=comp, DL=channel)
+    RVA_EXPORT_CHANNEL_LEGACY     = 0x50F6C60   # deep ExportChannelToBytes worker
+    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FA5F0   # Import dispatch wrapper
+    RVA_EXEC_IMPORT_CHANNEL       = 0x50E1B50   # exec ImportChannelFromBytes (scan anchor)
+    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E13A0   # FunctionsInfo ClearChannel exec
+    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E1460   # FunctionsInfo ExportChannelToBytes exec
+    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E1B50   # FunctionsInfo ImportChannelFromBytes exec
+    RVA_BEGIN_STROKE_NATIVE       = 0x50E1360   # FunctionsInfo BeginStroke exec
+    RVA_END_STROKE_NATIVE         = 0x50E1440   # FunctionsInfo EndStroke exec
+    RVA_BEGIN_STROKE_LEGACY       = 0x50EFC80   # deep BeginStroke worker
+    RVA_END_STROKE_LEGACY         = 0x50F6590   # deep EndStroke worker
     RVA_IMPORT_RT_NATIVE          = 0x5104030   # copies TArray bytes into AlbedoRenderTarget
-    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D07B0   # dump RequestFullTextureSync (ProcessEvent stub — do NOT call)
+    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D07E0   # FunctionsInfo RequestFullTextureSync (do NOT call)
     RVA_APPLY_PAINT_TO_MATERIAL   = 0x5103270   # internal RT→material worker (do NOT call directly)
     OFF_PAINT_CHANNELS_DIRTY      = 0x016B      # DISABLED — overlaps DynamicMaterialInstance @ +0x0168
     RVA_REQUEST_TEXTURE_SYNC        = 0x50FCDB0   # DO NOT call from Peterhack — delayed AV crash
-    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E2830   # PaintAtScreenPosition (dump)
-    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E1960   # HitTestAtScreenPosition (dump)
-    RVA_GET_PAINT_MESH_NATIVE     = 0x50E16E0   # GetInitializedPaintMesh
-    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E2830   # FunctionsInfo PaintAtScreenPosition (scan anchor)
-    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E1960   # FunctionsInfo HitTestAtScreenPosition (scan anchor)
+    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E2860   # PaintAtScreenPosition exec (FunctionsInfo)
+    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E1990   # HitTestAtScreenPosition exec (FunctionsInfo)
+    RVA_GET_PAINT_MESH_NATIVE     = 0x50E1710   # GetInitializedPaintMesh exec (FunctionsInfo)
+    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E2860   # PaintAtScreenPosition scan anchor
+    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E1990   # HitTestAtScreenPosition scan anchor
     EPaintChannel_Albedo = 0
     EPaintChannel_All = 4
 
@@ -2905,8 +3003,41 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             print(f"[PAINT] rejected worker 0x{worker:X} (bad prologue @ exec 0x{exec_rva:X})")
         return 0
 
+    def _align_exec_entry(self, anchor_rva, search=0x80):
+        """
+        FunctionsInfo exec RVAs can point at a prior function's epilogue (ret/int3)
+        instead of the real UFUNCTION entry. Scan forward for a normal prologue.
+        """
+        if self._native_rva_ok(anchor_rva):
+            return anchor_rva
+        base = self._module_base()
+        if not base:
+            return anchor_rva
+        try:
+            blob = self.pm.read_bytes(base + anchor_rva, search)
+        except Exception:
+            return anchor_rva
+        for pat in (
+            b"\x48\x89\x5C\x24",  # mov [rsp+N], rbx
+            b"\x48\x89\x4C\x24",  # mov [rsp+N], rcx
+            b"\x40\x53\x48\x83",  # push rbx; sub rsp, …
+            b"\x48\x8B\xC4",      # mov rax, rsp
+        ):
+            idx = blob.find(pat)
+            if idx >= 0:
+                aligned = anchor_rva + idx
+                if aligned != anchor_rva:
+                    print(
+                        f"[PAINT] exec anchor 0x{anchor_rva:X} "
+                        f"aligned -> 0x{aligned:X} (+0x{idx:X})",
+                        flush=True,
+                    )
+                return aligned
+        return anchor_rva
+
     def _scan_deep_worker(self, anchor_rva, read_size=0x900):
         """Disassemble an exec/dump anchor and return the far native worker RVA."""
+        anchor_rva = self._align_exec_entry(anchor_rva)
         base = self._module_base()
         if not base:
             return 0
@@ -3667,10 +3798,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         wrap_mode=False, accumulate=False,
     ):
         """
-        Chameleon blend via PaintAtUV stamps while the game is briefly frozen.
+        Chameleon blend: compose a full atlas and import it live, or sparse UV stamps.
 
-        Live (unfrozen) injects race the render thread and AV at null+0x18.  One short
-        freeze for clear + all batches avoids that; total freeze is a few seconds.
+        Import while frozen returns ok but leaves RT empty; live import + export verify
+        is tried first.  Material-sync nudge (auto_flush) is skipped — it can leave the
+        paint pipeline flushing and looks like solid-colour flicker with the bridge DLL.
         """
         if not uv_points:
             print("[CAMO] no UV points — cannot apply camo")
@@ -3679,7 +3811,15 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             print("[CAMO] apply aborted before start")
             return False
 
-        print(f"[CAMO] UV apply pawn=0x{actor:X} points={len(uv_points)}")
+        self._paint_at_uv_worker_rva = None
+        if not self._resolve_paint_at_uv_worker():
+            print("[CAMO] PaintAtUV worker unresolved — cannot apply camo")
+            return False
+        self._resolve_channel_io_workers()
+
+        wrap_label = "ENABLED" if wrap_mode else "DISABLED"
+        print(f"[CAMO] wrap mode: {wrap_label} (wrap_mode={wrap_mode})", flush=True)
+        print(f"[CAMO] apply pawn=0x{actor:X} points={len(uv_points)}")
 
         comp = self._get_runtime_paint_component(actor)
         if not comp:
@@ -3690,45 +3830,48 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             g = max(8, int(brush_grid))
         else:
             g = max(8, int(round(len(uv_points) ** 0.5)))
-        overlap = float(brush_overlap)
         atlas_res = self.get_albedo_resolution(comp=comp)
-        stamp_cap = self.CAMO_WRAP_MAX_STAMPS if wrap_mode else self.CAMO_MAX_STAMPS
+        compose_cap = 16384 if wrap_mode else 8192
+        compose_pts = list(uv_points)
+        if len(compose_pts) > compose_cap:
+            compose_pts = self._subsample_camo_points(uv_points, compose_cap)
+        brush_r_uv = max(0.008, min(0.022, 0.55 / g))
+        uniq = len({p[2] for p in compose_pts})
+
+        stamp_cap = self.CAMO_WRAP_MAX_STAMPS if wrap_mode else min(self.CAMO_MAX_STAMPS, 1024)
         paint_pts = list(uv_points)
         if len(paint_pts) > stamp_cap:
             paint_pts = self._subsample_camo_points(uv_points, stamp_cap)
-        px_brush = min((atlas_res / g) * overlap, self.CAMO_MAX_BRUSH_PX)
-        uniq = len({p[2] for p in paint_pts})
+        g_fallback = max(8, int(round(len(paint_pts) ** 0.5)))
+        overlap = 0.30 if wrap_mode else 0.34
+        hardness = 1.0
 
         print(
-            f"[CAMO] UV apply {len(paint_pts)}/{len(uv_points)} stamps "
-            f"grid={g} unique_colors={uniq} brush~{px_brush:.1f}px "
-            f"fast={fast_paint} wrap={wrap_mode} accumulate={accumulate}",
+            f"[CAMO] plan compose={len(compose_pts)} fallback_uv={len(paint_pts)} "
+            f"grid~{g_fallback} unique_colors={uniq} atlas={atlas_res} wrap={wrap_mode}",
+            flush=True,
         )
 
         if self._camo_aborted():
             return False
 
+        import time
+        atlas_blob = None
+        if not accumulate:
+            atlas_blob = self._compose_camo_atlas_from_points(
+                compose_pts, atlas_res=atlas_res, brush_radius_uv=brush_r_uv,
+            )
+
         ok = False
+        live = comp
         with self._game_frozen("CAMO"):
             if self._camo_aborted():
                 return False
             live = self._get_runtime_paint_component(actor, quiet=True) or comp
             if not self._validate_paint_ready(live, actor, label="CAMO"):
                 return False
-            self._prepare_paint_component(
-                live,
-                record_strokes=bool(accumulate),
-                auto_flush=False,
-            )
-            import time
-
-            if accumulate:
-                print("[CAMO] accumulate mode — skipping ClearChannel (layer on bridge paint)")
-                if not self._call_begin_stroke(live, label="CAMO"):
-                    print("[CAMO] BeginStroke failed — continuing without stroke session")
-            else:
-                # One ClearChannel then UV stamps only.  ImportChannel (4 MB one-shot) was
-                # rejected by the game and the follow-up clear after failure crashed UE.
+            self._prepare_paint_component(live, record_strokes=False, auto_flush=False)
+            if not accumulate:
                 if not self._call_clear_paint_channel(live):
                     print("[CAMO] ClearChannel failed — aborting (avoid crash cascade)")
                     return False
@@ -3736,43 +3879,88 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             if self._camo_aborted() or not self._game_process_alive():
                 return False
 
-            print(
-                f"[CAMO] UV stamp apply {len(paint_pts)}/{len(uv_points)} "
-                f"(grid={g}, wrap={wrap_mode})",
-            )
-            ok = self._apply_uv_paint_points(
-                actor, paint_pts, log_prefix="CAMO", brush_grid=g,
-                brush_opacity=brush_opacity, brush_hardness=brush_hardness,
-                freeze=False, comp=live,
-                record_strokes=bool(accumulate), auto_flush=False,
-                brush_overlap=overlap, fast_mode=False,
-                subsampling_stride=1, replace=False,
-            )
-            if ok and accumulate:
-                ok = self._flush_uv_paint_session(live, label="CAMO", settle_ms=350)
-                print(f"[CAMO] EndStroke flush ok={ok}")
-            if not ok and not self._game_process_alive():
-                print("[CAMO] game crashed during UV stamps — stopping")
-                return False
-
         if self._camo_aborted():
-            print("[CAMO] apply aborted during UV pass")
             return False
 
+        expected_bytes = atlas_res * atlas_res * 4
+        import_native = False
+        if atlas_blob and not accumulate and self._game_process_alive():
+            live = self._get_runtime_paint_component(actor, quiet=True) or live
+            self._quiesce_paint_component(live)
+            print(f"[CAMO] live ImportChannel ({len(atlas_blob)} bytes)", flush=True)
+            import_native = bool(
+                self._call_import_channel_bytes(live, atlas_blob, self.EPaintChannel_Albedo)
+            )
+            if import_native:
+                ok = True
+                time.sleep(0.15)
+                self._call_end_stroke(live, label="CAMO")
+                time.sleep(0.08)
+                verified = self._verify_import_on_comp(live, expected_bytes, label="CAMO")
+                if verified:
+                    print("[CAMO] live import verified on RT", flush=True)
+                else:
+                    print(
+                        "[CAMO] live import native ok — trusting RT "
+                        "(export verify broken; NOT running UV fallback)",
+                        flush=True,
+                    )
+            else:
+                print("[CAMO] live import native failed — sparse UV fallback", flush=True)
+            self._quiesce_paint_component(live)
+
+        if not ok and not import_native and self._game_process_alive() and not self._camo_aborted():
+            with self._game_frozen("CAMO"):
+                live = self._get_runtime_paint_component(actor, quiet=True) or comp
+                if not self._validate_paint_ready(live, actor, label="CAMO"):
+                    return False
+                self._quiesce_paint_component(live)
+                if not accumulate:
+                    self._call_clear_paint_channel(live)
+                    time.sleep(0.05)
+                radius = min(
+                    self._paint_brush_radius_pixels(live, g_fallback, overlap=overlap) * 0.85,
+                    self.CAMO_MAX_BRUSH_PX,
+                )
+                self._write_brush_settings(live, radius, hardness, brush_opacity)
+                print(
+                    f"[CAMO] sparse UV apply {len(paint_pts)}/{len(uv_points)} "
+                    f"r={radius:.1f}px hard={hardness} overlap={overlap}",
+                    flush=True,
+                )
+                ok = self._apply_uv_paint_points(
+                    actor, paint_pts, log_prefix="CAMO", brush_grid=g_fallback,
+                    brush_opacity=brush_opacity, brush_hardness=hardness,
+                    freeze=False, comp=live,
+                    record_strokes=False, auto_flush=False,
+                    brush_overlap=overlap, fast_mode=bool(fast_paint),
+                    subsampling_stride=1, replace=False,
+                )
+                self._quiesce_paint_component(live)
+
+        if self._camo_aborted():
+            print("[CAMO] apply aborted during paint pass")
+            return False
         if not self._game_process_alive():
             print("[CAMO] game exited during apply")
             return False
 
+        live = self._get_runtime_paint_component(actor, quiet=True) or live
+        self._quiesce_paint_component(live)
+
         if ok:
-            ok = self._post_unfreeze_paint_finalize(live, label="CAMO", atlas_verified=False)
+            ok = self._post_unfreeze_paint_finalize(live, label="CAMO")
+            self._quiesce_paint_component(live)
             if ok:
-                print("[CAMO] UV apply complete")
+                print("[CAMO] apply complete")
+            else:
+                print("[CAMO] paint wrote RT but material did not update")
         else:
             print("[CAMO] FAILED — no paint applied")
 
         ok = ok and self._game_process_alive()
         if ok:
-            print("[CAMO] full-body apply finished")
+            print("[CAMO] camo finished")
         return ok
 
     # -----------------------------------------------------------------------
@@ -3806,6 +3994,58 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             self.pm.write_bytes(comp + 0x01AD, b"\x01" if auto_flush else b"\x00", 1)
         except Exception:
             pass
+
+    def _reset_paint_component_flags(self, comp):
+        """Turn off record_strokes/auto_flush so the game does not keep repainting."""
+        self._prepare_paint_component(comp, record_strokes=False, auto_flush=False)
+
+    def _quiesce_paint_component(self, comp, label="CAMO"):
+        """Stop stroke recording, auto-flush, and live network paint sync."""
+        self._reset_paint_component_flags(comp)
+        try:
+            self.pm.write_bytes(comp + 0x0125, b"\x00", 1)  # bRealtimeNetworkSync
+        except Exception:
+            pass
+
+    def _unload_bridge_dll_from_game(self):
+        """Eject meccha-xenos-bridge.dll — F9 alone does not stop its 16 ms paint tick."""
+        unloaded = []
+        if not getattr(self, "pm", None):
+            return unloaded
+        try:
+            import pymem.process
+            modules = pymem.process.list_modules(self.pm.process_handle)
+        except Exception as exc:
+            print(f"[CAMO] in-game module scan failed: {exc}", flush=True)
+            return unloaded
+
+        fragments = ("meccha-xenos-bridge", "xenos-bridge", "meccha_camouflage")
+        kernel32 = ctypes.windll.kernel32
+        h_process = self.pm.process_handle
+        free_lib = kernel32.GetProcAddress(
+            kernel32.GetModuleHandleW("Kernel32.dll"), b"FreeLibrary",
+        )
+        if not free_lib:
+            return unloaded
+
+        for mod in modules:
+            name = (getattr(mod, "name", "") or "").lower()
+            if not any(frag in name for frag in fragments):
+                continue
+            base = int(getattr(mod, "lpBaseOfDll", 0) or 0)
+            if base <= 0x10000:
+                continue
+            print(f"[CAMO] unloading in-game DLL {mod.name} @ 0x{base:X}", flush=True)
+            h_thread = kernel32.CreateRemoteThread(
+                h_process, None, 0, free_lib, base, 0, None,
+            )
+            if h_thread:
+                kernel32.WaitForSingleObject(h_thread, 8000)
+                kernel32.CloseHandle(h_thread)
+                unloaded.append(mod.name)
+        if unloaded:
+            print(f"[CAMO] unloaded {len(unloaded)} bridge DLL(s): {', '.join(unloaded)}", flush=True)
+        return unloaded
 
     def _validate_paint_ready(self, comp, pawn, label="PAINT"):
         """Ensure RT, material, and mesh exist before native PaintAtUV (null+0x18 AV otherwise)."""
@@ -3943,7 +4183,31 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         except Exception as exc:
             print(f"[{label}] RT export diagnostic failed: {exc}")
 
-    def _post_unfreeze_paint_finalize(self, comp, label="PAINT", verify_export=False, atlas_verified=False):
+    def _sync_paint_to_material(self, comp, label="CAMO", end_stroke=True):
+        """
+        Push albedo RT to the visible material while the game is still frozen.
+
+        Must run before unfreeze — post-unfreeze PaintAtUV injects crash UE (null+0x18).
+        """
+        if not comp or not self._game_process_alive():
+            return False
+        import time
+        end_ok = False
+        if end_stroke:
+            self._prepare_paint_component(comp, record_strokes=False, auto_flush=True)
+            end_ok = self._call_end_stroke(comp, label=label)
+            time.sleep(0.08)
+        self._prepare_paint_component(comp, record_strokes=False, auto_flush=True)
+        nudge_ok = self._nudge_paint_visibility(comp, label=label)
+        time.sleep(0.08)
+        print(
+            f"[{label}] material sync (frozen) end={end_ok} nudge={nudge_ok}",
+            flush=True,
+        )
+        self._reset_paint_component_flags(comp)
+        return bool(end_ok or nudge_ok)
+
+    def _post_unfreeze_paint_finalize(self, comp, label="PAINT", verify_export=False, atlas_verified=False, used_import=False):
         """
         Brief settle after paint.  Never call RequestFullTextureSync or scribble on
         comp memory — both crash the render pipeline on this build.
@@ -3952,10 +4216,12 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if not comp or not self._game_process_alive():
             return False
         if label == "CAMO":
-            # Never PaintAtUV/export after unfreeze with auto_flush — causes null+0x18 AV.
             time.sleep(0.35)
             alive = self._game_process_alive()
-            print(f"[{label}] finalize settle ok={alive} (no post-unfreeze injects)")
+            if alive:
+                res = self.get_albedo_resolution(comp=comp)
+                self._verify_import_on_comp(comp, res * res * 4, label=label)
+            print(f"[{label}] finalize settle ok={alive}", flush=True)
             return alive
         time.sleep(0.2)
         nudged = self._nudge_paint_visibility(comp, label=label)
@@ -4076,23 +4342,24 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             print(f"[{label}] game exited before import")
             return (False, False) if verify else False
         print(f"[{label}] ImportChannel one-shot ({len(atlas_blob)} bytes)")
-        ok = self._call_import_channel_bytes(comp, atlas_blob, self.EPaintChannel_Albedo)
+        native_ok = self._call_import_channel_bytes(comp, atlas_blob, self.EPaintChannel_Albedo)
         verified = False
-        if ok:
+        if native_ok:
             time.sleep(0.08)
             if verify:
                 if self._camo_aborted():
-                    ok = False
+                    native_ok = False
                 else:
                     verified = self._verify_import_rt_opaque(comp, label=label)
                     if not verified:
                         print(
-                            f"[{label}] ImportChannel native ok=True but RT still empty — "
-                            "treating as failure",
+                            f"[{label}] export verify unavailable while frozen — "
+                            "trusting native import (skipping UV stamp fallback)",
+                            flush=True,
                         )
-                        ok = False
             else:
                 print(f"[{label}] import complete — RT verify skipped")
+        ok = native_ok
         if progress_cb:
             try:
                 progress_cb(100, 100)
