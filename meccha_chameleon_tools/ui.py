@@ -2194,6 +2194,7 @@ class Overlay(QWidget):
         self.setWindowTitle("Meccha Chameleon Tools - Overlay")
         self._key_states = {}
         self._last_cam = None           # last-known-good camera; survives free-cam gaps
+        self._last_geom = None          # skip setGeometry when unchanged (reduces flicker)
         self._camouflage_active = False
         self._camouflage_color = None  # Tuple[int,int,int] when sampled
         self._camo_key_held = False    # legacy edge detect (unused)
@@ -2380,11 +2381,17 @@ class Overlay(QWidget):
                 rect = win32gui.GetClientRect(self.game_hwnd)
                 tl = win32gui.ClientToScreen(self.game_hwnd, (rect[0], rect[1]))
                 br = win32gui.ClientToScreen(self.game_hwnd, (rect[2], rect[3]))
-                self.setGeometry(tl[0], tl[1], br[0] - tl[0], br[1] - tl[1])
-            else:
+                geom = (tl[0], tl[1], br[0] - tl[0], br[1] - tl[1])
+                if geom != self._last_geom:
+                    self._last_geom = geom
+                    self.setGeometry(*geom)
+            elif self._last_geom != (0, 0, 1920, 1080):
+                self._last_geom = (0, 0, 1920, 1080)
                 self.setGeometry(0, 0, 1920, 1080)
         except Exception:
-            self.setGeometry(0, 0, 1920, 1080)
+            if self._last_geom != (0, 0, 1920, 1080):
+                self._last_geom = (0, 0, 1920, 1080)
+                self.setGeometry(0, 0, 1920, 1080)
 
     def update_overlay(self):
         import time as _time

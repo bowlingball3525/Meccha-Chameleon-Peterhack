@@ -536,6 +536,14 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
     PROCESS_NAME = "PenguinHotel-Win64-Shipping.exe"
     MODULE_NAME = "PenguinHotel-Win64-Shipping.exe"
+    GWORLD_RVA = 0x09C7C620
+
+    # ESP session debounce — ignore brief memory-read glitches (overlay ~60 Hz).
+    ESP_WORLD_MISS_LIMIT = 15       # ~250 ms without UWorld before clearing
+    ESP_PA_EMPTY_LIMIT = 24         # ~400 ms empty PlayerArray before match-end
+    ESP_SESSION_CHANGE_LIMIT = 10   # ~170 ms new world/gs before cache reset
+    ESP_POS_MISS_LIMIT = 10         # frames before dropping a cached player
+    ESP_DEAD_STREAK_LIMIT = 4       # consecutive dead reads before hiding a player
 
     GUOBJECT_SIG = bytes([
         0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00,
@@ -690,6 +698,13 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._esp_session_key = None           # (world_ptr, gamestate_ptr) — change clears cache
         self._esp_session_ready = False
         self._esp_last_player_array_count = 0
+        self._esp_world_miss_streak = 0
+        self._esp_pa_empty_streak = 0
+        self._esp_session_change_streak = 0
+        self._esp_pending_session_key = None
+        self._world_last_good = 0
+        self._world_last_good_time = 0.0
+        self._esp_dead_streak = {}             # pawn -> consecutive dead reads
         self._export_worker_rva = None
         self._import_worker_rva = None
         self._clear_worker_rva = None
@@ -772,10 +787,30 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         return cls.IMAGE_WRAP_MODE_LABELS.get(key, f"Unknown ({key})")
 
     def _get_world(self):
+        import time as _time
+
+        world = 0
         viewport = rp(self.pm, self.gengine + self.offsets["UEngine::GameViewport"])
-        if not viewport:
-            return 0
-        return rp(self.pm, viewport + self.offsets["UGameViewportClient::World"])
+        if viewport:
+            world = rp(self.pm, viewport + self.offsets["UGameViewportClient::World"]) or 0
+
+        if not world or world < 0x100000:
+            try:
+                base = self._cached_module_base
+                if base:
+                    world = rp(self.pm, base + self.GWORLD_RVA) or 0
+            except Exception:
+                world = 0
+
+        if world and world > 0x100000:
+            self._world_last_good = world
+            self._world_last_good_time = _time.monotonic()
+            return world
+
+        last = self._world_last_good
+        if last and (_time.monotonic() - self._world_last_good_time) < 0.2:
+            return last
+        return 0
 
     def _get_local_controller(self, world):
         if not world:
@@ -1418,6 +1453,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 msg += f" ({reason})"
             print(msg, flush=True)
         self._players_cache = []
+        self._esp_dead_streak.clear()
 
     def _is_pawn_alive(self, pawn, player_state=0):
         """False for confirmed dead pawns. Dead flag only on FirstPersonCharacter."""
@@ -1437,6 +1473,17 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             pass
         return True
 
+    def _pawn_alive_for_esp(self, pawn, player_state=0):
+        """Debounced alive check — ignores one-frame dead/health glitches."""
+        if not pawn:
+            return False
+        if self._is_pawn_alive(pawn, player_state):
+            self._esp_dead_streak.pop(pawn, None)
+            return True
+        streak = self._esp_dead_streak.get(pawn, 0) + 1
+        self._esp_dead_streak[pawn] = streak
+        return streak < self.ESP_DEAD_STREAK_LIMIT
+
     def _esp_session_snapshot(self):
         """Return (world_ptr, gamestate_ptr, player_array_count) for cache invalidation."""
         world = self._get_world()
@@ -1454,31 +1501,80 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         """
         Clear ESP cache when leaving a server or when the match ends.
 
-        Detects world / GameState pointer changes, empty PlayerArray after a
-        populated match, and total loss of the UWorld (disconnect / main menu).
+        Transient read failures (empty PlayerArray, null UWorld for a frame)
+        are debounced so ESP does not flicker off mid-match.
         """
         world, gs, pa_count = self._esp_session_snapshot()
         key = (world, gs)
 
         if not world:
-            if self._players_cache:
-                self.clear_players_cache("left world / disconnected")
-            self._esp_session_key = None
-            self._esp_session_ready = False
-            self._esp_last_player_array_count = 0
-            return False
+            self._esp_world_miss_streak += 1
+            if self._esp_world_miss_streak >= self.ESP_WORLD_MISS_LIMIT:
+                if self._players_cache:
+                    self.clear_players_cache("left world / disconnected")
+                self._esp_session_key = None
+                self._esp_session_ready = False
+                self._esp_last_player_array_count = 0
+                self._esp_world_miss_streak = 0
+                self._esp_pa_empty_streak = 0
+                self._esp_session_change_streak = 0
+                self._esp_pending_session_key = None
+                return False
+            return True
+
+        self._esp_world_miss_streak = 0
 
         if self._esp_session_ready and key != self._esp_session_key:
-            self.clear_players_cache("server or map changed")
+            if self._esp_pending_session_key != key:
+                self._esp_pending_session_key = key
+                self._esp_session_change_streak = 1
+            else:
+                self._esp_session_change_streak += 1
+            if self._esp_session_change_streak >= self.ESP_SESSION_CHANGE_LIMIT:
+                self.clear_players_cache("server or map changed")
+                self._esp_session_change_streak = 0
+                self._esp_pending_session_key = None
+        else:
+            self._esp_session_change_streak = 0
+            self._esp_pending_session_key = None
 
         prev_pa = self._esp_last_player_array_count
         if self._esp_session_ready and prev_pa >= 2 and pa_count == 0:
-            self.clear_players_cache("match ended (PlayerArray empty)")
+            self._esp_pa_empty_streak += 1
+            if self._esp_pa_empty_streak >= self.ESP_PA_EMPTY_LIMIT:
+                self.clear_players_cache("match ended (PlayerArray empty)")
+                self._esp_pa_empty_streak = 0
+        else:
+            self._esp_pa_empty_streak = 0
 
         self._esp_session_key = key
         self._esp_session_ready = True
         self._esp_last_player_array_count = pa_count
         return True
+
+    def _refresh_cached_players(self, cap):
+        """Keep last-known players alive through brief empty reads / pos glitches."""
+        updated = []
+        for p in self._players_cache[:cap]:
+            actor = p.get("actor")
+            if not actor:
+                continue
+            ps = p.get("player_state", 0)
+            if not self._pawn_alive_for_esp(actor, ps):
+                continue
+            pos = self.get_actor_root_pos(actor)
+            entry = dict(p)
+            if pos:
+                entry["pos"] = pos
+                entry["_pos_miss"] = 0
+            else:
+                miss = int(p.get("_pos_miss", 0)) + 1
+                if miss >= self.ESP_POS_MISS_LIMIT:
+                    continue
+                entry["_pos_miss"] = miss
+            updated.append(entry)
+        self._players_cache = updated
+        return self._players_cache[:cap]
 
     def get_players(self, include_local=False, team_filter=False):
         """Return up to MAX_ESP_PLAYERS entries.
@@ -1502,22 +1598,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if fresh:
             self._players_cache = fresh[:cap]
         elif self._players_cache:
-            # Brief read failure — keep last known living players with fresh positions.
-            updated = []
-            for p in self._players_cache[:cap]:
-                actor = p.get("actor")
-                if not actor:
-                    continue
-                ps = p.get("player_state", 0)
-                if not self._is_pawn_alive(actor, ps):
-                    continue
-                pos = self.get_actor_root_pos(actor)
-                if not pos:
-                    continue
-                entry = dict(p)
-                entry["pos"] = pos
-                updated.append(entry)
-            self._players_cache = updated
+            return self._refresh_cached_players(cap)
 
         return self._players_cache[:cap]
 
@@ -1583,7 +1664,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                             continue
                         if "Spectate" in pawn_cls:
                             continue
-                    if not self._is_pawn_alive(pawn, ps):
+                    if not self._pawn_alive_for_esp(pawn, ps):
                         continue
                     pos = self.get_actor_root_pos(pawn)
                     if not pos:
@@ -1636,7 +1717,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                             continue
                         if "Spectate" in cls_name:
                             continue
-                    if not self._is_pawn_alive(actor, 0):
+                    if not self._pawn_alive_for_esp(actor, 0):
                         continue
                     pos = self.get_actor_root_pos(actor)
                     if not pos:
