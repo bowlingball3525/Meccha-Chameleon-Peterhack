@@ -76,6 +76,7 @@ class Config:
 
     # Camouflage / Paint
     camouflage_enabled: bool = True
+    auto_update: bool = True  # check GitHub main on startup and apply newer source
     camouflage_sample_size: int = 32   # legacy — now driven by paint_quality
     camouflage_quality: int = 2        # legacy — now driven by paint_quality
     camouflage_opacity: int = 200

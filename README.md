@@ -47,6 +47,14 @@ Paint any PNG/JPG directly onto your character's texture atlas with two wrap mod
 ### Launcher
 - `Peterhack.bat` — auto-elevates to Administrator, no manual "Run as Admin" needed
 
+### Auto-update
+Peterhack checks the [GitHub main branch](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack) on every launch (no releases required). If newer source is available it downloads and applies it automatically, then restarts.
+
+- **ZIP download users** — files are merged in place; `esp_config.json` and paint presets are preserved.
+- **Git clone users** — uses `git fetch` + `git reset --hard` when Git is installed.
+- Toggle off in the **CHANGELOG** tab, or launch with `python -m meccha_chameleon_tools --no-update`.
+- Version is shown on the CHANGELOG tab (`VERSION` file / git commit).
+
 ---
 
 ## Requirements

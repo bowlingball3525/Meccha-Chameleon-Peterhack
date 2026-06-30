@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QCheckBox, QComboBox, QLabel,
     QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QColorDialog,
     QSpinBox, QDoubleSpinBox, QSlider, QListWidget, QStackedWidget,
-    QFileDialog, QLineEdit,
+    QFileDialog, QLineEdit, QMessageBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QImage
@@ -1603,6 +1603,29 @@ class Menu(QWidget):
         )
         lo.addWidget(hdr)
 
+        from meccha_chameleon_tools.updater import get_local_sha
+
+        ver = get_local_sha()
+        ver_label = QLabel(
+            f"Version: {ver[:7] if ver else 'unknown'}  "
+            "(tracks GitHub main — no releases needed)"
+        )
+        ver_label.setStyleSheet("color: #8ab870; font-size: 10px;")
+        lo.addWidget(ver_label)
+
+        self.cb_auto_update = self._chk(
+            "Auto-update from GitHub on startup", "auto_update",
+        )
+        self.cb_auto_update.setToolTip(
+            "Checks bowlingball3525/Meccha-Chameleon-Peterhack main branch each launch.\n"
+            "Your esp_config.json and paint presets are kept."
+        )
+        lo.addWidget(self.cb_auto_update)
+
+        btn_update = QPushButton("Check for updates now")
+        btn_update.clicked.connect(self._check_updates_now)
+        lo.addWidget(btn_update)
+
         txt = QTextEdit()
         txt.setReadOnly(True)
         txt.setStyleSheet("""
@@ -1630,6 +1653,15 @@ class Menu(QWidget):
             "=== Peterhack Changelog ===\n"
             "\n"
             "--- Jun 29, 2026 (latest) ---\n"
+            "\n"
+            "[Auto-update from GitHub main]\n"
+            "  + Checks main branch on every launch (no releases needed).\n"
+            "  + ZIP installs: downloads and merges source, keeps your config.\n"
+            "  + Git clones: fetch + reset when Git is available.\n"
+            "  + CHANGELOG tab: version, toggle, manual check button.\n"
+            "\n"
+            "[ESP stability]\n"
+            "  + Debounced player cache — no more random ESP flicker/off.\n"
             "\n"
             "[Camouflage — bridge wrap + native camera-facing]\n"
             "  + Wrap ON: bridge multi-angle paint (front, rotate 180°, back).\n"
@@ -2151,6 +2183,36 @@ class Menu(QWidget):
         self.btn_record_key.setEnabled(False)
         self.btn_record_key.setText('Press key...')
         self._key_recorder.start()
+
+    def _check_updates_now(self):
+        from meccha_chameleon_tools.updater import check_for_updates_manual
+
+        save_config(self.config)
+        reply = QMessageBox.question(
+            self,
+            "Check for updates",
+            "Download and apply the latest source from GitHub main?\n"
+            "Peterhack will restart. Your settings and paint presets are kept.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        def _run():
+            try:
+                check_for_updates_manual()
+            except SystemExit:
+                pass
+            except Exception as exc:
+                QTimer.singleShot(
+                    0,
+                    lambda: QMessageBox.warning(
+                        self, "Update failed", str(exc),
+                    ),
+                )
+
+        threading.Thread(target=_run, daemon=False).start()
 
     def _save_config(self):
         if save_config(self.config):
