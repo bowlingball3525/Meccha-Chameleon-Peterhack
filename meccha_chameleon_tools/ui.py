@@ -467,6 +467,7 @@ class Menu(QWidget):
         super().__init__()
         self.config = config
         self.esp = esp
+        self.esp.config = config
         self.setWindowTitle("Peterhack | Meccha Chameleon")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -544,7 +545,12 @@ class Menu(QWidget):
             self.lbl_camo_status.setText("Painted!")
             self._camo_set_overlay_feedback("CAMO OK", 90)
         else:
-            self.lbl_camo_status.setText("Paint failed")
+            err = getattr(self.esp, "_camo_last_error", None)
+            if err:
+                short = err if len(err) <= 120 else err[:117] + "..."
+                self.lbl_camo_status.setText(f"Paint failed — {short}")
+            else:
+                self.lbl_camo_status.setText("Paint failed")
             self._camo_set_overlay_feedback("CAMO FAIL", 90)
         self._update_camo_buttons()
         QTimer.singleShot(
@@ -1374,11 +1380,40 @@ class Menu(QWidget):
         info = QLabel(
             "Fully automatic — injects meccha-xenos-bridge.dll and paints full 360° wrap.\n"
             "Click Paint Now or press F10. F9 cancels.\n"
-            "Four passes: left side, right side, front, back (ends facing forward)."
+            "Four passes: left, right, front, back (ends facing forward).\n"
+            "Start emote/pose first if you want — wrap uses your current camera angle."
         )
         info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 0;")
         info.setWordWrap(True)
         lo.addWidget(info)
+
+        camo_q_row = QHBoxLayout()
+        camo_q_row.addWidget(QLabel("Camo quality:"))
+        self.sld_camo_quality = QSlider(Qt.Horizontal)
+        self.sld_camo_quality.setRange(1, 20)
+        self.sld_camo_quality.setValue(getattr(self.config, "paint_quality", 12))
+        self.sld_camo_quality.setTickPosition(QSlider.TicksBelow)
+        self.sld_camo_quality.setTickInterval(2)
+        self.sld_camo_quality.setToolTip(
+            "Environment camo sharpness — higher = denser strokes, smoother edges.\n"
+            "1=Draft (fast) · 12=High+ · 20=God Mode (~4× longer per pass)."
+        )
+        camo_q_row.addWidget(self.sld_camo_quality)
+        self.lbl_camo_quality = QLabel(
+            f"{_CAMO_QLABELS.get(self.sld_camo_quality.value(), '')} "
+            f"({self.sld_camo_quality.value()})"
+        )
+        self.lbl_camo_quality.setStyleSheet(
+            "color: #8ab870; font-size: 10px; min-width: 90px;"
+        )
+
+        def _on_camo_quality_change(v):
+            setattr(self.config, "paint_quality", v)
+            self.lbl_camo_quality.setText(f"{_CAMO_QLABELS.get(v, '')} ({v})")
+
+        self.sld_camo_quality.valueChanged.connect(_on_camo_quality_change)
+        camo_q_row.addWidget(self.lbl_camo_quality)
+        lo.addLayout(camo_q_row)
 
         self.lbl_camo_status = QLabel("Ready — click Paint Now")
         self.lbl_camo_status.setStyleSheet("color: #888; font-size: 10px; padding: 4px 0;")

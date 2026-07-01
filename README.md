@@ -101,15 +101,15 @@ Each pass **orbits the camera** (controller `ControlRotation` only — your char
 
 **Flow:**
 1. Peterhack injects **`meccha-xenos-bridge.dll`** via **`meccha-xenos-injector.exe`** (or reuses an existing bridge if TCP on port **47654** responds).
-2. For each pass: `rotate` (bridge or native camera fallback) → `paint_full_route` over TCP.
+2. For each pass: restore baseline view → `paint_full_route` with `camera_yaw_offset` (camera orbits inside the bridge; no separate `rotate` call).
 3. Sends `cancel_paint` and restores view rotation when done.
 
 **Bridge TCP commands:**
 
 | Command | Description |
 |---|---|
-| `paint_full_route` | Scene-capture basecolor → UV stroke paint |
-| `rotate` | Rotate **camera view** by yaw delta (not pawn body) |
+| `paint_full_route` | Scene-capture basecolor → UV stroke paint (`camera_yaw_offset` for wrap passes) |
+| `rotate` | Legacy camera yaw delta (superseded by `camera_yaw_offset` in paint) |
 | `cancel_paint` | Cancel active paint and drain the queue |
 | `ping` / `capabilities` | Health check and command list |
 
@@ -197,7 +197,8 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 | Symptom | What to try |
 |---|---|
 | `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `C:\peterhack\logs\latest.log` |
-| `could not unload` bridge DLL | **Restart the game**, then Paint Now again |
+| `could not unload` / `runtime-bridge-*.dll` stuck | **Quit the game completely** and relaunch. Don't run `meccha-camouflage.exe` separately. Run Peterhack as Administrator. |
+| `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` (use GitHub Actions EXE or full release, not source-only zip). |
 | Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |
 | `bridge DLL is outdated (no rotate)` | Restart game so Peterhack can copy the latest bridge from the bundle |
 | Camo only paints one side / body spins | Update to latest build — rotate should move **camera only** |

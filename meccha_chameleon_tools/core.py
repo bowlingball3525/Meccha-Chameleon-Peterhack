@@ -1010,6 +1010,17 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return None
         return rot
 
+    def set_control_rotation(self, pitch_deg, yaw_deg, roll_deg):
+        """Set full controller ControlRotation (pitch, yaw, roll degrees)."""
+        world = self._get_world()
+        if not world:
+            return False
+        pc = self._get_local_controller(world)
+        if not pc:
+            return False
+        addr = pc + self.offsets.get("AController::ControlRotation", 0x320)
+        return wvec3(self.pm, addr, (float(pitch_deg), float(yaw_deg), float(roll_deg)))
+
     def set_control_yaw(self, yaw_deg):
         """Set controller yaw while keeping pitch/roll."""
         world = self._get_world()

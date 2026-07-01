@@ -492,6 +492,16 @@ class TrainerMixin:
         """Invoke UObject::ProcessEvent(caller, ufunc, params) in the game process."""
         return self._process_event_call_out(caller_obj, ufunc, params_bytes, timeout_ms) is not None
 
+    def native_set_control_rotation(self, pitch_deg, yaw_deg, roll_deg):
+        """Set controller view via ProcessEvent SetControlRotation."""
+        world = self._get_world() if hasattr(self, "_get_world") else 0
+        pc = self._get_local_controller(world) if world and hasattr(self, "_get_local_controller") else 0
+        fn_cr = self._find_ue_function("Controller", "SetControlRotation")
+        if not pc or not fn_cr:
+            return False
+        cr_params = struct.pack("<ddd", float(pitch_deg), float(yaw_deg), float(roll_deg))
+        return self._process_event_call(pc, fn_cr, cr_params)
+
     def native_rotate_yaw_delta(self, yaw_delta_deg):
         """Rotate controller view yaw only (scene capture reads ControlRotation, not pawn)."""
         delta = float(yaw_delta_deg)

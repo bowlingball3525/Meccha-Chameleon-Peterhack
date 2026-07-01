@@ -503,12 +503,17 @@ class CamoBridgeMixin:
             return
         cmds = (resp.get("metadata") or {}).get("commands") or []
         self._bridge_commands = set(cmds)
+        meta = resp.get("metadata") or {}
+        fields = meta.get("paint_full_route_fields") or []
+        self._bridge_paint_yaw = "camera_yaw_offset" in fields
         if cmds:
             print(f"[CAMO] bridge commands: {', '.join(cmds)}", flush=True)
-        if cmds and "rotate" not in cmds:
+        if self._bridge_paint_yaw:
+            print("[CAMO] wrap yaw via paint_full_route camera_yaw_offset", flush=True)
+        elif cmds and "rotate" not in cmds:
             print(
-                "[CAMO] bridge DLL is outdated (no rotate) — "
-                "ProcessEvent fallback will be used; restart game after updating camo files",
+                "[CAMO] bridge DLL is outdated (no rotate / paint yaw) — "
+                "update bridge binaries and restart the game",
                 flush=True,
             )
 
@@ -604,26 +609,35 @@ class CamoBridgeMixin:
 
         self._stop_legacy_camo_controller()
         self._bridge_port = None
+        self._camo_last_error = None
 
         loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
         tcp_ok = bool(self._resolve_bridge_port())
-        has_rotate = self._bridge_has_rotate() if tcp_ok else False
 
         ready = tcp_ok and has_xenos and not has_runtime
         if ready:
             print("[CAMO] meccha-xenos-bridge ready (TCP)", flush=True)
             self._log_bridge_capabilities()
-            if tcp_ok and not has_rotate:
-                print("[CAMO] bridge rotate via native camera fallback if needed", flush=True)
             return True
+
+        # Sidecar runtime-bridge (e.g. from old meccha-camouflage.exe) — reuse if TCP works.
+        if tcp_ok and loaded and not has_xenos:
+            resp = self._bridge_request("capabilities", {}, timeout=5)
+            if resp and resp.get("success"):
+                cmds = (resp.get("metadata") or {}).get("commands") or []
+                if "paint_full_route" in cmds:
+                    print(
+                        f"[CAMO] reusing in-game bridge TCP ({', '.join(mod_names)})",
+                        flush=True,
+                    )
+                    self._log_bridge_capabilities()
+                    return True
 
         reasons = []
         if has_runtime:
             reasons.append("runtime-bridge loaded")
         if has_xenos and not tcp_ok:
             reasons.append("xenos TCP dead")
-        if tcp_ok and not has_rotate:
-            reasons.append("rotate via fallback")
         if loaded and not has_xenos:
             reasons.append("unknown bridge")
         print(
@@ -635,35 +649,52 @@ class CamoBridgeMixin:
         if loaded:
             self._unload_all_bridge_modules()
             _t.sleep(0.5)
+            for attempt in range(3):
+                still_loaded, still_names, _, _ = self._bridge_dll_state()
+                if not still_loaded:
+                    break
+                if attempt < 2:
+                    print(
+                        f"[CAMO] bridge still loaded — retry unload ({attempt + 2}/3)...",
+                        flush=True,
+                    )
+                    self._bridge_shutdown()
+                    _t.sleep(0.6)
+                    self._unload_all_bridge_modules()
+                    _t.sleep(0.5)
             still_loaded, still_names, _, _ = self._bridge_dll_state()
             if still_loaded:
-                print(
-                    f"[CAMO] could not unload: {', '.join(still_names)} — "
-                    "restart the game, then retry Paint Now.",
-                    flush=True,
+                msg = (
+                    f"Stale bridge stuck in game ({', '.join(still_names)}). "
+                    "Fully quit the game (not just menu), relaunch, join a match, "
+                    "then Paint Now. Do not run meccha-camouflage.exe separately."
                 )
+                self._camo_last_error = msg
+                print(f"[CAMO] {msg}", flush=True)
                 return False
 
         try:
             missing = self._extract_stable_camo_files()
             if missing:
-                print(
-                    f"[CAMO] missing bridge binaries: {', '.join(missing)} "
-                    f"(expected in {self._camo_bundle_dir()})",
-                    flush=True,
+                msg = (
+                    f"Missing bridge files: {', '.join(missing)}. "
+                    f"Copy meccha-xenos-bridge.dll and meccha-xenos-injector.exe into "
+                    f"{self._camo_bundle_dir()} or download the latest Peterhack release."
                 )
+                self._camo_last_error = msg
+                print(f"[CAMO] {msg}", flush=True)
                 return False
         except Exception as exc:
+            self._camo_last_error = f"Bridge extract failed: {exc}"
             print(f"[CAMO] extract failed: {exc}", flush=True)
             return False
 
         self._write_port_sidecar(self._get_stable_dll_path(), BRIDGE_FIXED_PORT)
 
         if not self._try_direct_inject(BRIDGE_FIXED_PORT, force=True):
-            print(
-                "[CAMO] inject failed — run Peterhack as administrator.",
-                flush=True,
-            )
+            msg = "Bridge inject failed — run Peterhack as Administrator."
+            self._camo_last_error = msg
+            print(f"[CAMO] {msg}", flush=True)
             return False
 
         print("[CAMO] waiting for meccha-xenos-bridge TCP...", flush=True)
@@ -705,11 +736,30 @@ class CamoBridgeMixin:
         return self.set_control_yaw(self._normalize_yaw_deg(yaw + yaw_offset))
 
     def _camo_restore_view_rotation(self, state):
-        if not state:
+        if not state or "control" not in state:
             return
-        if "control" in state and hasattr(self, "set_control_yaw"):
-            _pitch, yaw, _roll = state["control"]
+        pitch, yaw, roll = state["control"]
+        if hasattr(self, "native_set_control_rotation"):
+            self.native_set_control_rotation(pitch, yaw, roll)
+        elif hasattr(self, "set_control_rotation"):
+            self.set_control_rotation(pitch, yaw, roll)
+        elif hasattr(self, "set_control_yaw"):
             self.set_control_yaw(yaw)
+
+    def _camo_apply_pass_camera(self, state, yaw_offset):
+        """Restore baseline pose then apply wrap yaw (full pitch/yaw/roll)."""
+        if not state or "control" not in state:
+            return None
+        self._camo_restore_view_rotation(state)
+        pitch, yaw, roll = state["control"]
+        target_yaw = self._normalize_yaw_deg(yaw + float(yaw_offset))
+        if hasattr(self, "native_set_control_rotation"):
+            self.native_set_control_rotation(pitch, target_yaw, roll)
+        elif hasattr(self, "set_control_rotation"):
+            self.set_control_rotation(pitch, target_yaw, roll)
+        elif hasattr(self, "set_control_yaw"):
+            self.set_control_yaw(target_yaw)
+        return (pitch, target_yaw, roll)
 
     # Full wrap: sides first, then front (180°), then back (0° — ends facing forward).
     CAMO_WRAP_YAW_PASSES = (
@@ -767,8 +817,19 @@ class CamoBridgeMixin:
 
         return False
 
-    def _paint_payload(self, pid):
-        return {
+    def _paint_payload(self, pid, camera_yaw_offset=0, camera_rotation=None):
+        cfg = getattr(self, "config", None)
+        quality = max(1, min(20, int(getattr(cfg, "paint_quality", 12) if cfg else 12)))
+        min_points = {
+            1: 2500, 5: 6000, 8: 9000, 10: 12000, 12: 15000,
+            14: 18000, 16: 22000, 18: 26000, 20: 30000,
+        }
+        keys = sorted(min_points)
+        floor = min_points[keys[0]]
+        for k in keys:
+            if quality >= k:
+                floor = min_points[k]
+        payload = {
             "native_apply_mode": "template_brush_paint",
             "route": "f10_template_brush_paint",
             "process": {
@@ -777,10 +838,19 @@ class CamoBridgeMixin:
             },
             "max_paints_per_tick": 256,
             "paint_tick_budget_ms": 16,
-            "brush_radius": 4.0,
-            "template_min_direct_points": 5000,
+            "paint_quality": quality,
+            "template_min_direct_points": floor,
             "auto_flush_during_paint": True,
         }
+        if camera_rotation:
+            pitch, yaw, roll = camera_rotation
+            payload["camera_rotation_absolute"] = True
+            payload["camera_pitch"] = float(pitch)
+            payload["camera_yaw"] = float(yaw)
+            payload["camera_roll"] = float(roll)
+        elif camera_yaw_offset:
+            payload["camera_yaw_offset"] = int(camera_yaw_offset)
+        return payload
 
     def _finalize_camo_paint(self):
         """Stop template_brush_paint tick loops after apply."""
@@ -808,6 +878,9 @@ class CamoBridgeMixin:
         try:
             pid = self.pm.process_id
             print(f"[CAMO] pid={pid} wrap={full_wrap}", flush=True)
+            cfg = getattr(self, "config", None)
+            q = getattr(cfg, "paint_quality", 12) if cfg else 12
+            print(f"[CAMO] paint quality={q}/20", flush=True)
             if not pid:
                 return False
 
@@ -816,32 +889,59 @@ class CamoBridgeMixin:
 
             import time as _t
 
-            payload = self._paint_payload(pid)
             passes = (
                 list(self.CAMO_WRAP_YAW_PASSES) if full_wrap else [(0, "front")]
             )
 
-            self._camo_yaw_offset = 0
             self._camo_view_state = self._camo_save_view_rotation() if full_wrap else None
+            if self._camo_view_state:
+                pitch, yaw, roll = self._camo_view_state["control"]
+                print(
+                    f"[CAMO] wrap baseline pitch={pitch:.0f}° yaw={yaw:.0f}° roll={roll:.0f}°",
+                    flush=True,
+                )
             try:
                 for pass_idx, (target_yaw, label) in enumerate(passes):
                     if self._camo_aborted():
                         print("[CAMO] apply aborted", flush=True)
                         return False
-                    if target_yaw != self._camo_yaw_offset:
-                        if not self._camo_rotate_to_yaw(target_yaw, label):
-                            print(
-                                f"[CAMO] {label} pass rotate failed — aborting wrap "
-                                f"(earlier passes already applied)",
-                                flush=True,
-                            )
-                            self._finalize_camo_paint()
-                            return False
+                    camera_rotation = None
+                    if self._camo_view_state:
+                        camera_rotation = self._camo_apply_pass_camera(
+                            self._camo_view_state, target_yaw,
+                        )
+                        _t.sleep(0.3)
+                    elif target_yaw and not getattr(self, "_bridge_paint_yaw", False):
+                        print(
+                            f"[CAMO] {label} camera yaw={target_yaw}° (ProcessEvent fallback)...",
+                            flush=True,
+                        )
+                        if hasattr(self, "native_rotate_yaw_delta"):
+                            if not self.native_rotate_yaw_delta(target_yaw):
+                                print(
+                                    f"[CAMO] {label} camera yaw failed — aborting wrap",
+                                    flush=True,
+                                )
+                                self._finalize_camo_paint()
+                                return False
+                            _t.sleep(0.5)
 
+                    rot_note = ""
+                    if camera_rotation:
+                        rot_note = (
+                            f" pitch={camera_rotation[0]:.0f}° "
+                            f"yaw={camera_rotation[1]:.0f}° "
+                            f"roll={camera_rotation[2]:.0f}°"
+                        )
                     print(
                         f"[CAMO] paint pass {pass_idx + 1}/{len(passes)} "
-                        f"({label}, port={self._bridge_port})...",
+                        f"({label}, wrap_yaw={target_yaw}°{rot_note}, port={self._bridge_port})...",
                         flush=True,
+                    )
+                    payload = self._paint_payload(
+                        pid,
+                        camera_yaw_offset=target_yaw,
+                        camera_rotation=camera_rotation,
                     )
                     resp = self._bridge_request("paint_full_route", payload, timeout=120)
                     print(f"[CAMO] paint response={resp}", flush=True)
