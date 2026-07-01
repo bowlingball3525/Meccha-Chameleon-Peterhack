@@ -86,6 +86,7 @@ class Config:
     camouflage_opacity: int = 200
     camouflage_hide_local_body: bool = True  # hide local mesh during screen sampling
     camo_full_body_wrap: bool = True         # always 360° wrap (left/right/front/back)
+    camo_skip_front_pass: bool = False       # skip front paint pass (flat maps only)
     paint_image_path: str = ""
     paint_image_opacity: int = 255
     paint_image_grid: int = 32

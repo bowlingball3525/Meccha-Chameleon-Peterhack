@@ -5,6 +5,7 @@ Camouflage bridge for Peterhack.
 Injects meccha-xenos-bridge.dll and talks over localhost TCP (paint, rotate, cancel).
 """
 import json
+import math
 import os
 import sys
 import glob
@@ -216,9 +217,10 @@ class CamoBridgeMixin:
                     break
                 raw += chunk
             line = raw.split(b"\n")[0]
-            return json.loads(line) if line else {"success": False}
-        except Exception:
-            return {"success": False}
+            return json.loads(line) if line else {"success": False, "message": "empty bridge response"}
+        except Exception as exc:
+            print(f"[CAMO] bridge {command} failed: {exc}", flush=True)
+            return {"success": False, "message": str(exc)}
         finally:
             sock.close()
 
@@ -746,28 +748,296 @@ class CamoBridgeMixin:
         elif hasattr(self, "set_control_yaw"):
             self.set_control_yaw(yaw)
 
-    def _camo_apply_pass_camera(self, state, yaw_offset):
-        """Restore baseline pose then apply wrap yaw (full pitch/yaw/roll)."""
-        if not state or "control" not in state:
-            return None
-        self._camo_restore_view_rotation(state)
-        pitch, yaw, roll = state["control"]
-        target_yaw = self._normalize_yaw_deg(yaw + float(yaw_offset))
-        if hasattr(self, "native_set_control_rotation"):
-            self.native_set_control_rotation(pitch, target_yaw, roll)
-        elif hasattr(self, "set_control_rotation"):
-            self.set_control_rotation(pitch, target_yaw, roll)
-        elif hasattr(self, "set_control_yaw"):
-            self.set_control_yaw(target_yaw)
-        return (pitch, target_yaw, roll)
+    @staticmethod
+    def _camo_normalize_pitch_deg(pitch):
+        pitch = float(pitch) % 360.0
+        if pitch > 180.0:
+            pitch -= 360.0
+        return pitch
 
-    # Full wrap: sides first, then front (180°), then back (0° — ends facing forward).
+    @staticmethod
+    def _camo_rotation_to_axes(rot):
+        """FRotator (pitch, yaw, roll degrees) → forward, right, up unit axes."""
+        pitch, yaw, roll = [math.radians(float(x)) for x in rot]
+        sp, cp = math.sin(pitch), math.cos(pitch)
+        sy, cy = math.sin(yaw), math.cos(yaw)
+        sr, cr = math.sin(roll), math.cos(roll)
+        forward = (cp * cy, cp * sy, sp)
+        right = (sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp)
+        up = (-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp)
+        return forward, right, up
+
+    @staticmethod
+    def _camo_direction_to_rotation(dx, dy, dz):
+        """World look direction → UE ControlRotation (pitch, yaw, roll)."""
+        mag = math.hypot(dx, dy, dz)
+        if mag < 1e-9:
+            return 0.0, 0.0, 0.0
+        dx, dy, dz = dx / mag, dy / mag, dz / mag
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, dz))))
+        yaw = math.degrees(math.atan2(dy, dx))
+        return pitch, yaw, 0.0
+
+    def _camo_get_body_rotation(self):
+        """Pawn root FRotator (pitch, yaw, roll) — reference frame for wrap orbit."""
+        if not hasattr(self, "_find_local_pawn") or not hasattr(self, "get_actor_root_rotation"):
+            return None
+        pawn = self._find_local_pawn()
+        if not pawn:
+            return None
+        rot = self.get_actor_root_rotation(pawn)
+        if not rot or not all(math.isfinite(float(v)) for v in rot):
+            return None
+        return (float(rot[0]), float(rot[1]), float(rot[2]))
+
+    def _camo_is_emote_pose(self, control_rot=None, body_rot=None):
+        """True when pawn root or controller view suggests emote/prone."""
+        if body_rot:
+            bp = self._camo_normalize_pitch_deg(body_rot[0])
+            br = float(body_rot[2])
+            if abs(bp) > 35.0 or abs(br) > 25.0:
+                return True
+        rot = control_rot
+        if rot is None and hasattr(self, "get_control_rotation"):
+            rot = self.get_control_rotation()
+        if rot:
+            cp = self._camo_normalize_pitch_deg(rot[0])
+            cr = float(rot[2])
+            if abs(cp) > 35.0 or abs(cr) > 25.0:
+                return True
+        return False
+
+    @staticmethod
+    def _camo_neg(v):
+        return (-v[0], -v[1], -v[2])
+
+    @staticmethod
+    def _camo_normalize_vec(v):
+        mag = math.hypot(v[0], v[1], v[2])
+        if mag < 1e-9:
+            return (0.0, 0.0, 0.0)
+        return (v[0] / mag, v[1] / mag, v[2] / mag)
+
+    def _camo_root_is_tilted(self, body_rot):
+        if not body_rot:
+            return False
+        bp = self._camo_normalize_pitch_deg(body_rot[0])
+        br = float(body_rot[2])
+        return abs(bp) > 20.0 or abs(br) > 20.0
+
+    def _camo_dynamic_body_axes(self, control_rot, body_rot):
+        """Body forward/right/up for orbit — uses root rotation or view-inferred frame."""
+        if body_rot and self._camo_root_is_tilted(body_rot):
+            return self._camo_rotation_to_axes(body_rot)
+
+        body_yaw = float(body_rot[1]) if body_rot else 0.0
+        if hasattr(self, "_camo_get_body_forward_yaw"):
+            by = self._camo_get_body_forward_yaw()
+            if by is not None:
+                body_yaw = float(by)
+
+        if control_rot:
+            cp = self._camo_normalize_pitch_deg(control_rot[0])
+            cr = float(control_rot[2])
+            if abs(cp) > 20.0 or abs(cr) > 20.0:
+                rad = math.radians(body_yaw)
+                forward = (math.cos(rad), math.sin(rad), 0.0)
+                right = (-forward[1], forward[0], 0.0)
+                up = (0.0, 0.0, 1.0)
+                if abs(cr) > 20.0:
+                    crad = math.radians(cr)
+                    cos_r, sin_r = math.cos(crad), math.sin(crad)
+                    forward = (
+                        forward[0] * cos_r + up[0] * sin_r,
+                        forward[1] * cos_r + up[1] * sin_r,
+                        forward[2] * cos_r + up[2] * sin_r,
+                    )
+                    right = (
+                        right[0] * cos_r + up[0] * sin_r,
+                        right[1] * cos_r + up[1] * sin_r,
+                        right[2] * cos_r + up[2] * sin_r,
+                    )
+                return forward, right, up
+
+        eff = body_rot if body_rot else (0.0, body_yaw, 0.0)
+        return self._camo_rotation_to_axes(eff)
+
+    def _camo_orbit_basis(self, forward, right, up, control_rot=None, root_tilted=False):
+        """Pick orbit plane (two axes) from body orientation + current view."""
+        forward = self._camo_normalize_vec(forward)
+        right = self._camo_normalize_vec(right)
+        up = self._camo_normalize_vec(up)
+        up_align = abs(up[2])
+        fwd_horiz = math.hypot(forward[0], forward[1])
+
+        cp = 0.0
+        if control_rot:
+            cp = self._camo_normalize_pitch_deg(control_rot[0])
+        view_tilted = abs(cp) > 35.0
+
+        # Lay-down / look-down emote with upright root — front/back vertical, sides horizontal.
+        if view_tilted and not root_tilted:
+            return up, right, "dynamic-flat"
+
+        if root_tilted:
+            if up_align > 0.55 and fwd_horiz > 0.35:
+                return forward, right, "dynamic-tilted-upright"
+            return up, right, "dynamic-tilted"
+
+        # Standing / normal locomotion — yaw orbit in horizontal plane.
+        if up_align > 0.65 and fwd_horiz > 0.35:
+            return forward, right, "dynamic-upright"
+
+        # On-back root or ambiguous — vertical front/back.
+        return up, right, "dynamic-supine"
+
+    def _camo_plan_wrap_orbit(self, control_rot=None):
+        """Compute 4-pass camera orbit from body axes — any pose, one code path."""
+        body_rot = self._camo_get_body_rotation()
+        if not body_rot:
+            body_yaw = 0.0
+            if control_rot:
+                body_yaw = float(control_rot[1])
+            body_rot = (0.0, body_yaw, 0.0)
+
+        root_tilted = self._camo_root_is_tilted(body_rot)
+        emote = self._camo_is_emote_pose(control_rot, body_rot)
+
+        self._camo_body_yaw = float(body_rot[1])
+        self._camo_body_rot = body_rot
+        self._camo_emote_pose = emote
+
+        forward, right, up = self._camo_dynamic_body_axes(control_rot, body_rot)
+        axis_a, axis_b, orbit_mode = self._camo_orbit_basis(
+            forward, right, up, control_rot, root_tilted
+        )
+        self._camo_orbit_mode = orbit_mode
+
+        planned = []
+        for yaw_offset, label in self.CAMO_WRAP_YAW_PASSES:
+            ang = math.radians(float(yaw_offset))
+            ox = axis_a[0] * math.cos(ang) + axis_b[0] * math.sin(ang)
+            oy = axis_a[1] * math.cos(ang) + axis_b[1] * math.sin(ang)
+            oz = axis_a[2] * math.cos(ang) + axis_b[2] * math.sin(ang)
+            look = self._camo_normalize_vec((ox, oy, oz))
+            if look == (0.0, 0.0, 0.0):
+                continue
+            cam = self._camo_direction_to_rotation(*look)
+            planned.append((cam, label, int(yaw_offset)))
+
+        return planned, emote, body_rot
+
+    def _camo_is_prone_or_emote(self, control_rot=None):
+        """True when pitch/roll suggest lay-down emote or prone."""
+        return self._camo_is_emote_pose(control_rot, self._camo_get_body_rotation())
+
+    def _camo_set_camera_rotation(self, pitch, yaw, roll):
+        if hasattr(self, "native_set_control_rotation"):
+            return bool(self.native_set_control_rotation(pitch, yaw, roll))
+        if hasattr(self, "set_control_rotation"):
+            return bool(self.set_control_rotation(pitch, yaw, roll))
+        return False
+
+    def _camo_rotate_camera(self, yaw_delta, label=""):
+        """Rotate controller view yaw (ControlRotation) via bridge."""
+        import time as _t
+
+        note = f" ({label})" if label else ""
+        print(f"[CAMO] camera rotate{note} delta={yaw_delta:.0f}°...", flush=True)
+        resp = self._bridge_request(
+            "rotate",
+            {"yaw": float(yaw_delta), "target": "camera"},
+            timeout=10,
+        )
+        print(f"[CAMO] camera rotate response={resp}", flush=True)
+        if resp and resp.get("success"):
+            _t.sleep(self.CAMO_CAMERA_SETTLE_MS / 1000.0)
+            return True
+        if hasattr(self, "native_rotate_yaw_delta") and self.native_rotate_yaw_delta(yaw_delta):
+            _t.sleep(self.CAMO_CAMERA_SETTLE_MS / 1000.0)
+            return True
+        return False
+
+    def _camo_pass_camera_from_control(self, control, yaw_offset=0):
+        if not control:
+            return None
+        pitch, yaw, roll = control
+        return (
+            float(pitch),
+            self._normalize_yaw_deg(float(yaw) + float(yaw_offset)),
+            float(roll),
+        )
+
+    def _camo_get_body_forward_yaw(self):
+        """Pawn root yaw — camo pass angles are relative to body facing, not world north."""
+        if not hasattr(self, "_find_local_pawn") or not hasattr(self, "get_actor_root_rotation"):
+            return None
+        pawn = self._find_local_pawn()
+        if not pawn:
+            return None
+        rot = self.get_actor_root_rotation(pawn)
+        if not rot:
+            return None
+        yaw = float(rot[1])
+        return yaw if math.isfinite(yaw) else None
+
+    def _camo_reset_to_default_view(self):
+        """Align camera to pawn forward (chest view) before camouflage."""
+        body_yaw = self._camo_get_body_forward_yaw()
+        if body_yaw is None:
+            body_yaw = 0.0
+            if hasattr(self, "get_control_rotation"):
+                rot = self.get_control_rotation()
+                if rot:
+                    body_yaw = float(rot[1])
+        self._camo_body_yaw = body_yaw
+        pitch, roll = 0.0, 0.0
+        if hasattr(self, "native_set_control_rotation"):
+            if self.native_set_control_rotation(pitch, body_yaw, roll):
+                return True
+        if hasattr(self, "set_control_rotation"):
+            if self.set_control_rotation(pitch, body_yaw, roll):
+                return True
+        return False
+
+    def _camo_rotate_pawn(self, yaw_delta, label=""):
+        """Rotate local pawn yaw via bridge K2_SetActorRotation (SilentJMA back-pass)."""
+        import time as _t
+
+        note = f" ({label})" if label else ""
+        print(f"[CAMO] pawn rotate{note} delta={yaw_delta:.0f}°...", flush=True)
+        resp = self._bridge_request(
+            "rotate",
+            {"yaw": float(yaw_delta), "target": "pawn"},
+            timeout=10,
+        )
+        print(f"[CAMO] pawn rotate response={resp}", flush=True)
+        if resp and resp.get("success"):
+            _t.sleep(self.CAMO_CAMERA_SETTLE_MS / 1000.0)
+            return True
+        return False
+
+    def _camo_body_pass_rotation(self, yaw_offset):
+        """Legacy standing-only yaw orbit — prefer _camo_plan_wrap_orbit()."""
+        base_yaw = getattr(self, "_camo_body_yaw", None)
+        if base_yaw is None:
+            base_yaw = self._camo_get_body_forward_yaw() or 0.0
+        return (
+            0.0,
+            self._normalize_yaw_deg(float(base_yaw) + float(yaw_offset)),
+            0.0,
+        )
+
+    # Pass order: front → sides → back last.
     CAMO_WRAP_YAW_PASSES = (
+        (0, "front"),
         (90, "left"),
         (270, "right"),
-        (180, "front"),
-        (0, "back"),
+        (180, "back"),
     )
+    CAMO_PAWN_BACK_YAW = 180
+    CAMO_CAMERA_SETTLE_MS = 1500
+    CAMO_DEFAULT_SETTLE_SEC = 0.5
 
     def _camo_rotate_to_yaw(self, target_yaw, label):
         """Rotate to yaw offset from session start — bridge delta, then ProcessEvent, then memory."""
@@ -817,7 +1087,43 @@ class CamoBridgeMixin:
 
         return False
 
-    def _paint_payload(self, pid, camera_yaw_offset=0, camera_rotation=None):
+    CAMO_PAINT_ROUTE_TIMEOUT = 300
+
+    def _camo_set_collision_free(self, enable, label=""):
+        """Disable pawn collision (noclip) — used on front pass only."""
+        if not hasattr(self, "_trainer_anti_clipping") or not hasattr(self, "_find_local_pawn"):
+            return
+        pawn = self._find_local_pawn()
+        cfg = getattr(self, "config", None)
+        if not pawn or not cfg:
+            return
+        user_noclip = bool(getattr(cfg, "trainer_anti_clipping", False))
+        note = f" ({label})" if label else ""
+        if enable:
+            if user_noclip:
+                self._camo_noclip_owned = False
+                self._camo_noclip_hold = True
+                print(f"[CAMO] noclip already on (trainer toggle){note}", flush=True)
+                return
+            self._trainer_anti_clipping(pawn, cfg, True)
+            self._camo_noclip_owned = True
+            self._camo_noclip_hold = True
+            print(f"[CAMO] noclip on for front pass (held through paint){note}", flush=True)
+        elif getattr(self, "_camo_noclip_owned", False) or getattr(self, "_camo_noclip_hold", False):
+            self._camo_noclip_hold = False
+            if getattr(self, "_camo_noclip_owned", False):
+                self._trainer_anti_clipping(pawn, cfg, False)
+                self._camo_noclip_owned = False
+            print(f"[CAMO] noclip restored after front pass{note}", flush=True)
+
+    def _paint_payload(
+        self,
+        pid,
+        camera_yaw_offset=0,
+        camera_rotation=None,
+        camera_body_anchor=False,
+        camera_body_pullback=150.0,
+    ):
         cfg = getattr(self, "config", None)
         quality = max(1, min(20, int(getattr(cfg, "paint_quality", 12) if cfg else 12)))
         min_points = {
@@ -848,8 +1154,14 @@ class CamoBridgeMixin:
             payload["camera_pitch"] = float(pitch)
             payload["camera_yaw"] = float(yaw)
             payload["camera_roll"] = float(roll)
+            if camera_body_anchor:
+                payload["camera_use_body_anchor"] = True
+                payload["camera_body_pullback"] = float(camera_body_pullback)
         elif camera_yaw_offset:
             payload["camera_yaw_offset"] = int(camera_yaw_offset)
+        payload["camera_settle_ms"] = int(
+            getattr(self, "CAMO_CAMERA_SETTLE_MS", 1500)
+        )
         return payload
 
     def _finalize_camo_paint(self):
@@ -866,7 +1178,7 @@ class CamoBridgeMixin:
                 pass
 
     def camo_apply(self, r=None, g=None, b=None, a=None, full_wrap=True):
-        """Environment camouflage via bridge paint_full_route (always 360° wrap)."""
+        """Environment camo — 4-pass 360° wrap via paint_full_route (camera orbit per pass)."""
         del r, g, b, a
         full_wrap = True
         if not getattr(self, "pm", None) or not self.pm:
@@ -875,6 +1187,8 @@ class CamoBridgeMixin:
 
         self._camo_abort = False
         self._bridge_port = None
+        self._camo_noclip_owned = False
+        self._camo_noclip_hold = False
         try:
             pid = self.pm.process_id
             print(f"[CAMO] pid={pid} wrap={full_wrap}", flush=True)
@@ -889,65 +1203,100 @@ class CamoBridgeMixin:
 
             import time as _t
 
-            passes = (
-                list(self.CAMO_WRAP_YAW_PASSES) if full_wrap else [(0, "front")]
+            self._camo_view_state = self._camo_save_view_rotation() if full_wrap else None
+            saved_control = (
+                self._camo_view_state.get("control") if self._camo_view_state else None
             )
 
-            self._camo_view_state = self._camo_save_view_rotation() if full_wrap else None
-            if self._camo_view_state:
-                pitch, yaw, roll = self._camo_view_state["control"]
+            wrap_passes, emote_pose, body_rot = self._camo_plan_wrap_orbit(saved_control)
+            if not full_wrap:
+                wrap_passes = wrap_passes[:1]
+            skip_front = bool(getattr(cfg, "camo_skip_front_pass", False)) if cfg else False
+            if skip_front and full_wrap:
+                before = len(wrap_passes)
+                wrap_passes = [p for p in wrap_passes if p[1] != "front"]
+                if len(wrap_passes) < before:
+                    print("[CAMO] front pass disabled (flat map option)", flush=True)
+            if not wrap_passes:
+                print("[CAMO] orbit plan empty — cannot paint", flush=True)
+                self._camo_last_error = "Could not compute camo camera orbit"
+                return False
+
+            body_pitch = self._camo_normalize_pitch_deg(body_rot[0])
+            body_roll = float(body_rot[2])
+            orbit_mode = getattr(self, "_camo_orbit_mode", "dynamic")
+            print(
+                f"[CAMO] single camo_apply: {len(wrap_passes)}-pass 360° wrap "
+                f"({orbit_mode}, body pitch={body_pitch:.0f}° roll={body_roll:.0f}°)",
+                flush=True,
+            )
+            self._camo_last_error = None
+
+            upright_orbit = orbit_mode == "dynamic-upright"
+            if full_wrap and upright_orbit:
+                body_yaw = self._camo_get_body_forward_yaw()
                 print(
-                    f"[CAMO] wrap baseline pitch={pitch:.0f}° yaw={yaw:.0f}° roll={roll:.0f}°",
+                    f"[CAMO] aligning camera to pawn forward "
+                    f"(body yaw={body_yaw if body_yaw is not None else '?'}°)...",
                     flush=True,
                 )
+                if not self._camo_reset_to_default_view():
+                    print("[CAMO] camera align failed — continuing", flush=True)
+                else:
+                    print(
+                        f"[CAMO] camera aligned (body yaw={getattr(self, '_camo_body_yaw', 0):.0f}°)",
+                        flush=True,
+                    )
+                _t.sleep(self.CAMO_DEFAULT_SETTLE_SEC)
+
+            for idx, (cam, label, yaw_offset) in enumerate(wrap_passes):
+                pitch, yaw, roll = cam
+                print(
+                    f"[CAMO] orbit plan {idx + 1}/{len(wrap_passes)} "
+                    f"({label}, offset={yaw_offset}°, "
+                    f"cam pitch={pitch:.0f}° yaw={yaw:.0f}° roll={roll:.0f}°)",
+                    flush=True,
+                )
+
             try:
-                for pass_idx, (target_yaw, label) in enumerate(passes):
+                for pass_idx, (cam, label, yaw_offset) in enumerate(wrap_passes):
                     if self._camo_aborted():
                         print("[CAMO] apply aborted", flush=True)
                         return False
-                    camera_rotation = None
-                    if self._camo_view_state:
-                        camera_rotation = self._camo_apply_pass_camera(
-                            self._camo_view_state, target_yaw,
-                        )
-                        _t.sleep(0.3)
-                    elif target_yaw and not getattr(self, "_bridge_paint_yaw", False):
-                        print(
-                            f"[CAMO] {label} camera yaw={target_yaw}° (ProcessEvent fallback)...",
-                            flush=True,
-                        )
-                        if hasattr(self, "native_rotate_yaw_delta"):
-                            if not self.native_rotate_yaw_delta(target_yaw):
-                                print(
-                                    f"[CAMO] {label} camera yaw failed — aborting wrap",
-                                    flush=True,
-                                )
-                                self._finalize_camo_paint()
-                                return False
-                            _t.sleep(0.5)
-
-                    rot_note = ""
-                    if camera_rotation:
-                        rot_note = (
-                            f" pitch={camera_rotation[0]:.0f}° "
-                            f"yaw={camera_rotation[1]:.0f}° "
-                            f"roll={camera_rotation[2]:.0f}°"
-                        )
+                    pitch, yaw, roll = cam
+                    front_pass = label == "front"
                     print(
-                        f"[CAMO] paint pass {pass_idx + 1}/{len(passes)} "
-                        f"({label}, wrap_yaw={target_yaw}°{rot_note}, port={self._bridge_port})...",
+                        f"[CAMO] paint pass {pass_idx + 1}/{len(wrap_passes)} "
+                        f"({label}, offset={yaw_offset}°, "
+                        f"cam pitch={pitch:.0f}° yaw={yaw:.0f}° roll={roll:.0f}°, "
+                        f"settle={self.CAMO_CAMERA_SETTLE_MS}ms)"
+                        f"{' [noclip]' if front_pass else ''}...",
                         flush=True,
                     )
-                    payload = self._paint_payload(
-                        pid,
-                        camera_yaw_offset=target_yaw,
-                        camera_rotation=camera_rotation,
-                    )
-                    resp = self._bridge_request("paint_full_route", payload, timeout=120)
-                    print(f"[CAMO] paint response={resp}", flush=True)
-                    if not resp or not resp.get("success", False):
-                        self._finalize_camo_paint()
-                        return False
+                    if front_pass:
+                        self._camo_set_collision_free(True, label="front")
+                    try:
+                        payload = self._paint_payload(
+                            pid,
+                            camera_rotation=cam,
+                            camera_body_anchor=front_pass,
+                            camera_body_pullback=280.0 if (front_pass and not upright_orbit) else 150.0,
+                        )
+                        resp = self._bridge_request(
+                            "paint_full_route",
+                            payload,
+                            timeout=self.CAMO_PAINT_ROUTE_TIMEOUT,
+                        )
+                        print(f"[CAMO] paint response={resp}", flush=True)
+                        if not resp or not resp.get("success", False):
+                            err = resp.get("message") or resp.get("stage") if resp else "no response"
+                            self._camo_last_error = f"Paint pass {label} failed: {err}"
+                            print(f"[CAMO] {self._camo_last_error}", flush=True)
+                            self._finalize_camo_paint()
+                            return False
+                    finally:
+                        if front_pass:
+                            self._camo_set_collision_free(False, label="front")
             finally:
                 if self._camo_view_state:
                     self._camo_restore_view_rotation(self._camo_view_state)
@@ -963,6 +1312,8 @@ class CamoBridgeMixin:
             print(f"[CAMO] exception: {exc}", flush=True)
             traceback.print_exc()
             try:
+                self._camo_set_collision_free(False)
+                self._camo_noclip_hold = False
                 self._finalize_camo_paint()
             except Exception:
                 pass
@@ -971,6 +1322,8 @@ class CamoBridgeMixin:
     def camo_stop(self):
         """Cancel active camouflage paint."""
         self._camo_abort = True
+        self._camo_set_collision_free(False, label="stop")
+        self._camo_noclip_hold = False
         print("[CAMO] sending cancel_paint...", flush=True)
         resp = self._bridge_request("cancel_paint", {}, timeout=5)
         print(f"[CAMO] cancel response={resp}", flush=True)

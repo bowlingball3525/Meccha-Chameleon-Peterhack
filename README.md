@@ -38,7 +38,7 @@ Peterhack is a **fully external** tool. It does not modify game files on disk.
 | **AIMBOT** | Hold key aim (default MB5), FOV circle, smoothing, bone offset |
 | **EXPLOITS** | Memory toggles — no gun CD, no recoil, decoy CD/count, noclip, anti-kick watchdog, auto-rename |
 | **COLORS** | Per-team and skeleton colors |
-| **CAMOUFLAGE** | Full 360° environment camo + custom image paint + UV diagnostic |
+| **CAMOUFLAGE** | Dynamic 360° environment camo, quality slider, optional skip-front toggle, custom image paint, UV diagnostic |
 | **CHANGELOG** | Version info and auto-update toggle |
 
 Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord** (opens invite link).
@@ -88,28 +88,43 @@ Enable **Debug Logging** to emit `[TRAINER:TAG]` lines to `latest.log`.
 
 ### Environment Camouflage (bridge)
 
-Every **Paint Now** / **F10** runs **full 360° wrap** (four scene-capture passes). There is no front-only mode.
+Every **Paint Now** / **F10** runs a **360° environment camo wrap** via the in-game bridge. Camera angles are computed **dynamically** from your pawn root rotation and current view — standing, crouched, or lay-down emotes are handled automatically (no manual pose setup).
 
-| Pass | Label | Camera yaw offset |
+**Pass order:** **front → left → right → back** (back is last).
+
+| Pass | When standing (`dynamic-upright`) | When lay-down / tilted (`dynamic-flat`, etc.) |
 |---|---|---|
-| 1 | Left side | 90° |
-| 2 | Right side | 270° |
-| 3 | Front | 180° |
-| 4 | Back | 0° (restores starting view) |
+| **Front** | Horizontal, pawn forward | Look **up** from below the body |
+| **Left / Right** | Horizontal sides | Horizontal sides (pitch 0°) |
+| **Back** | Horizontal, opposite forward | Look **down** from above |
 
-Each pass **orbits the camera** (controller `ControlRotation` only — your character does not spin), scene-captures the environment, and paints visible mesh UVs. Expect ~30–40 seconds per pass (~2–3 minutes total).
+Each pass sets **camera rotation only** (pawn does not spin), waits **1.5 s** (`camera_settle_ms`), UV-samples the mesh, scene-captures environment colors, and paints via `ServerPaintBatch`. Expect ~30–60 seconds per pass depending on **Camo quality** (1–20); four passes ≈ **2–4 minutes**.
+
+**CAMOUFLAGE tab options:**
+
+| Control | Description |
+|---|---|
+| **Camo quality** | Slider 1–20 — stroke density per pass (higher = smoother, slower) |
+| **Disable front pass (only if flat map)** | Skips the front pass; runs left → right → back only |
+| **Paint Now** / **F10** | Start one full `camo_apply()` |
+| **Stop Camo (F9)** | `cancel_paint` over TCP |
+
+**Noclip during camo:** On non-upright orbits, **noclip is enabled for the entire front pass** (camera settle + paint) so geometry does not block the below-looking-up view. It is restored before side/back passes. This is separate from the EXPLOITS noclip toggle; camo holds noclip even when that toggle is off.
 
 **Flow:**
-1. Peterhack injects **`meccha-xenos-bridge.dll`** via **`meccha-xenos-injector.exe`** (or reuses an existing bridge if TCP on port **47654** responds).
-2. For each pass: restore baseline view → `paint_full_route` with `camera_yaw_offset` (camera orbits inside the bridge; no separate `rotate` call).
-3. Sends `cancel_paint` and restores view rotation when done.
+1. Peterhack injects **`meccha-xenos-bridge.dll`** via **`meccha-xenos-injector.exe`** (or reuses TCP on **47654** if already loaded).
+2. Saves your view, plans four look directions from body/view axes, runs **`paint_full_route`** once per pass.
+3. Front pass uses **body-anchored scene capture** (pullback from pawn center) when noclip is active.
+4. Restores your original camera when done.
+
+**F10** only calls `camo_apply()` in Peterhack — it is not sent to the game as a keybind.
 
 **Bridge TCP commands:**
 
 | Command | Description |
 |---|---|
-| `paint_full_route` | Scene-capture basecolor → UV stroke paint (`camera_yaw_offset` for wrap passes) |
-| `rotate` | Legacy camera yaw delta (superseded by `camera_yaw_offset` in paint) |
+| `paint_full_route` | Camera settle → UV sample → scene-capture → paint (`camera_rotation_absolute`, `camera_settle_ms`, optional `camera_use_body_anchor`) |
+| `rotate` | `"target":"camera"` for ControlRotation; `"target":"pawn"` for pawn yaw |
 | `cancel_paint` | Cancel active paint and drain the queue |
 | `ping` / `capabilities` | Health check and command list |
 
@@ -122,7 +137,7 @@ Each pass **orbits the camera** (controller `ControlRotation` only — your char
 | `meccha-xenos-bridge.dll` | In-game TCP bridge (scene capture + server paint batch) |
 | `meccha-xenos-injector.exe` | Loads the bridge DLL into the game process |
 
-Peterhack ships prebuilt bridge binaries in `meccha_chameleon_tools/`. To rebuild locally, compile `runtime/src/bridge.cpp` with Visual Studio (see `runtime/scripts/build.ps1`) and copy the output to `meccha-xenos-bridge.dll`.
+Peterhack ships prebuilt bridge binaries in `meccha_chameleon_tools/`. To rebuild locally, run `runtime/scripts/build.ps1` (Visual Studio) and copy `runtime-bridge.dll` → `meccha-xenos-bridge.dll`.
 
 ### Custom Character Paint — Apply Image
 
@@ -145,7 +160,7 @@ Separate from environment camo. Paint any PNG/JPG onto your character atlas:
 | Key | Action |
 |---|---|
 | **Insert** / **F1** | Toggle menu + ESP overlay |
-| **F10** | Apply environment camouflage (360° wrap) |
+| **F10** | Apply environment camouflage (`camo_apply()` — four passes unless front disabled) |
 | **F9** | Stop / cancel camouflage paint |
 | **MB5** (default) | Aimbot hold |
 
@@ -174,7 +189,7 @@ pip install -r requirements.txt
 1. Launch **MECCHA CHAMELEON** and join a match.
 2. Run **`Peterhack.bat`** (self-elevates to Administrator).
 3. Configure ESP, exploits, and colors in the menu tabs.
-4. For environment camo: press **F10** or click **Paint Now** on the CAMOUFLAGE tab.
+4. For environment camo: open **CAMOUFLAGE**, set quality, optionally enable **Disable front pass** on flat maps, then **Paint Now** or **F10**.
 5. Use the **PLAYERS** tab to copy Steam IDs, manage your blocklist, or enable autokick.
 
 Pre-built EXE: download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main`, or build locally with PyInstaller (see `.github/workflows/build.yml`).
@@ -197,12 +212,14 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 | Symptom | What to try |
 |---|---|
 | `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `C:\peterhack\logs\latest.log` |
-| `could not unload` / `runtime-bridge-*.dll` stuck | **Quit the game completely** and relaunch. Don't run `meccha-camouflage.exe` separately. Run Peterhack as Administrator. |
-| `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` (use GitHub Actions EXE or full release, not source-only zip). |
+| `could not unload` / `runtime-bridge-*.dll` stuck | **Quit the game completely** and relaunch. Run Peterhack as Administrator. |
+| `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` |
 | Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |
-| `bridge DLL is outdated (no rotate)` | Restart game so Peterhack can copy the latest bridge from the bundle |
-| Camo only paints one side / body spins | Update to latest build — rotate should move **camera only** |
-| Camo takes ~2–3 minutes | Normal for full 360° wrap (four passes) |
+| `[TRAINER:NO-CLIP] restored collision` during front pass | Update to latest build — camo now holds noclip for the full front pass |
+| Front pass blocked by floor/geometry | Use latest build (front noclip + body anchor); on flat maps try **Disable front pass** |
+| Camo only paints one side / body spins | Update — rotate moves **camera only**, not the pawn |
+| Lay-down emote wrong angles | Update — dynamic orbit reads pose automatically; check log for `dynamic-flat` / `dynamic-upright` |
+| Camo takes ~2–4 minutes | Normal for four passes at quality 12+ |
 | Steam ID shows `—` in PLAYERS tab | Wait a few seconds for replication; select row and Copy again |
 | ESP feels laggy | Disable **Show Steam ID** if you do not need it; keep PLAYERS tab closed when not in use |
 

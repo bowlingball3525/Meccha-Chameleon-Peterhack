@@ -511,7 +511,7 @@ class Menu(QWidget):
             self.btn_camo_apply.setEnabled(not painting)
 
     def _paint_camo_now(self):
-        """Apply camo — menu button or F10 (via overlay). Always full 360° wrap."""
+        """Apply camo — menu button or F10 hotkey both call camo_apply() once."""
         if getattr(self, "_camo_busy", False):
             self.lbl_camo_status.setText("Already painting...")
             return
@@ -1378,10 +1378,10 @@ class Menu(QWidget):
         lo.addWidget(hdr)
 
         info = QLabel(
-            "Fully automatic — injects meccha-xenos-bridge.dll and paints full 360° wrap.\n"
-            "Click Paint Now or press F10. F9 cancels.\n"
-            "Four passes: left, right, front, back (ends facing forward).\n"
-            "Start emote/pose first if you want — wrap uses your current camera angle."
+            "Fully automatic — 4-pass wrap: front → left → right → back.\n"
+            "Camera angles are computed dynamically from your pose (any angle/emote).\n"
+            "Noclip on front pass when not standing upright.\n"
+            "Click Paint Now or press F10. F9 cancels. Camera only — pawn does not spin."
         )
         info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 0;")
         info.setWordWrap(True)
@@ -1414,6 +1414,13 @@ class Menu(QWidget):
         self.sld_camo_quality.valueChanged.connect(_on_camo_quality_change)
         camo_q_row.addWidget(self.lbl_camo_quality)
         lo.addLayout(camo_q_row)
+
+        skip_front = self._chk("Disable front pass (only if flat map)", "camo_skip_front_pass")
+        skip_front.setToolTip(
+            "Skip the front camera pass — left, right, back only.\n"
+            "Use on flat maps where the front pass is unnecessary or causes issues."
+        )
+        lo.addWidget(skip_front)
 
         self.lbl_camo_status = QLabel("Ready — click Paint Now")
         self.lbl_camo_status.setStyleSheet("color: #888; font-size: 10px; padding: 4px 0;")
@@ -1776,6 +1783,14 @@ class Menu(QWidget):
             "=== Peterhack Changelog ===\n"
             "\n"
             "--- Jul 1, 2026 (latest) ---\n"
+            "\n"
+            "[Camouflage — dynamic orbit + front pass options]\n"
+            "  + Dynamic camera orbit from pawn root + view (any angle/emote).\n"
+            "  + Pass order: front → left → right → back (back last).\n"
+            "  + Front pass noclip held through entire paint (trainer tick fix).\n"
+            "  + Body-anchored scene capture on front pass (geometry pullback).\n"
+            "  + Toggle: Disable front pass (only if flat map) — 3-pass mode.\n"
+            "  + Camo quality slider 1–20; bridge DLL rebuilt.\n"
             "\n"
             "[Camouflage — 360° wrap + camera rotate fix]\n"
             "  + Always-on full wrap: left, right, front, back (four passes).\n"

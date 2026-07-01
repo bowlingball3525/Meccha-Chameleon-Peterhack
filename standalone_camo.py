@@ -161,26 +161,43 @@ class CamouflageEngine:
         return False
 
     def camo_apply(self):
+        """Single call — front + back via paint_full_route; pawn rotate 180° between passes."""
         if not self._game_pid or not self._ensure_bridge():
             return False
-        # Two passes: front + back (rotate 180 between)
-        for i, yaw in enumerate([0, 180]):
-            if yaw != 0:
-                bridge_request("rotate", {"yaw": yaw}, timeout=10)
-                time.sleep(1.5)
-            resp = bridge_request(
-                "paint_full_route",
-                {"native_apply_mode": "template_brush_paint",
-                 "route": "f10_template_brush_paint",
-                 "process": {"pid": self._game_pid, "name": "PenguinHotel-Win64-Shipping.exe"},
-                 "max_paints_per_tick": 256, "paint_tick_budget_ms": 16,
-                 "brush_radius": 4.0, "template_min_direct_points": 1000,
-                 "auto_flush_during_paint": True},
-                timeout=120,
-            )
-            if not resp or not resp.get("success", False):
-                return False
-        return True
+        rotated = False
+        try:
+            for pass_idx, yaw in enumerate((0, 180)):
+                if yaw:
+                    bridge_request(
+                        "rotate",
+                        {"yaw": float(yaw), "target": "pawn"},
+                        timeout=10,
+                    )
+                    rotated = True
+                    time.sleep(1.5)
+                resp = bridge_request(
+                    "paint_full_route",
+                    {
+                        "native_apply_mode": "template_brush_paint",
+                        "route": "f10_template_brush_paint",
+                        "process": {
+                            "pid": self._game_pid,
+                            "name": "PenguinHotel-Win64-Shipping.exe",
+                        },
+                        "max_paints_per_tick": 256,
+                        "paint_tick_budget_ms": 16,
+                        "brush_radius": 4.0,
+                        "template_min_direct_points": 1000,
+                        "auto_flush_during_paint": True,
+                    },
+                    timeout=120,
+                )
+                if not resp or not resp.get("success", False):
+                    return False
+            return True
+        finally:
+            if rotated:
+                bridge_request("rotate", {"yaw": -180.0, "target": "pawn"}, timeout=10)
 
     def camo_stop(self):
         resp = bridge_request("cancel_paint", {}, timeout=10)
@@ -248,7 +265,7 @@ class CamoWindow(tk.Tk):
         sep = tk.Frame(frame, bg="#2a2a3e", height=1)
         sep.pack(fill="x", padx=pad, pady=4)
 
-        info = tk.Label(frame, text="Launches bridge, triggers F10 to paint",
+        info = tk.Label(frame, text="Launches bridge, one camo_apply (front + back via TCP)",
                        bg=BG, fg="#888", font=("Segoe UI", 9), wraplength=250)
         info.pack(padx=pad, pady=(0, 2))
 

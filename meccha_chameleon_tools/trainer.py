@@ -682,9 +682,15 @@ class TrainerMixin:
 
     def tick_trainer(self, config):
         """Apply enabled trainer features (throttled — not every overlay frame)."""
+        camo_noclip_hold = getattr(self, "_camo_noclip_hold", False)
+
         if not config or not self._trainer_any_active(config):
-            if self._trainer_anticlip_saved is not None:
+            if self._trainer_anticlip_saved is not None and not camo_noclip_hold:
                 self._trainer_anti_clipping(0, config, False)
+            if camo_noclip_hold:
+                pawn = self._find_local_pawn()
+                if pawn and self._trainer_anticlip_saved is None:
+                    self._trainer_anti_clipping(pawn, config, True)
             return
 
         now = time.monotonic()
@@ -702,7 +708,10 @@ class TrainerMixin:
             return
 
         pawn = self._find_local_pawn()
-        if config.trainer_anti_clipping:
+        if camo_noclip_hold:
+            if pawn and self._trainer_anticlip_saved is None:
+                self._trainer_anti_clipping(pawn, config, True)
+        elif config.trainer_anti_clipping:
             self._trainer_anti_clipping(pawn, config, True)
         elif self._trainer_anticlip_saved is not None:
             self._trainer_anti_clipping(pawn, config, False)
