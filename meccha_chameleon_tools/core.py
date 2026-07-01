@@ -3909,7 +3909,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
         psapi = ctypes.windll.psapi
         kernel32 = ctypes.windll.kernel32
-        hmods = (wintypes.HMODULE * 1024)()
+        h_process = ctypes.c_void_p(int(h_process) & 0xFFFFFFFFFFFFFFFF)
+        hmods = (ctypes.c_void_p * 1024)()
         cb_needed = wintypes.DWORD()
 
         if psapi.EnumProcessModules(
@@ -3918,16 +3919,18 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             ctypes.sizeof(hmods),
             ctypes.byref(cb_needed),
         ):
-            count = cb_needed.value // ctypes.sizeof(wintypes.HMODULE)
+            count = cb_needed.value // ctypes.sizeof(ctypes.c_void_p)
             name_buf = ctypes.create_unicode_buffer(512)
             for i in range(count):
-                base = int(hmods[i] or 0)
+                mod = hmods[i]
+                base = int(mod or 0)
                 if base <= 0x10000:
                     continue
+                mod_handle = ctypes.c_void_p(base)
                 name = ""
-                if psapi.GetModuleBaseNameW(h_process, hmods[i], name_buf, 512):
+                if psapi.GetModuleBaseNameW(h_process, mod_handle, name_buf, 512):
                     name = name_buf.value
-                elif psapi.GetModuleFileNameExW(h_process, hmods[i], name_buf, 512):
+                elif psapi.GetModuleFileNameExW(h_process, mod_handle, name_buf, 512):
                     name = os.path.basename(name_buf.value)
                 if name:
                     yield name.lower(), base

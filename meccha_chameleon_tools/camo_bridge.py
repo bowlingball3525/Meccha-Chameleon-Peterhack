@@ -11,6 +11,8 @@ import sys
 import glob
 import subprocess as _subprocess
 
+from meccha_chameleon_tools.log_util import PETERHACK_ROOT
+
 CREATE_NO_WINDOW = 0x08000000
 BRIDGE_PING_TIMEOUT = 1.0
 BRIDGE_FIXED_PORT = 47654
@@ -24,10 +26,8 @@ class CamoBridgeMixin:
     INJECTOR_NAME = "meccha-xenos-injector.exe"
     BRIDGE_HOST = "127.0.0.1"
     BRIDGE_PORT = BRIDGE_FIXED_PORT
-    CAMO_DIR = os.path.join(os.environ.get("APPDATA", "."), "MecchaCamouflage")
-    RUNTIME_DIR = os.path.join(
-        os.environ.get("LOCALAPPDATA", "."), "MecchaCamouflage", "runtime",
-    )
+    CAMO_DIR = os.path.join(PETERHACK_ROOT, "camo")
+    RUNTIME_DIR = os.path.join(CAMO_DIR, "runtime")
 
     @staticmethod
     def _camo_bundle_dir():
@@ -284,6 +284,7 @@ class CamoBridgeMixin:
         import shutil
 
         os.makedirs(self.CAMO_DIR, exist_ok=True)
+        os.makedirs(self.RUNTIME_DIR, exist_ok=True)
         missing = []
         for src_fn, dst_fn, label in (
             (self._get_exe_path(), self._get_stable_exe_path(), self.EXE_NAME),
@@ -294,6 +295,8 @@ class CamoBridgeMixin:
                 shutil.copy2(src_fn, dst_fn)
             elif not os.path.isfile(dst_fn):
                 missing.append(label)
+        if not missing:
+            print(f"[CAMO] bridge files ready in {self.CAMO_DIR}", flush=True)
         return missing
 
     @staticmethod
@@ -318,13 +321,44 @@ class CamoBridgeMixin:
         if err:
             print(f"[CAMO] controller last_error: {err}", flush=True)
 
-    def _try_direct_inject(self, port=BRIDGE_FIXED_PORT):
-        """Fallback inject — writes .port sidecar so DLL listens on known port."""
-        loaded, mod_names = self._bridge_dll_loaded()
-        if loaded:
+    def _bridge_dll_state(self):
+        """Return (any_loaded, module_names, has_xenos_bridge, has_runtime_bridge)."""
+        loaded, names = self._bridge_dll_loaded()
+        if not loaded:
+            return False, [], False, False
+        has_xenos = any("meccha-xenos-bridge" in n for n in names)
+        has_runtime = any("runtime-bridge" in n for n in names)
+        return True, names, has_xenos, has_runtime
+
+    def _log_bridge_capabilities(self):
+        resp = self._bridge_request("capabilities", {}, timeout=5)
+        if not resp or not resp.get("success"):
+            return
+        cmds = (resp.get("metadata") or {}).get("commands") or []
+        if cmds:
+            print(f"[CAMO] bridge commands: {', '.join(cmds)}", flush=True)
+
+    def _bridge_has_rotate(self):
+        resp = self._bridge_request("capabilities", {}, timeout=5)
+        if resp and resp.get("success"):
+            cmds = (resp.get("metadata") or {}).get("commands") or []
+            return "rotate" in cmds
+        probe = self._bridge_request("rotate", {"yaw": 0}, timeout=5)
+        return bool(probe and probe.get("success"))
+
+    def _try_direct_inject(self, port=BRIDGE_FIXED_PORT, force=False):
+        """Inject SilentJMA meccha-xenos-bridge.dll (full TCP command set)."""
+        loaded, mod_names, has_xenos, _has_runtime = self._bridge_dll_state()
+        if loaded and has_xenos and not force:
             print(
-                f"[CAMO] direct inject skipped — bridge already loaded "
-                f"({', '.join(mod_names)})",
+                f"[CAMO] meccha-xenos-bridge already loaded ({', '.join(mod_names)})",
+                flush=True,
+            )
+            return True
+        if loaded and not force:
+            print(
+                f"[CAMO] other bridge loaded ({', '.join(mod_names)}) — "
+                f"restart game before inject",
                 flush=True,
             )
             return False
@@ -336,7 +370,7 @@ class CamoBridgeMixin:
             return False
         self._write_port_sidecar(dll, port)
         print(
-            f"[CAMO] direct inject pid={getattr(self.pm, 'process_id', 0)} "
+            f"[CAMO] injecting {self.DLL_NAME} pid={getattr(self.pm, 'process_id', 0)} "
             f"port={port}...",
             flush=True,
         )
@@ -362,7 +396,7 @@ class CamoBridgeMixin:
         return False
 
     def _ensure_bridge(self):
-        """Launch bridge controller, wait for inject + TCP (auto port discovery)."""
+        """Inject SilentJMA xenos bridge DLL, then launch controller (TCP command server)."""
         import time as _t
 
         if not getattr(self, "pm", None) or not self.pm.process_id:
@@ -370,25 +404,38 @@ class CamoBridgeMixin:
             return False
 
         pid = self.pm.process_id
+        loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
 
         if self._resolve_bridge_port():
+            if has_runtime and not has_xenos:
+                print(
+                    "[CAMO] TCP up but embedded runtime-bridge is loaded (no rotate). "
+                    "Restart the game so Peterhack can inject meccha-xenos-bridge.dll.",
+                    flush=True,
+                )
+                return False
             print("[CAMO] bridge already up (TCP)", flush=True)
+            self._log_bridge_capabilities()
             return True
 
-        dll_loaded, mod_names = self._bridge_dll_loaded()
-        if dll_loaded:
+        if loaded and has_runtime and not has_xenos:
             print(
-                f"[CAMO] bridge DLL already in game ({', '.join(mod_names)}) "
-                f"— skipping inject",
+                f"[CAMO] wrong bridge in game ({', '.join(mod_names)}) — "
+                "restart the game, then Paint Now (needs meccha-xenos-bridge.dll).",
                 flush=True,
             )
-            print("[CAMO] waiting for existing bridge TCP...", flush=True)
-            if self._wait_for_bridge_tcp("existing bridge"):
-                return True
-            self._log_bridge_diagnostics()
+            return False
+
+        if loaded and has_xenos:
             print(
-                "[CAMO] bridge DLL is loaded but TCP is not responding — "
-                "will not inject again (restart the game, then retry Paint Now).",
+                f"[CAMO] {self.DLL_NAME} in game — waiting for TCP...",
+                flush=True,
+            )
+            if self._wait_for_bridge_tcp("xenos bridge"):
+                self._log_bridge_capabilities()
+                return True
+            print(
+                "[CAMO] xenos bridge loaded but TCP dead — restart the game.",
                 flush=True,
             )
             return False
@@ -401,8 +448,10 @@ class CamoBridgeMixin:
                     f"(expected in {self._camo_bundle_dir()})",
                     flush=True,
                 )
+                return False
         except Exception as exc:
             print(f"[CAMO] extract failed: {exc}", flush=True)
+            return False
 
         dll = self._get_stable_dll_path()
         self._write_port_sidecar(dll, BRIDGE_FIXED_PORT)
@@ -417,92 +466,140 @@ class CamoBridgeMixin:
             print("[CAMO] restarting bridge controller (not responding on TCP)", flush=True)
             self.cleanup()
 
+        # Inject full SilentJMA bridge BEFORE controller (controller skips inject if TCP up).
+        if not self._try_direct_inject(BRIDGE_FIXED_PORT):
+            print(
+                "[CAMO] inject failed — run Peterhack as administrator.",
+                flush=True,
+            )
+            return False
+
+        for _ in range(30):
+            if self._resolve_bridge_port():
+                break
+            _t.sleep(0.5)
+
         print(
-            f"[CAMO] launching bridge controller (fixed port {BRIDGE_FIXED_PORT})...",
+            f"[CAMO] launching bridge controller (port {BRIDGE_FIXED_PORT})...",
             flush=True,
         )
+        print(f"[CAMO] runtime log dir: {self.RUNTIME_DIR}", flush=True)
         try:
             self._bridge_proc = _subprocess.Popen(
                 [
                     exe_path,
                     "--bridge-port", str(BRIDGE_FIXED_PORT),
                     "--bridge-host", self.BRIDGE_HOST,
+                    "--log-dir", self.RUNTIME_DIR,
                 ],
                 cwd=os.path.dirname(exe_path),
                 creationflags=CREATE_NO_WINDOW,
             )
         except Exception as exc:
             print(f"[CAMO] failed to launch controller: {exc}", flush=True)
+            if self._resolve_bridge_port():
+                self._log_bridge_capabilities()
+                return True
             return False
 
-        print("[CAMO] waiting for DLL inject + TCP...", flush=True)
-        inject_tried = False
-
-        for i in range(120):
-            if self._camo_aborted():
-                return False
-            _t.sleep(0.5)
-
-            if self._resolve_bridge_port():
-                print(f"[CAMO] bridge ready ({(i + 1) * 0.5:.1f}s)", flush=True)
-                return True
-
-            proc = getattr(self, "_bridge_proc", None)
-            if proc and proc.poll() is not None:
-                print(f"[CAMO] controller exited rc={proc.poll()}", flush=True)
-                break
-
-            status = self._read_last_status()
-            bridge = status.get("bridge") or {}
-            proc_info = status.get("process") or {}
-            if (
-                bridge.get("state") == "ready"
-                and bridge.get("port")
-                and proc_info.get("pid") == pid
-                and bridge.get("message") == "pong"
-            ):
-                port = int(bridge["port"])
-                self._bridge_port = port
-                print(f"[CAMO] bridge ready on port {port} (controller verified)", flush=True)
-                return True
-            if bridge.get("state") == "ready" and bridge.get("port"):
-                port = int(bridge["port"])
-                if self._ping_port(port):
-                    self._bridge_port = port
-                    print(f"[CAMO] bridge ready on port {port} (from status)", flush=True)
-                    return True
-
-            if i == 39 and not inject_tried:
-                inject_tried = True
-                last_err = status.get("last_error")
-                loaded_now, _ = self._bridge_dll_loaded()
-                if loaded_now:
-                    print(
-                        "[CAMO] bridge DLL loaded by controller — skipping direct inject",
-                        flush=True,
-                    )
-                elif bridge.get("state") != "ready" and not last_err:
-                    self._try_direct_inject(BRIDGE_FIXED_PORT)
-
-            if i > 0 and i % 8 == 7:
-                tried = self._discover_bridge_ports()
-                print(
-                    f"[CAMO] waiting for bridge TCP... {(i + 1) // 8}/15 "
-                    f"(probing ports: {tried[:5]})",
-                    flush=True,
-                )
-
-        if self._resolve_bridge_port():
+        print("[CAMO] waiting for bridge TCP...", flush=True)
+        if self._wait_for_bridge_tcp("bridge"):
+            self._log_bridge_capabilities()
             return True
 
         self._log_bridge_diagnostics()
         print(
             "[CAMO] failed to communicate with bridge DLL — "
-            "Peterhack could not reach the TCP server. "
-            "Run Peterhack as administrator (right-click Peterhack.bat → Run as administrator) "
-            "and retry Paint Now.",
+            "Run Peterhack as administrator and retry Paint Now.",
             flush=True,
         )
+        return False
+
+    @staticmethod
+    def _normalize_yaw_deg(yaw):
+        yaw = float(yaw) % 360.0
+        if yaw > 180.0:
+            yaw -= 360.0
+        return yaw
+
+    def _camo_save_view_rotation(self):
+        """Snapshot controller + pawn yaw for wrap restore."""
+        state = {}
+        if hasattr(self, "get_control_rotation"):
+            rot = self.get_control_rotation()
+            if rot:
+                state["control"] = rot
+        pawn = self._find_local_pawn() if hasattr(self, "_find_local_pawn") else 0
+        if pawn and hasattr(self, "get_actor_root_rotation"):
+            rot = self.get_actor_root_rotation(pawn)
+            if rot:
+                state["pawn"] = pawn
+                state["actor"] = rot
+        return state
+
+    def _camo_apply_view_yaw_delta(self, state, yaw_offset):
+        """Rotate camera + pawn to yaw_offset° from saved start (bridge uses ControlRotation)."""
+        if not state or yaw_offset is None:
+            return False
+        ok = False
+        if "control" in state and hasattr(self, "set_control_yaw"):
+            pitch, yaw, roll = state["control"]
+            ok = self.set_control_yaw(self._normalize_yaw_deg(yaw + yaw_offset)) or ok
+        pawn = state.get("pawn")
+        if pawn and "actor" in state and hasattr(self, "set_actor_root_yaw"):
+            pitch, yaw, roll = state["actor"]
+            ok = self.set_actor_root_yaw(
+                pawn, self._normalize_yaw_deg(yaw + yaw_offset),
+            ) or ok
+        return ok
+
+    def _camo_restore_view_rotation(self, state):
+        if not state:
+            return
+        if "control" in state and hasattr(self, "set_control_yaw"):
+            _pitch, yaw, _roll = state["control"]
+            self.set_control_yaw(yaw)
+        pawn = state.get("pawn")
+        if pawn and "actor" in state and hasattr(self, "set_actor_root_yaw"):
+            _pitch, yaw, _roll = state["actor"]
+            self.set_actor_root_yaw(pawn, yaw)
+
+    # Full wrap: sides first, then front (180°), then back (0° — ends facing forward).
+    CAMO_WRAP_YAW_PASSES = (
+        (90, "left"),
+        (270, "right"),
+        (180, "front"),
+        (0, "back"),
+    )
+
+    def _camo_rotate_to_yaw(self, target_yaw, label):
+        """Rotate to yaw offset from session start — bridge uses delta, native uses absolute."""
+        import time as _t
+
+        current = getattr(self, "_camo_yaw_offset", 0)
+        delta = int(target_yaw) - int(current)
+        if not delta:
+            return True
+
+        print(
+            f"[CAMO] rotate {label} target={target_yaw}° delta={delta}° (bridge)...",
+            flush=True,
+        )
+        rot_resp = self._bridge_request("rotate", {"yaw": delta}, timeout=10)
+        print(f"[CAMO] rotate response={rot_resp}", flush=True)
+        if rot_resp and rot_resp.get("success"):
+            _t.sleep(1.5)
+            self._camo_yaw_offset = target_yaw
+            return True
+
+        state = getattr(self, "_camo_view_state", None)
+        if state:
+            print("[CAMO] bridge rotate failed — native camera fallback...", flush=True)
+            if self._camo_apply_view_yaw_delta(state, target_yaw):
+                _t.sleep(1.5)
+                self._camo_yaw_offset = target_yaw
+                return True
+
         return False
 
     def _paint_payload(self, pid):
@@ -554,30 +651,42 @@ class CamoBridgeMixin:
             import time as _t
 
             payload = self._paint_payload(pid)
-            passes = [(0, "front")]
-            if full_wrap:
-                passes.append((180, "back"))
+            passes = (
+                list(self.CAMO_WRAP_YAW_PASSES) if full_wrap else [(0, "front")]
+            )
 
-            for pass_idx, (yaw, label) in enumerate(passes):
-                if self._camo_aborted():
-                    print("[CAMO] apply aborted", flush=True)
-                    return False
-                if yaw != 0:
-                    print(f"[CAMO] rotate {label} yaw={yaw}...", flush=True)
-                    rot_resp = self._bridge_request("rotate", {"yaw": yaw}, timeout=10)
-                    print(f"[CAMO] rotate response={rot_resp}", flush=True)
-                    _t.sleep(1.5)
+            self._camo_yaw_offset = 0
+            self._camo_view_state = self._camo_save_view_rotation() if full_wrap else None
+            try:
+                for pass_idx, (target_yaw, label) in enumerate(passes):
+                    if self._camo_aborted():
+                        print("[CAMO] apply aborted", flush=True)
+                        return False
+                    if target_yaw != self._camo_yaw_offset:
+                        if not self._camo_rotate_to_yaw(target_yaw, label):
+                            print(
+                                f"[CAMO] {label} pass rotate failed — aborting wrap "
+                                f"(earlier passes already applied)",
+                                flush=True,
+                            )
+                            self._finalize_camo_paint()
+                            return False
 
-                print(
-                    f"[CAMO] paint pass {pass_idx + 1}/{len(passes)} "
-                    f"({label}, port={self._bridge_port})...",
-                    flush=True,
-                )
-                resp = self._bridge_request("paint_full_route", payload, timeout=120)
-                print(f"[CAMO] paint response={resp}", flush=True)
-                if not resp or not resp.get("success", False):
-                    self._finalize_camo_paint()
-                    return False
+                    print(
+                        f"[CAMO] paint pass {pass_idx + 1}/{len(passes)} "
+                        f"({label}, port={self._bridge_port})...",
+                        flush=True,
+                    )
+                    resp = self._bridge_request("paint_full_route", payload, timeout=120)
+                    print(f"[CAMO] paint response={resp}", flush=True)
+                    if not resp or not resp.get("success", False):
+                        self._finalize_camo_paint()
+                        return False
+            finally:
+                if self._camo_view_state:
+                    self._camo_restore_view_rotation(self._camo_view_state)
+                    self._camo_view_state = None
+                    _t.sleep(0.3)
 
             self._finalize_camo_paint()
             print("[CAMO] apply complete", flush=True)

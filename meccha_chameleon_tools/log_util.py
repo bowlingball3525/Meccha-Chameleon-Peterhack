@@ -8,6 +8,7 @@ import threading
 import traceback
 
 LOG_DIR = r"C:\peterhack\logs"
+PETERHACK_ROOT = os.path.dirname(LOG_DIR)
 
 _log_files = []
 _session_path = None

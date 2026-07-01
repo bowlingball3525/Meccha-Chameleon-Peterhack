@@ -514,7 +514,7 @@ class Menu(QWidget):
         self._camo_busy = True
         wrap = bool(getattr(self.config, "camo_full_body_wrap", False))
         self.lbl_camo_status.setText(
-            "Painting (front + back)..." if wrap else "Painting..."
+            "Painting (360° wrap)..." if wrap else "Painting..."
         )
         self._camo_set_overlay_feedback("PAINTING...", 600)
         self._camo_thread = threading.Thread(target=self._camo_menu_worker, daemon=True)
@@ -1121,17 +1121,17 @@ class Menu(QWidget):
         self.cb_camo = self._chk("Enable Camouflage", "camouflage_enabled")
         lo.addWidget(self.cb_camo)
 
-        self.cb_camo_wrap = self._chk("Wrap around character (front + back)", "camo_full_body_wrap")
+        self.cb_camo_wrap = self._chk("Wrap around character (full 360°)", "camo_full_body_wrap")
         self.cb_camo_wrap.setToolTip(
             "Off: front-facing camouflage only (default).\n"
-            "On: rotate 180° and paint the back for full-body wrap."
+            "On: four passes — left side, right side, front, then back (ends facing forward)."
         )
         lo.addWidget(self.cb_camo_wrap)
 
         info = QLabel(
             "Fully automatic — launches bridge, injects DLL, and paints.\n"
             "Click Paint Now (optional F10 shortcut). F9 cancels.\n"
-            "Use Wrap when you want the environment painted on your back as well."
+            "Use Wrap for full-body camo including the sides of your character."
         )
         info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 0;")
         info.setWordWrap(True)
@@ -1509,7 +1509,7 @@ class Menu(QWidget):
             "  + Debounced player cache — no more random ESP flicker/off.\n"
             "\n"
             "[Camouflage — bridge wrap + native camera-facing]\n"
-            "  + Wrap ON: bridge multi-angle paint (front, rotate 180°, back).\n"
+            "  + Wrap ON: bridge 4-pass paint (left, right, front, back).\n"
             "  + Wrap OFF: native screen-sample + UV/import paint.\n"
             "  + Start / Stop Camouflage buttons; F9 stop (polled).\n"
             "  + Bundled camo/ binaries ship with Peterhack.\n"

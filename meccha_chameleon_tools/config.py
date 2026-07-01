@@ -81,7 +81,7 @@ class Config:
     camouflage_quality: int = 2        # legacy — now driven by paint_quality
     camouflage_opacity: int = 200
     camouflage_hide_local_body: bool = True  # hide local mesh during screen sampling
-    camo_full_body_wrap: bool = False        # bridge two-pass 360° (off = standard bridge camo)
+    camo_full_body_wrap: bool = False        # bridge 4-pass wrap: left/right/front/back
     paint_image_path: str = ""
     paint_image_opacity: int = 255
     paint_image_grid: int = 32
