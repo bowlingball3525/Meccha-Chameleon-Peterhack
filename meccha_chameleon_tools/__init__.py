@@ -185,6 +185,7 @@ def main():
 
     def _on_game_ready(esp):
         _esp_holder.append(esp)
+        esp.start_bridge_preload()
         from meccha_chameleon_tools.webhook import bind_webhook_config
         bind_webhook_config(esp, config)
         menu = Menu(config, esp)

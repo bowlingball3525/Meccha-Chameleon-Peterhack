@@ -14,6 +14,7 @@ class Config:
     enabled: bool = True
     dot_esp: bool = True
     box_esp: bool = False
+    corner_box: bool = False
     skeleton_esp: bool = False
     show_local: bool = True
     show_names: bool = True
@@ -21,6 +22,8 @@ class Config:
     show_distance: bool = True
     snap_lines: bool = True
     team_filter: bool = False
+    enemy_only: bool = False
+    show_roles: bool = True
     oof_arrow_radius: int = 0   # 0 = screen edge; otherwise px from center
     oof_show_names: bool = True
     oof_show_distance: bool = True
@@ -34,6 +37,8 @@ class Config:
     skeleton_color: Tuple[int, int, int] = (0, 255, 255)
     box_color: Tuple[int, int, int] = (255, 255, 255)
     radar_color: Tuple[int, int, int] = (255, 255, 255)
+    visible_color: Tuple[int, int, int] = (0, 255, 0)
+    not_visible_color: Tuple[int, int, int] = (128, 0, 128)
 
     # Sizing
     dot_radius: int = 8
@@ -87,6 +92,7 @@ class Config:
     camouflage_hide_local_body: bool = True  # hide local mesh during screen sampling
     camo_full_body_wrap: bool = True         # always 360° wrap (left/right/front/back)
     camo_skip_front_pass: bool = False       # skip front paint pass (flat maps only)
+    camo_back_pass_only: bool = False        # paint only the back orbit pass
     paint_image_path: str = ""
     paint_image_opacity: int = 255
     paint_image_grid: int = 32
@@ -113,7 +119,8 @@ class Config:
 
 
 _COLOR_KEYS = ("enemy_color", "local_color", "hunter_color", "survivor_color",
-               "skeleton_color", "box_color", "radar_color")
+               "skeleton_color", "box_color", "radar_color",
+               "visible_color", "not_visible_color")
 
 
 def config_to_dict(config: Config) -> dict:

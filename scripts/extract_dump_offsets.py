@@ -12,6 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "meccha_chameleon_tools" / "core.py"
 TRAINER = ROOT / "meccha_chameleon_tools" / "trainer.py"
 
+GLOBAL_PATCHES = {
+    "GWORLD_RVA": "OFFSET_GWORLD",
+}
+
+TRAINER_PATCHES = {
+    "RVA_PROCESS_EVENT": "OFFSET_PROCESSEVENT",
+}
+
 # Prefer C:\dumper-7 (user may typo as duper-7)
 DUMP_ROOTS = [Path(r"C:\dumper-7"), Path(r"C:\duper-7")]
 
@@ -48,6 +56,13 @@ LEGACY_SCAN = {
     "RVA_IMPORT_CHANNEL_LEGACY": "ImportChannelFromBytes",
     "RVA_BEGIN_STROKE_LEGACY": "BeginStroke",
     "RVA_END_STROKE_LEGACY": "EndStroke",
+}
+
+# Shift by PaintAtUV exec delta when live deep-worker scan is unavailable.
+LEGACY_ESTIMATE_CONSTS = LEGACY_SCAN.keys() | {
+    "RVA_IMPORT_RT_NATIVE",
+    "RVA_REQUEST_TEXTURE_SYNC",
+    "RVA_APPLY_PAINT_TO_MATERIAL",
 }
 
 
@@ -158,7 +173,16 @@ def collect_updates(dump: Path) -> dict[str, int]:
 
     updates: dict[str, int] = {"FNAMEPOOL_DELTA": gobjects - gnames}
 
+    for const, global_key in GLOBAL_PATCHES.items():
+        if global_key in globals_map:
+            updates[const] = globals_map[global_key]
+
+    for const, global_key in TRAINER_PATCHES.items():
+        if global_key in globals_map:
+            updates[const] = globals_map[global_key]
+
     func_rvas = {}
+    old_paint_at_uv = None
     for name in PAINT_FUNCS:
         entry = rpc_funcs.get(name)
         rva = parse_function_rva(entry)
@@ -166,19 +190,48 @@ def collect_updates(dump: Path) -> dict[str, int]:
             print(f"  {name} = NOT FOUND")
             continue
         func_rvas[name] = rva
+        if name == "PaintAtUV":
+            old_paint_at_uv = rva
         for const in EXEC_TO_CORE.get(name, ()):
             updates[const] = rva
 
-    updates.update(scan_legacy_workers(func_rvas))
+    scanned = scan_legacy_workers(func_rvas)
+    updates.update(scanned)
+
+    if not scanned and old_paint_at_uv is not None:
+        # Estimate legacy worker shift from PaintAtUV exec movement vs core.py anchor.
+        text = CORE.read_text(encoding="utf-8")
+        m = re.search(r"RVA_EXEC_PAINT_AT_UV\s*=\s*(0x[0-9A-Fa-f]+)", text)
+        if m:
+            prev_exec = int(m.group(1), 16)
+            delta = old_paint_at_uv - prev_exec
+            if delta:
+                print(f"[estimate] PaintAtUV exec delta=0x{delta:X} — shifting legacy workers")
+                for const in LEGACY_ESTIMATE_CONSTS:
+                    m2 = re.search(rf"{re.escape(const)}\s*=\s*(0x[0-9A-Fa-f]+)", text)
+                    if m2:
+                        updates[const] = int(m2.group(1), 16) + delta
+
     return updates
 
 
 def apply_updates(updates: dict[str, int]) -> None:
-    for path in (CORE,):
+    targets = (
+        (CORE, "core.py"),
+        (TRAINER, "trainer.py"),
+    )
+    for path, label in targets:
+        if not path.is_file():
+            continue
         text = path.read_text(encoding="utf-8")
         changed = []
         missing = []
         for name, value in sorted(updates.items()):
+            # Trainer only gets ProcessEvent; core gets everything else.
+            if path == TRAINER and name != "RVA_PROCESS_EVENT":
+                continue
+            if path == CORE and name == "RVA_PROCESS_EVENT":
+                continue
             text, ok = patch_const(text, name, value)
             if ok:
                 changed.append(f"  {name} = 0x{value:X}")
@@ -186,10 +239,10 @@ def apply_updates(updates: dict[str, int]) -> None:
                 missing.append(name)
         if changed:
             path.write_text(text, encoding="utf-8")
-            print(f"Patched {path.name}:")
+            print(f"Patched {label}:")
             print("\n".join(changed))
         if missing:
-            print(f"Not found in {path.name}: {', '.join(missing)}")
+            print(f"Not found in {label}: {', '.join(missing)}")
 
 
 def report(dump: Path, updates: dict[str, int]) -> None:
@@ -200,17 +253,24 @@ def report(dump: Path, updates: dict[str, int]) -> None:
         if k.startswith("OFFSET") or k.startswith("INDEX"):
             print(f"  {k} = 0x{v:X}")
 
-    text = CORE.read_text(encoding="utf-8")
-    print("\n=== core.py vs dump ===")
-    for name, new_val in sorted(updates.items()):
-        m = re.search(rf"{re.escape(name)}\s*=\s*(0x[0-9A-Fa-f]+)", text)
-        old = int(m.group(1), 16) if m else None
-        if old == new_val:
-            print(f"  {name}: OK (0x{new_val:X})")
-        elif old is None:
-            print(f"  {name}: NEW 0x{new_val:X}")
-        else:
-            print(f"  {name}: CHANGE 0x{old:X} -> 0x{new_val:X}")
+    for label, path in (("core.py", CORE), ("trainer.py", TRAINER)):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        print(f"\n=== {label} vs dump ===")
+        for name, new_val in sorted(updates.items()):
+            if label == "trainer.py" and name != "RVA_PROCESS_EVENT":
+                continue
+            if label == "core.py" and name == "RVA_PROCESS_EVENT":
+                continue
+            m = re.search(rf"{re.escape(name)}\s*=\s*(0x[0-9A-Fa-f]+)", text)
+            old = int(m.group(1), 16) if m else None
+            if old == new_val:
+                print(f"  {name}: OK (0x{new_val:X})")
+            elif old is None:
+                print(f"  {name}: NEW 0x{new_val:X}")
+            else:
+                print(f"  {name}: CHANGE 0x{old:X} -> 0x{new_val:X}")
 
 
 def main():

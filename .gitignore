@@ -34,5 +34,5 @@ Desktop.ini
 esp_config.json
 
 # Local dev (not shipped)
-runtime/
+runtime/.build/
 backup/

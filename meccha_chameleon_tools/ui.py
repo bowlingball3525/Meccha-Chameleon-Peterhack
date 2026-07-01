@@ -270,6 +270,51 @@ def draw_2d_box(painter, pos, camera, screen_w, screen_h,
     painter.drawRect(int(min_x), int(min_y), int(max_x - min_x), int(max_y - min_y))
 
 
+def draw_corner_box(painter, pos, camera, screen_w, screen_h,
+                    height_world, half_width_world, rot, color, scale=1.0, length_ratio=0.25):
+    """Draw a corner-only 2D bounding box."""
+    h = height_world * scale
+    hw = half_width_world * scale
+    corners_local = [
+        (-hw, 0, -hw), (-hw, 0, hw), (hw, 0, hw), (hw, 0, -hw),
+        (-hw, h, -hw), (-hw, h, hw), (hw, h, hw), (hw, h, -hw),
+    ]
+    pitch, yaw, _ = rot if rot else (0, 0, 0)
+    yaw_rad = math.radians(yaw)
+    cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
+    screen_points = []
+    for lx, ly, lz in corners_local:
+        rx = lx * cy - lz * sy
+        rz = lx * sy + lz * cy
+        wx = pos[0] + rx
+        wy = pos[1] + ly
+        wz = pos[2] + rz
+        s = w2s((wx, wy, wz), camera, screen_w, screen_h)
+        if s[2]:
+            screen_points.append(s[:2])
+    if len(screen_points) < 4:
+        return
+    xs = [p[0] for p in screen_points]
+    ys = [p[1] for p in screen_points]
+    min_x, max_x = int(min(xs)), int(max(xs))
+    min_y, max_y = int(min(ys)), int(max(ys))
+    bw = max_x - min_x
+    bh = max_y - min_y
+    if bw < 2 or bh < 2:
+        return
+    corner = max(4, int(min(bw, bh) * length_ratio))
+    pen = QPen(QColor(*color), 2)
+    painter.setPen(pen)
+    painter.drawLine(min_x, min_y, min_x + corner, min_y)
+    painter.drawLine(min_x, min_y, min_x, min_y + corner)
+    painter.drawLine(max_x - corner, min_y, max_x, min_y)
+    painter.drawLine(max_x, min_y, max_x, min_y + corner)
+    painter.drawLine(min_x, max_y - corner, min_x, max_y)
+    painter.drawLine(min_x, max_y, min_x + corner, max_y)
+    painter.drawLine(max_x - corner, max_y, max_x, max_y)
+    painter.drawLine(max_x, max_y, max_x, max_y - corner)
+
+
 def draw_skeleton(painter, bone_positions, camera, screen_w, screen_h, color):
     """Draw skeleton lines connecting bones."""
     bone_screen = {}
@@ -402,6 +447,8 @@ class Menu(QWidget):
     paint_job_finished = pyqtSignal(bool, str)
     paint_job_progress = pyqtSignal(int, int)
     camo_job_finished = pyqtSignal(bool)
+    bridge_exploit_finished = pyqtSignal(bool, str)
+    trainer_rename_finished = pyqtSignal(bool, str)
     update_check_failed = pyqtSignal(str)
 
     # Peter pants green sampled from logo — RGB(32, 96, 16)
@@ -479,6 +526,8 @@ class Menu(QWidget):
         self.paint_job_finished.connect(self._finish_paint_job, _queued)
         self.paint_job_progress.connect(self._on_paint_job_progress, _queued)
         self.camo_job_finished.connect(self._camo_menu_done, _queued)
+        self.bridge_exploit_finished.connect(self._bridge_exploit_done, _queued)
+        self.trainer_rename_finished.connect(self._trainer_rename_done, _queued)
         self.update_check_failed.connect(self._on_update_check_failed, _queued)
         self._paint_watchdog = QTimer(self)
         self._paint_watchdog.setSingleShot(True)
@@ -488,6 +537,8 @@ class Menu(QWidget):
         self._hotkeys_native = False
         self._camo_thread = None
         self._camo_busy = False
+        self._bridge_exploit_thread = None
+        self._bridge_exploit_busy = False
         self._stop_thread = None
         self._player_rows = []
         self._blocklist_entries = load_blocklist()
@@ -495,7 +546,51 @@ class Menu(QWidget):
         self._build_ui()
         self._player_list_timer = QTimer(self)
         self._player_list_timer.timeout.connect(self._refresh_players_tab)
+        self._bridge_preload_timer = QTimer(self)
+        self._bridge_preload_timer.timeout.connect(self._poll_bridge_preload)
+        self._watch_bridge_preload()
         self.setFixedSize(580, 820)
+
+    def _watch_bridge_preload(self):
+        ok = getattr(self.esp, "_bridge_preload_ok", None)
+        if ok is not None:
+            self._on_bridge_preload_done(bool(ok))
+            return
+        if not getattr(self.esp, "_bridge_preload_started", False):
+            return
+        if hasattr(self, "lbl_camo_status"):
+            self.lbl_camo_status.setText("Injecting bridge...")
+        if hasattr(self, "lbl_bridge_exploit_status"):
+            self.lbl_bridge_exploit_status.setText("Injecting bridge...")
+        self._bridge_preload_timer.start(400)
+
+    def _poll_bridge_preload(self):
+        ok = getattr(self.esp, "_bridge_preload_ok", None)
+        thread = getattr(self.esp, "_bridge_preload_thread", None)
+        if ok is None and thread and thread.is_alive():
+            return
+        self._bridge_preload_timer.stop()
+        self._on_bridge_preload_done(bool(ok))
+
+    def _on_bridge_preload_done(self, ok):
+        if hasattr(self, "lbl_camo_status"):
+            if ok:
+                self.lbl_camo_status.setText("Bridge ready — click Paint Now")
+            else:
+                err = getattr(self.esp, "_camo_last_error", None) or "inject failed"
+                short = err if len(err) <= 100 else err[:97] + "..."
+                self.lbl_camo_status.setText(f"Bridge failed — {short}")
+        if hasattr(self, "lbl_bridge_exploit_status"):
+            if ok:
+                self.lbl_bridge_exploit_status.setText("Bridge ready.")
+            else:
+                err = getattr(self.esp, "_camo_last_error", None) or "inject failed"
+                short = err if len(err) <= 100 else err[:97] + "..."
+                self.lbl_bridge_exploit_status.setText(f"Bridge failed — {short}")
+        if ok and getattr(self.config, "trainer_anti_kick", False):
+            self.esp._anti_kick_bridge_state = None
+            if hasattr(self.esp, "_sync_anti_kick_bridge"):
+                self.esp._sync_anti_kick_bridge(True, self.config)
 
     def attach_overlay(self, overlay):
         self._overlay = overlay
@@ -557,6 +652,131 @@ class Menu(QWidget):
             2000,
             lambda: self.lbl_camo_status.setText("Ready — click Paint Now"),
         )
+
+    def _update_bridge_exploit_buttons(self):
+        busy = bool(getattr(self, "_bridge_exploit_busy", False))
+        for attr in ("btn_tp_fill", "btn_tp_go", "btn_bridge_kill"):
+            btn = getattr(self, attr, None)
+            if btn:
+                btn.setEnabled(not busy)
+
+    def _fill_teleport_coords(self):
+        world = self.esp._get_world()
+        local_pc = self.esp._get_local_controller(world) if world else 0
+        local_pawn = (
+            rp(self.esp.pm, local_pc + self.esp.offsets["APlayerController::AcknowledgedPawn"])
+            if local_pc else 0
+        )
+        pos = self.esp.get_actor_root_pos(local_pawn) if local_pawn else None
+        if not pos:
+            self.lbl_bridge_exploit_status.setText("No local position — join a match first.")
+            return
+        self.spn_tp_x.setValue(float(pos[0]))
+        self.spn_tp_y.setValue(float(pos[1]))
+        self.spn_tp_z.setValue(float(pos[2]))
+        self.lbl_bridge_exploit_status.setText(
+            f"Filled ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+        )
+
+    def _run_trainer_rename(self):
+        if getattr(self, "_trainer_rename_busy", False):
+            return
+        if getattr(self, "_trainer_rename_thread", None) and self._trainer_rename_thread.is_alive():
+            return
+        name = self.txt_trainer_rename.text().strip()[:32]
+        if not name:
+            self.lbl_trainer_rename_status.setText("Enter a name first.")
+            return
+        self.config.trainer_rename_text = name
+        self._trainer_rename_busy = True
+        self.btn_trainer_rename.setEnabled(False)
+        self.lbl_trainer_rename_status.setText(f"Renaming to '{name}'...")
+        self._trainer_rename_thread = threading.Thread(
+            target=self._trainer_rename_worker,
+            args=(name,),
+            daemon=True,
+        )
+        self._trainer_rename_thread.start()
+
+    def _trainer_rename_worker(self, name):
+        ok = False
+        msg = "Rename failed."
+        try:
+            ok, msg = self.esp.trainer_rename_now(name, self.config, force=True)
+            if not msg:
+                msg = "Renamed." if ok else "Rename failed."
+        except Exception as exc:
+            msg = str(exc)
+            ok = False
+        self.trainer_rename_finished.emit(ok, msg)
+
+    def _trainer_rename_done(self, ok, msg):
+        self._trainer_rename_busy = False
+        self._trainer_rename_thread = None
+        self.btn_trainer_rename.setEnabled(True)
+        short = msg if len(msg) <= 140 else msg[:137] + "..."
+        self.lbl_trainer_rename_status.setText(("OK — " if ok else "Failed — ") + short)
+
+    def _run_bridge_teleport(self):
+        if getattr(self, "_bridge_exploit_busy", False):
+            return
+        if self._bridge_exploit_thread and self._bridge_exploit_thread.is_alive():
+            return
+        x = float(self.spn_tp_x.value())
+        y = float(self.spn_tp_y.value())
+        z = float(self.spn_tp_z.value())
+        self._bridge_exploit_busy = True
+        self.lbl_bridge_exploit_status.setText(f"Teleporting to ({x:.1f}, {y:.1f}, {z:.1f})...")
+        self._update_bridge_exploit_buttons()
+        self._bridge_exploit_thread = threading.Thread(
+            target=self._bridge_exploit_worker,
+            args=("teleport", x, y, z),
+            daemon=True,
+        )
+        self._bridge_exploit_thread.start()
+
+    def _run_bridge_kill(self):
+        if getattr(self, "_bridge_exploit_busy", False):
+            return
+        if self._bridge_exploit_thread and self._bridge_exploit_thread.is_alive():
+            return
+        self._bridge_exploit_busy = True
+        self.lbl_bridge_exploit_status.setText("Killing local player via bridge...")
+        self._update_bridge_exploit_buttons()
+        self._bridge_exploit_thread = threading.Thread(
+            target=self._bridge_exploit_worker,
+            args=("kill",),
+            daemon=True,
+        )
+        self._bridge_exploit_thread.start()
+
+    def _bridge_exploit_worker(self, kind, x=0.0, y=0.0, z=0.0):
+        ok = False
+        msg = "Bridge not ready — wait for auto-inject or retry."
+        try:
+            if not self.esp._ensure_bridge():
+                err = getattr(self.esp, "_camo_last_error", None)
+                if err:
+                    msg = err
+            elif kind == "teleport":
+                ok = self.esp.bridge_teleport(x, y, z)
+                msg = "Teleported." if ok else (getattr(self.esp, "_camo_last_error", None) or "Teleport failed.")
+            elif kind == "kill":
+                ok = self.esp.bridge_kill(enemies=False)
+                msg = "Kill sent." if ok else (getattr(self.esp, "_camo_last_error", None) or "Kill failed.")
+            else:
+                msg = f"Unknown bridge command: {kind}"
+        except Exception as exc:
+            msg = str(exc)
+            ok = False
+        self.bridge_exploit_finished.emit(ok, msg)
+
+    def _bridge_exploit_done(self, ok, msg):
+        self._bridge_exploit_busy = False
+        self._bridge_exploit_thread = None
+        short = msg if len(msg) <= 140 else msg[:137] + "..."
+        self.lbl_bridge_exploit_status.setText(("OK — " if ok else "Failed — ") + short)
+        self._update_bridge_exploit_buttons()
 
     def _stop_camo_now(self):
         """Stop camo — bridge cancel_paint (F9 / Stop button)."""
@@ -826,14 +1046,14 @@ class Menu(QWidget):
             QScrollBar:vertical {{ width: 0px; }}
             QScrollBar:horizontal {{ height: 0px; }}
         """)
-        self.tab_list.addItems(["VISUALS","PLAYERS","RADAR","AIMBOT","EXPLOITS","COLORS","CAMOUFLAGE","CHANGELOG"])
+        self.tab_list.addItems(["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","CHANGELOG"])
         self.tab_list.currentRowChanged.connect(self._switch_tab)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background: transparent;")
 
         self._pages = {}
-        for tab_name in ["VISUALS","PLAYERS","RADAR","AIMBOT","EXPLOITS","COLORS","CAMOUFLAGE","CHANGELOG"]:
+        for tab_name in ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","CHANGELOG"]:
             page = QWidget()
             page.setStyleSheet("background: transparent;")
             self._pages[tab_name] = page
@@ -882,16 +1102,16 @@ class Menu(QWidget):
 
         # Build each tab page
         self._build_visuals_tab()
+        self._build_colors_tab()
         self._build_players_tab()
         self._build_radar_tab()
         self._build_aimbot_tab()
         self._build_trainer_tab()
-        self._build_colors_tab()
         self._build_camouflage_tab()
         self._build_changelog_tab()
 
     def _switch_tab(self, idx):
-        names = ["VISUALS","PLAYERS","RADAR","AIMBOT","EXPLOITS","COLORS","CAMOUFLAGE","CHANGELOG"]
+        names = ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","CHANGELOG"]
         if 0 <= idx < len(names):
             self.stack.setCurrentIndex(idx)
             if names[idx] == "PLAYERS":
@@ -915,15 +1135,18 @@ class Menu(QWidget):
         row.setSpacing(6)
         self.cb_dot = self._chk("Dot","dot_esp")
         self.cb_box = self._chk("2D Box","box_esp")
+        self.cb_corner = self._chk("Corner Box","corner_box")
         self.cb_skeleton = self._chk("Skeleton","skeleton_esp")
         row.addWidget(self.cb_dot)
         row.addWidget(self.cb_box)
+        row.addWidget(self.cb_corner)
         row.addWidget(self.cb_skeleton)
         lo.addLayout(row)
         for cfg, label in [("show_local","Show Local Player"), ("show_names","Show Names"),
                            ("show_steam_id","Show Steam ID"), ("show_distance","Show Distance"),
-                           ("snap_lines","Snap Lines"),
-                           ("team_filter","Team Filter"), ("distance_scaling","Dist. Scaling")]:
+                           ("show_roles","Show Roles"), ("snap_lines","Snap Lines"),
+                           ("team_filter","Team Filter"), ("enemy_only","Enemy Only"),
+                           ("distance_scaling","Dist. Scaling")]:
             cb = self._chk(label, cfg)
             lo.addWidget(cb)
         dr = QHBoxLayout()
@@ -1254,8 +1477,10 @@ class Menu(QWidget):
         lo.setSpacing(4)
         self.cb_aimbot = self._chk("Aimbot Enabled","aimbot_enabled")
         self.cb_aim_fov = self._chk("Show FOV Circle","aimbot_show_fov")
+        self.cb_aim_visible = self._chk("Visible targets only","aimbot_visible_check")
         lo.addWidget(self.cb_aimbot)
         lo.addWidget(self.cb_aim_fov)
+        lo.addWidget(self.cb_aim_visible)
         kr = QHBoxLayout()
         self.lbl_aim_key = QLabel("Aim Key: " + self.config.aimbot_key)
         self.btn_record_key = QPushButton("Record Key")
@@ -1327,7 +1552,16 @@ class Menu(QWidget):
         lo.addLayout(dr)
 
         lo.addWidget(self._chk("Anti-Clipping (noclip)", "trainer_anti_clipping"))
-        lo.addWidget(self._chk("Anti-Kick (watchdog)", "trainer_anti_kick"))
+        cb_anti_kick = self._chk("Anti-Kick", "trainer_anti_kick")
+        cb_anti_kick.setToolTip(
+            "Blocks host kick RPCs via bridge (ClientWasKicked, return-to-menu, Kick, etc.).\n"
+            "Auto-scans PlayerController/PlayerState for kick/ban/disconnect RPCs.\n"
+            "Blocked kicks are logged to C:\\peterhack\\logs\\anti_kick.log and latest.log.\n"
+            "Requires bridge injected. Chains with UE4SS when detected.\n"
+            "If enable crashes the game, toggle off, fully quit/relaunch, then retry.\n"
+            "EOS/platform-level kicks may still disconnect you."
+        )
+        lo.addWidget(cb_anti_kick)
         lo.addWidget(self._chk("Auto-Rename", "trainer_auto_rename"))
 
         rr = QHBoxLayout()
@@ -1335,13 +1569,85 @@ class Menu(QWidget):
         self.txt_trainer_rename = QLineEdit(self.config.trainer_rename_text)
         self.txt_trainer_rename.setMaxLength(32)
         self.txt_trainer_rename.setToolTip(
-            "Sets your in-game display name (CustomPlayerName), not your Steam username."
+            "Calls SetName(Server) on your PlayerState — replicates CustomPlayerName\n"
+            "so the nameplate above your character updates for everyone."
         )
         self.txt_trainer_rename.textChanged.connect(
             lambda t: setattr(self.config, "trainer_rename_text", t.strip())
         )
+        self.txt_trainer_rename.returnPressed.connect(self._run_trainer_rename)
         rr.addWidget(self.txt_trainer_rename)
+        self.btn_trainer_rename = QPushButton("Rename")
+        self.btn_trainer_rename.setToolTip(
+            "Send SetName(Server) once via bridge.\n"
+            "Works in lobby without Auto-Rename enabled."
+        )
+        self.btn_trainer_rename.clicked.connect(self._run_trainer_rename)
+        rr.addWidget(self.btn_trainer_rename)
         lo.addLayout(rr)
+        self.lbl_trainer_rename_status = QLabel("")
+        self.lbl_trainer_rename_status.setWordWrap(True)
+        self.lbl_trainer_rename_status.setStyleSheet("color: #6a8a5a; font-size: 10px;")
+        lo.addWidget(self.lbl_trainer_rename_status)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #2a4a1a;")
+        lo.addWidget(sep)
+
+        bridge_hdr = QLabel("Bridge commands (in-game DLL)")
+        bridge_hdr.setStyleSheet("font-size: 12px; font-weight: bold; color: #7ec850; padding: 4px 0 0 0;")
+        lo.addWidget(bridge_hdr)
+
+        bridge_hint = QLabel(
+            "Teleport and kill use the camo bridge over localhost TCP.\n"
+            "Bridge auto-injects when Peterhack connects to the game."
+        )
+        bridge_hint.setWordWrap(True)
+        bridge_hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
+        lo.addWidget(bridge_hint)
+
+        tp_row = QHBoxLayout()
+        tp_row.addWidget(QLabel("X:"))
+        self.spn_tp_x = QDoubleSpinBox()
+        self.spn_tp_x.setRange(-100000.0, 100000.0)
+        self.spn_tp_x.setDecimals(1)
+        self.spn_tp_x.setSingleStep(100.0)
+        tp_row.addWidget(self.spn_tp_x)
+        tp_row.addWidget(QLabel("Y:"))
+        self.spn_tp_y = QDoubleSpinBox()
+        self.spn_tp_y.setRange(-100000.0, 100000.0)
+        self.spn_tp_y.setDecimals(1)
+        self.spn_tp_y.setSingleStep(100.0)
+        tp_row.addWidget(self.spn_tp_y)
+        tp_row.addWidget(QLabel("Z:"))
+        self.spn_tp_z = QDoubleSpinBox()
+        self.spn_tp_z.setRange(-100000.0, 100000.0)
+        self.spn_tp_z.setDecimals(1)
+        self.spn_tp_z.setSingleStep(100.0)
+        tp_row.addWidget(self.spn_tp_z)
+        lo.addLayout(tp_row)
+
+        tp_btns = QHBoxLayout()
+        self.btn_tp_fill = QPushButton("Use My Position")
+        self.btn_tp_fill.clicked.connect(self._fill_teleport_coords)
+        tp_btns.addWidget(self.btn_tp_fill)
+        self.btn_tp_go = QPushButton("Teleport")
+        self.btn_tp_go.clicked.connect(self._run_bridge_teleport)
+        tp_btns.addWidget(self.btn_tp_go)
+        lo.addLayout(tp_btns)
+
+        kill_row = QHBoxLayout()
+        self.btn_bridge_kill = QPushButton("Kill Self")
+        self.btn_bridge_kill.setToolTip("Destroys local pawn via bridge K2_DestroyActor / damage fallback.")
+        self.btn_bridge_kill.clicked.connect(self._run_bridge_kill)
+        kill_row.addWidget(self.btn_bridge_kill)
+        lo.addLayout(kill_row)
+
+        self.lbl_bridge_exploit_status = QLabel("")
+        self.lbl_bridge_exploit_status.setWordWrap(True)
+        self.lbl_bridge_exploit_status.setStyleSheet("color: #aaa; font-size: 10px;")
+        lo.addWidget(self.lbl_bridge_exploit_status)
 
         lo.addStretch()
 
@@ -1360,11 +1666,17 @@ class Menu(QWidget):
         self.btn_enemy_color.clicked.connect(lambda: self._pick_color("enemy_color"))
         self.btn_skeleton_color = QPushButton("Skeleton Color")
         self.btn_skeleton_color.clicked.connect(lambda: self._pick_color("skeleton_color"))
+        self.btn_visible_color = QPushButton("Visible (Enemy Only mode)")
+        self.btn_visible_color.clicked.connect(lambda: self._pick_color("visible_color"))
+        self.btn_not_visible_color = QPushButton("Not Visible (Enemy Only mode)")
+        self.btn_not_visible_color.clicked.connect(lambda: self._pick_color("not_visible_color"))
         lo.addWidget(self.btn_local_color)
         lo.addWidget(self.btn_hunter_color)
         lo.addWidget(self.btn_survivor_color)
         lo.addWidget(self.btn_enemy_color)
         lo.addWidget(self.btn_skeleton_color)
+        lo.addWidget(self.btn_visible_color)
+        lo.addWidget(self.btn_not_visible_color)
         lo.addStretch()
 
     def _build_camouflage_tab(self):
@@ -1378,7 +1690,8 @@ class Menu(QWidget):
         lo.addWidget(hdr)
 
         info = QLabel(
-            "Fully automatic — 4-pass wrap: front → left → right → back.\n"
+            "Fully automatic — 6-pass wrap: front → left → right → back, "
+            "then head/shoulders + inner legs.\n"
             "Camera angles are computed dynamically from your pose (any angle/emote).\n"
             "Noclip on front pass when not standing upright.\n"
             "Click Paint Now or press F10. F9 cancels. Camera only — pawn does not spin."
@@ -1422,7 +1735,31 @@ class Menu(QWidget):
         )
         lo.addWidget(skip_front)
 
-        self.lbl_camo_status = QLabel("Ready — click Paint Now")
+        back_only = self._chk("Back pass only", "camo_back_pass_only")
+        back_only.setToolTip(
+            "Paint only the back-facing orbit pass (spine).\n"
+            "Skips front, sides, and detail passes — fastest option for back-panel touch-ups."
+        )
+        lo.addWidget(back_only)
+
+        def _sync_camo_pass_toggles(_state=0):
+            if back_only.isChecked():
+                skip_front.blockSignals(True)
+                skip_front.setChecked(False)
+                skip_front.blockSignals(False)
+                self.config.camo_skip_front_pass = False
+            elif skip_front.isChecked():
+                back_only.blockSignals(True)
+                back_only.setChecked(False)
+                back_only.blockSignals(False)
+                self.config.camo_back_pass_only = False
+            self.config.camo_skip_front_pass = skip_front.isChecked()
+            self.config.camo_back_pass_only = back_only.isChecked()
+
+        skip_front.stateChanged.connect(_sync_camo_pass_toggles)
+        back_only.stateChanged.connect(_sync_camo_pass_toggles)
+
+        self.lbl_camo_status = QLabel("Injecting bridge...")
         self.lbl_camo_status.setStyleSheet("color: #888; font-size: 10px; padding: 4px 0;")
         lo.addWidget(self.lbl_camo_status)
 
@@ -1784,6 +2121,62 @@ class Menu(QWidget):
             "\n"
             "--- Jul 1, 2026 (latest) ---\n"
             "\n"
+            "[Anti-Kick — vtable hook + kick logger]\n"
+            "  + Replaced global ProcessEvent inline patch with vtable hooks on\n"
+            "    PlayerController, PlayerState, and NetConnection (UE4SS-safe).\n"
+            "  + Blocks Kick, ClientWasKicked, return-to-menu RPCs, and\n"
+            "    NetConnection Close / disconnect-style calls.\n"
+            "  + Auto-scans kick-like function names on local objects.\n"
+            "  + Kick blocks logged to C:\\peterhack\\logs\\anti_kick.log;\n"
+            "    trainer polls get_anti_kick_log over bridge TCP.\n"
+            "  + Auto-refreshes hook targets when controller/player state\n"
+            "    pointers change (lobby → match spawn).\n"
+            "  + Note: pure EOS/Redpoint platform kicks may still drop the\n"
+            "    socket even when UE RPCs are blocked.\n"
+            "\n"
+            "[Rename — manual button + safer bridge path]\n"
+            "  + Rename button + Enter key beside \"Rename to:\" field.\n"
+            "  + set_player_name runs SetName(Server) on the game thread\n"
+            "    via bridge (no unsafe remote ProcessEvent from Python).\n"
+            "  + Auto-Rename debounced 1.5 s; works in lobby as non-host.\n"
+            "\n"
+            "[Camouflage — back pass only + yaw fix]\n"
+            "  + Back pass only toggle (mutually exclusive with skip front).\n"
+            "  + Fixed front/back yaw swap (camera pullback math).\n"
+            "\n"
+            "[Bridge source now in repo]\n"
+            "  + runtime/src/bridge.cpp, injector, sdk.hpp, build.ps1 tracked\n"
+            "    on GitHub (runtime/.build/ still gitignored).\n"
+            "\n"
+            "[Built with AI]\n"
+            "  + This release was developed with Cursor AI Composer 2.5.\n"
+            "\n"
+            "[Offsets — Jul 1, 2026 game update]\n"
+            "  + Dumper-7 dump 5.6.1-44394996 (Jul 1): GWorld, ProcessEvent,\n"
+            "    all URuntimePaintableComponent exec RVAs, legacy worker estimates.\n"
+            "  + Run scripts/extract_dump_offsets.py --apply after future dumps.\n"
+            "\n"
+            "[Camouflage — SilentJMA feature parity]\n"
+            "  + Corner Box ESP, Enemy Only filter, Show Roles toggle.\n"
+            "  + Visible / Not Visible colors (Enemy Only mode).\n"
+            "  + Aimbot visible check wired to _is_visible().\n"
+            "  + Bridge helpers: bridge_teleport, bridge_set_fov, bridge_kill, bridge_sdk_probe.\n"
+            "  + Bridge auto-injects on game connect (no Paint Now required first).\n"
+            "\n"
+            "[Camouflage — color/UV alignment fix]\n"
+            "  + Bridge stores mesh hit world positions from HitTestAtScreenPosition.\n"
+            "  + Scene-capture colors sampled via capture-camera projection (not player\n"
+            "    screen coords) — fixes off-center / wrong-color camo, especially on\n"
+            "    body-anchored front and inner-legs passes.\n"
+            "  + Capture FOV synced to player camera; torso-centered body anchor.\n"
+            "  + Camera settle raised to 2.0 s per pass.\n"
+            "\n"
+            "[Camouflage — detail passes for head/inner legs]\n"
+            "  + Two extra passes after the 4 orbit passes (6 total):\n"
+            "      head_shoulders — downward front tilt (head crown + shoulders)\n"
+            "      inner_legs — upward front tilt (crotch + inner thighs)\n"
+            "  + Body-anchored capture on steep inner_legs pass (emote/prone).\n"
+            "\n"
             "[Camouflage — dynamic orbit + front pass options]\n"
             "  + Dynamic camera orbit from pawn root + view (any angle/emote).\n"
             "  + Pass order: front → left → right → back (back last).\n"
@@ -1813,6 +2206,9 @@ class Menu(QWidget):
             "\n"
             "[EXPLOITS tab]\n"
             "  + No Gun CD, No Recoil, decoy toggles, noclip, auto-rename.\n"
+            "  + Anti-Kick blocks host kick RPCs via bridge ProcessEvent hook.\n"
+            "  + Auto-Rename uses SetName(Server) RPC (replicated nameplate).\n"
+            "  + Bridge Teleport + Kill Self (bridge auto-injects on connect).\n"
             "  + Debug logging to latest.log ([TRAINER:TAG] lines).\n"
             "\n"
             "[Logging / paint stability]\n"
@@ -3476,6 +3872,7 @@ class Overlay(QWidget):
             all_players = self.esp.get_players(
                 include_local=self.config.show_local,
                 team_filter=self.config.team_filter,
+                enemy_only=self.config.enemy_only,
             )
 
             # Get local player position for radar
@@ -3514,12 +3911,18 @@ class Overlay(QWidget):
                     is_hunter = pdata.get("is_hunter")
                     steam_id = (pdata.get("steam_id") or "").strip()
                     blocked = self.esp.is_blocked_steam_id(steam_id)
-                    if is_hunter is True:
+                    if self.config.enemy_only:
+                        visible = self.esp._is_visible(actor)
+                        base_color = (
+                            self.config.visible_color if visible
+                            else self.config.not_visible_color
+                        )
+                    elif is_hunter is True:
                         base_color = self.config.hunter_color
                     elif is_hunter is False:
                         base_color = self.config.survivor_color
                     else:
-                        base_color = self.config.enemy_color  # unknown team fallback
+                        base_color = self.config.enemy_color
 
                     color = (255, 140, 60) if blocked else base_color
 
@@ -3582,11 +3985,14 @@ class Overlay(QWidget):
                     self._draw_dot(painter, dsx, dsy, max(2, radius), color)
 
                 # 2D Box ESP
-                if self.config.box_esp:
-                    rot = self.esp.get_actor_root_rotation(actor) if actor else None
-                    hw = self.config.box_height_world / 3.0
+                rot = self.esp.get_actor_root_rotation(actor) if actor else None
+                hw = self.config.box_height_world / 3.0
+                if self.config.box_esp and not self.config.corner_box:
                     draw_2d_box(painter, pos, cam, w, h,
                                 self.config.box_height_world, hw, rot, color, scale)
+                if self.config.corner_box:
+                    draw_corner_box(painter, pos, cam, w, h,
+                                    self.config.box_height_world, hw, rot, color, scale)
 
                 # Skeleton ESP — isolated so bone-read failures never affect dot/box/labels
                 if self.config.skeleton_esp and actor and not is_local:
@@ -3617,6 +4023,10 @@ class Overlay(QWidget):
 
                 # Labels
                 label_parts = []
+                if self.config.show_roles and not is_local:
+                    is_hunter = pdata.get("is_hunter")
+                    role_str = "Hunter" if is_hunter is True else ("Survivor" if is_hunter is False else "?")
+                    label_parts.append(role_str)
                 if self.config.show_names:
                     if is_local:
                         label_parts.append("YOU")
@@ -3625,8 +4035,8 @@ class Overlay(QWidget):
                         player_name = pdata.get("player_name", "").strip()
                         team_str    = "Hunter" if is_hunter is True else ("Survivor" if is_hunter is False else "Player")
                         if player_name:
-                            label_parts.append(f"[{team_str}] {player_name}")
-                        else:
+                            label_parts.append(f"[{team_str}] {player_name}" if not self.config.show_roles else player_name)
+                        elif not self.config.show_roles:
                             label_parts.append(f"[{team_str}]")
                 steam_id = (pdata.get("steam_id") or "").strip()
                 if not is_local and self.esp.is_blocked_steam_id(steam_id):
@@ -3742,9 +4152,15 @@ class Overlay(QWidget):
         cam_loc = camera["loc"]
         best_dist = float("inf")
         best_target = None
-        for pdata in self.esp.get_players(include_local=False, team_filter=self.config.team_filter):
+        for pdata in self.esp.get_players(
+            include_local=False,
+            team_filter=self.config.team_filter,
+            enemy_only=self.config.enemy_only,
+        ):
             actor = pdata.get("actor")
             if not actor or actor == local_pawn or pdata.get("is_local"):
+                continue
+            if self.config.aimbot_visible_check and not self.esp._is_visible(actor):
                 continue
             pos = pdata["pos"]
             if local_pos and dist(pos, local_pos) < 150.0:

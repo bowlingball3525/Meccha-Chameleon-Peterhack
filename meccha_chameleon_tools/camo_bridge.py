@@ -10,12 +10,14 @@ import os
 import sys
 import glob
 import ctypes
+import threading
 import subprocess as _subprocess
 
 from meccha_chameleon_tools.log_util import PETERHACK_ROOT
 
 CREATE_NO_WINDOW = 0x08000000
-BRIDGE_PING_TIMEOUT = 1.0
+BRIDGE_PING_TIMEOUT = 2.5
+BRIDGE_PING_RETRIES = 3
 BRIDGE_FIXED_PORT = 47654
 
 
@@ -199,7 +201,7 @@ class CamoBridgeMixin:
             separators=(",", ":"),
         ) + "\n"
 
-    def _bridge_request_on_port(self, port, command, payload=None, timeout=30):
+    def _bridge_request_on_port(self, port, command, payload=None, timeout=30, quiet=False):
         import socket as _socket
 
         connect_timeout = min(1.5, max(0.4, float(timeout) * 0.15))
@@ -219,7 +221,8 @@ class CamoBridgeMixin:
             line = raw.split(b"\n")[0]
             return json.loads(line) if line else {"success": False, "message": "empty bridge response"}
         except Exception as exc:
-            print(f"[CAMO] bridge {command} failed: {exc}", flush=True)
+            if not quiet:
+                print(f"[CAMO] bridge {command} failed: {exc}", flush=True)
             return {"success": False, "message": str(exc)}
         finally:
             sock.close()
@@ -235,13 +238,24 @@ class CamoBridgeMixin:
             and response.get("message") == "pong"
         )
 
-    def _ping_port(self, port, timeout=BRIDGE_PING_TIMEOUT):
-        resp = self._bridge_request_on_port(port, "ping", timeout=timeout)
+    def _ping_port(self, port, timeout=BRIDGE_PING_TIMEOUT, quiet=False):
+        resp = self._bridge_request_on_port(port, "ping", timeout=timeout, quiet=quiet)
         return self._bridge_response_ok(resp)
 
     def _resolve_bridge_port(self):
         """Find the live bridge TCP port (controller uses dynamic ports)."""
+        import time as _t
+
+        cached = getattr(self, "_bridge_port", None)
+        if cached:
+            for attempt in range(BRIDGE_PING_RETRIES):
+                if self._ping_port(cached, quiet=attempt > 0):
+                    return cached
+                if attempt + 1 < BRIDGE_PING_RETRIES:
+                    _t.sleep(0.25)
         for port in self._discover_bridge_ports():
+            if cached and port == cached:
+                continue
             if self._ping_port(port):
                 if getattr(self, "_bridge_port", None) != port:
                     print(f"[CAMO] bridge TCP on 127.0.0.1:{port}", flush=True)
@@ -601,8 +615,38 @@ class CamoBridgeMixin:
             print(f"[CAMO] direct inject exception: {exc}", flush=True)
         return False
 
+    def start_bridge_preload(self):
+        """Inject bridge DLL in the background when Peterhack attaches to the game."""
+        if getattr(self, "_bridge_preload_started", False):
+            return
+        self._bridge_preload_started = True
+        self._bridge_preload_ok = None
+
+        def _worker():
+            print("[CAMO] auto-injecting bridge on connect...", flush=True)
+            ok = self._ensure_bridge()
+            self._bridge_preload_ok = ok
+            if ok:
+                print("[CAMO] bridge preload ready", flush=True)
+            else:
+                err = getattr(self, "_camo_last_error", None) or "unknown error"
+                print(f"[CAMO] bridge preload failed: {err}", flush=True)
+
+        self._bridge_preload_thread = threading.Thread(
+            target=_worker, daemon=True, name="bridge-preload",
+        )
+        self._bridge_preload_thread.start()
+
     def _ensure_bridge(self):
         """Ensure meccha-xenos-bridge.dll is loaded — the only in-game bridge we use."""
+        lock = getattr(self, "_bridge_ensure_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._bridge_ensure_lock = lock
+        with lock:
+            return self._ensure_bridge_impl()
+
+    def _ensure_bridge_impl(self):
         import time as _t
 
         if not getattr(self, "pm", None) or not self.pm.process_id:
@@ -610,7 +654,6 @@ class CamoBridgeMixin:
             return False
 
         self._stop_legacy_camo_controller()
-        self._bridge_port = None
         self._camo_last_error = None
 
         loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
@@ -618,6 +661,7 @@ class CamoBridgeMixin:
 
         ready = tcp_ok and has_xenos and not has_runtime
         if ready:
+            self._bridge_last_ok_ts = _t.time()
             print("[CAMO] meccha-xenos-bridge ready (TCP)", flush=True)
             self._log_bridge_capabilities()
             return True
@@ -642,6 +686,13 @@ class CamoBridgeMixin:
             reasons.append("xenos TCP dead")
         if loaded and not has_xenos:
             reasons.append("unknown bridge")
+        last_ok = getattr(self, "_bridge_last_ok_ts", 0.0)
+        if has_xenos and not tcp_ok and last_ok and (_t.time() - last_ok) < 8.0:
+            print("[CAMO] bridge TCP dropped briefly — waiting for listener...", flush=True)
+            if self._wait_for_bridge_tcp("bridge reconnect", attempts=20, sleep_s=0.25):
+                self._bridge_last_ok_ts = _t.time()
+                self._log_bridge_capabilities()
+                return True
         print(
             f"[CAMO] bridge reset ({', '.join(reasons) or 'not loaded'}) — "
             f"injecting {self.DLL_NAME}...",
@@ -701,6 +752,7 @@ class CamoBridgeMixin:
 
         print("[CAMO] waiting for meccha-xenos-bridge TCP...", flush=True)
         if self._wait_for_bridge_tcp("xenos bridge", attempts=80):
+            self._bridge_last_ok_ts = _t.time()
             self._log_bridge_capabilities()
             return True
 
@@ -818,6 +870,14 @@ class CamoBridgeMixin:
             return (0.0, 0.0, 0.0)
         return (v[0] / mag, v[1] / mag, v[2] / mag)
 
+    @staticmethod
+    def _camo_blend_dirs(a, b, wa, wb):
+        return CamoBridgeMixin._camo_normalize_vec((
+            a[0] * wa + b[0] * wb,
+            a[1] * wa + b[1] * wb,
+            a[2] * wa + b[2] * wb,
+        ))
+
     def _camo_root_is_tilted(self, body_rot):
         if not body_rot:
             return False
@@ -891,8 +951,27 @@ class CamoBridgeMixin:
         # On-back root or ambiguous — vertical front/back.
         return up, right, "dynamic-supine"
 
+    def _camo_detail_look_direction(self, forward, right, up, label, orbit_mode):
+        """Extra camera aim for UV islands missed by horizontal side passes."""
+        neg_up = self._camo_neg(up)
+        if label == "head_shoulders":
+            # Downward front tilt — head crown + shoulder tops (green/red head islands).
+            if orbit_mode == "dynamic-flat":
+                look = self._camo_blend_dirs(forward, neg_up, 0.30, 0.95)
+            else:
+                look = self._camo_blend_dirs(forward, neg_up, 0.42, 0.91)
+        elif label == "inner_legs":
+            # Upward front tilt — crotch + inner thighs (red leg-inner island).
+            if orbit_mode == "dynamic-flat":
+                look = self._camo_blend_dirs(right, up, 0.50, 0.82)
+            else:
+                look = self._camo_blend_dirs(forward, up, 0.52, 0.80)
+        else:
+            return (0.0, 0.0, 0.0)
+        return look
+
     def _camo_plan_wrap_orbit(self, control_rot=None):
-        """Compute 4-pass camera orbit from body axes — any pose, one code path."""
+        """Compute wrap + detail camera passes from body axes — any pose, one code path."""
         body_rot = self._camo_get_body_rotation()
         if not body_rot:
             body_yaw = 0.0
@@ -924,6 +1003,15 @@ class CamoBridgeMixin:
                 continue
             cam = self._camo_direction_to_rotation(*look)
             planned.append((cam, label, int(yaw_offset)))
+
+        for detail_idx, label in enumerate(self.CAMO_DETAIL_PASSES):
+            look = self._camo_detail_look_direction(
+                forward, right, up, label, orbit_mode
+            )
+            if look == (0.0, 0.0, 0.0):
+                continue
+            cam = self._camo_direction_to_rotation(*look)
+            planned.append((cam, label, -100 - detail_idx))
 
         return planned, emote, body_rot
 
@@ -1028,15 +1116,22 @@ class CamoBridgeMixin:
             0.0,
         )
 
-    # Pass order: front → sides → back last.
+    # Pass order: front → sides → back → detail (head/shoulders, inner legs).
+    # Yaw orbit is in the body forward/right plane. Bridge scene capture places the
+    # camera at body - look*pullback facing look, so +forward views the spine/back
+    # and -forward views the chest/front (not the raw axis label).
     CAMO_WRAP_YAW_PASSES = (
-        (0, "front"),
+        (180, "front"),
         (90, "left"),
         (270, "right"),
-        (180, "back"),
+        (0, "back"),
     )
-    CAMO_PAWN_BACK_YAW = 180
-    CAMO_CAMERA_SETTLE_MS = 1500
+    CAMO_DETAIL_PASSES = (
+        "head_shoulders",
+        "inner_legs",
+    )
+    CAMO_PAWN_BACK_YAW = 0
+    CAMO_CAMERA_SETTLE_MS = 2000
     CAMO_DEFAULT_SETTLE_SEC = 0.5
 
     def _camo_rotate_to_yaw(self, target_yaw, label):
@@ -1178,7 +1273,7 @@ class CamoBridgeMixin:
                 pass
 
     def camo_apply(self, r=None, g=None, b=None, a=None, full_wrap=True):
-        """Environment camo — 4-pass 360° wrap via paint_full_route (camera orbit per pass)."""
+        """Environment camo — 6-pass wrap (4 orbit + 2 detail) via paint_full_route."""
         del r, g, b, a
         full_wrap = True
         if not getattr(self, "pm", None) or not self.pm:
@@ -1212,7 +1307,13 @@ class CamoBridgeMixin:
             if not full_wrap:
                 wrap_passes = wrap_passes[:1]
             skip_front = bool(getattr(cfg, "camo_skip_front_pass", False)) if cfg else False
-            if skip_front and full_wrap:
+            back_only = bool(getattr(cfg, "camo_back_pass_only", False)) if cfg else False
+            if back_only and full_wrap:
+                before = len(wrap_passes)
+                wrap_passes = [p for p in wrap_passes if p[1] == "back"]
+                if len(wrap_passes) < before:
+                    print("[CAMO] back pass only mode", flush=True)
+            elif skip_front and full_wrap:
                 before = len(wrap_passes)
                 wrap_passes = [p for p in wrap_passes if p[1] != "front"]
                 if len(wrap_passes) < before:
@@ -1226,8 +1327,9 @@ class CamoBridgeMixin:
             body_roll = float(body_rot[2])
             orbit_mode = getattr(self, "_camo_orbit_mode", "dynamic")
             print(
-                f"[CAMO] single camo_apply: {len(wrap_passes)}-pass 360° wrap "
-                f"({orbit_mode}, body pitch={body_pitch:.0f}° roll={body_roll:.0f}°)",
+                f"[CAMO] single camo_apply: {len(wrap_passes)}-pass wrap "
+                f"(4 orbit + 2 detail, {orbit_mode}, "
+                f"body pitch={body_pitch:.0f}° roll={body_roll:.0f}°)",
                 flush=True,
             )
             self._camo_last_error = None
@@ -1265,6 +1367,8 @@ class CamoBridgeMixin:
                         return False
                     pitch, yaw, roll = cam
                     front_pass = label == "front"
+                    steep_up = label == "inner_legs" and pitch > 40.0
+                    use_body_anchor = front_pass or steep_up
                     print(
                         f"[CAMO] paint pass {pass_idx + 1}/{len(wrap_passes)} "
                         f"({label}, offset={yaw_offset}°, "
@@ -1279,8 +1383,10 @@ class CamoBridgeMixin:
                         payload = self._paint_payload(
                             pid,
                             camera_rotation=cam,
-                            camera_body_anchor=front_pass,
-                            camera_body_pullback=280.0 if (front_pass and not upright_orbit) else 150.0,
+                            camera_body_anchor=use_body_anchor,
+                            camera_body_pullback=280.0
+                            if (use_body_anchor and not upright_orbit)
+                            else 150.0,
                         )
                         resp = self._bridge_request(
                             "paint_full_route",
@@ -1333,3 +1439,61 @@ class CamoBridgeMixin:
             except Exception:
                 pass
         return bool(resp and resp.get("success", False))
+
+    def bridge_teleport(self, x, y, z):
+        """Teleport local pawn via bridge K2_SetActorLocation."""
+        print(f"[CAMO] teleport ({x:.1f}, {y:.1f}, {z:.1f})...", flush=True)
+        resp = self._bridge_request("teleport", {"x": float(x), "y": float(y), "z": float(z)}, timeout=30)
+        ok = bool(resp and resp.get("success"))
+        print(f"[CAMO] teleport {'ok' if ok else 'failed'}: {resp}", flush=True)
+        return ok
+
+    def bridge_set_fov(self, fov):
+        """Override camera FOV via bridge."""
+        print(f"[CAMO] set_fov {fov}...", flush=True)
+        resp = self._bridge_request("set_fov", {"fov": float(fov)}, timeout=30)
+        ok = bool(resp and resp.get("success"))
+        print(f"[CAMO] set_fov {'ok' if ok else 'failed'}: {resp}", flush=True)
+        return ok
+
+    def bridge_kill(self, enemies=False):
+        """Kill local player via bridge (enemies=True not implemented in bridge)."""
+        target = "enemies" if enemies else "self"
+        print(f"[CAMO] kill {target}...", flush=True)
+        resp = self._bridge_request("kill", {"enemies": bool(enemies)}, timeout=30)
+        ok = bool(resp and resp.get("success"))
+        print(f"[CAMO] kill {'ok' if ok else 'failed'}: {resp}", flush=True)
+        return ok
+
+    def bridge_set_anti_kick(self, enabled=True):
+        """Enable/disable in-game kick RPC blocking via bridge ProcessEvent hook."""
+        state = "on" if enabled else "off"
+        print(f"[CAMO] set_anti_kick {state}...", flush=True)
+        resp = self._bridge_request("set_anti_kick", {"enabled": bool(enabled)}, timeout=20)
+        ok = bool(resp and resp.get("success"))
+        print(f"[CAMO] set_anti_kick {'ok' if ok else 'failed'}: {resp}", flush=True)
+        return ok
+
+    def bridge_get_anti_kick_log(self, since_seq=0):
+        """Fetch kick RPC blocks logged by the bridge anti-kick hook."""
+        resp = self._bridge_request("get_anti_kick_log", {"since_seq": int(since_seq)}, timeout=10)
+        return resp if resp and resp.get("success") else None
+
+    def bridge_set_player_name(self, name):
+        """Replicated rename via SetName(Server) on the game thread."""
+        name = (name or "").strip()[:32]
+        if not name:
+            return False
+        print(f"[CAMO] set_player_name '{name}'...", flush=True)
+        resp = self._bridge_request("set_player_name", {"name": name}, timeout=30)
+        ok = bool(resp and resp.get("success"))
+        print(f"[CAMO] set_player_name {'ok' if ok else 'failed'}: {resp}", flush=True)
+        return ok
+
+    def bridge_sdk_probe(self, deep=False):
+        """Pre-flight SDK validation via bridge (no paint)."""
+        cmd = "sdk_deep_probe" if deep else "sdk_probe"
+        resp = self._bridge_request(cmd, {"type": cmd}, timeout=30)
+        ok = bool(resp and resp.get("success"))
+        print(f"[CAMO] {cmd} {'ok' if ok else 'failed'}: {resp}", flush=True)
+        return resp

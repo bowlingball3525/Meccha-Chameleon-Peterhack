@@ -8,22 +8,36 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 
 **Discord:** https://discord.gg/7T3damu79F
 
+> **Built with AI:** This project is actively developed with **[Cursor AI Composer 2.5](https://cursor.com)** — an AI coding assistant used for feature implementation, bridge hook work, debugging, and documentation.
+
 ---
 
 ## How It Works
 
-Peterhack is a **fully external** tool. It does not modify game files on disk.
+Peterhack is a **fully external** cheat. It does not modify game files on disk.
 
-1. **Attach** — On launch, Peterhack finds the game process and opens it with `pymem` (read/write memory from outside the game).
-2. **Read game state** — It resolves UE5 offsets (GWorld, actors, bones, health, team, etc.) and builds a player list each frame.
+```
+┌─────────────────┐     pymem read/write      ┌──────────────────────────┐
+│  Peterhack.exe  │ ◄──────────────────────► │  PenguinHotel (UE5.6)    │
+│  (Python/PyQt5) │                          │  PenguinHotel-Win64-...  │
+└────────┬────────┘                          └────────────┬─────────────┘
+         │                                                │
+         │  localhost TCP :47654                          │  injected DLL
+         └──────────────────────────────────────────────►│  meccha-xenos-bridge.dll
+                                                           └──────────────────────────┘
+```
+
+1. **Attach** — On launch, Peterhack finds the game process and opens it with `pymem` (external read/write memory).
+2. **Read game state** — Resolves UE5 offsets (GWorld, actors, bones, health, team, Steam IDs, etc.) and builds a debounced player list each frame.
 3. **Draw overlay** — A transparent PyQt5 window sits on top of the game and renders ESP, radar, and the aimbot FOV circle.
-4. **Write memory (optional)** — Exploits and aimbot apply small targeted writes (cooldowns, recoil, view angles, collision flags, etc.).
-5. **Camouflage (bridge)** — Environment camo injects **`meccha-xenos-bridge.dll`** into the game, then talks over **localhost TCP** port **47654** (`paint_full_route`, `rotate`, `cancel_paint`, etc.). Bridge files live in **`C:\peterhack\camo\`**.
-6. **Custom image paint (native)** — PNG/JPG skins use Peterhack’s own remote-call path (`ImportChannel` / UV stamping) and are separate from bridge camouflage.
+4. **Write memory (trainer)** — Exploits apply small targeted writes (cooldowns, recoil, collision flags) at ~20 Hz when toggled on.
+5. **Bridge (camo + exploits)** — Auto-injects **`meccha-xenos-bridge.dll`** and talks over **localhost TCP port 47654**. Used for environment camo, teleport, kill, rename, and anti-kick hooks.
+6. **Custom image paint** — PNG/JPG skins use Peterhack’s own remote-call path (`ImportChannel` / UV stamping), separate from bridge camouflage.
 
-**Requirements:** Run as **Administrator** (`Peterhack.bat` self-elevates). Be **in a match** (not the main menu) before applying camo.
+**Requirements:** Run as **Administrator** (`Peterhack.bat` self-elevates). Be **in a match** (not the main menu) before applying camo or bridge exploits.
 
 **Logs:** `C:\peterhack\logs\latest.log`  
+**Anti-kick log:** `C:\peterhack\logs\anti_kick.log`  
 **Blocklist:** `C:\peterhack\blocked_players.json`
 
 ---
@@ -32,112 +46,152 @@ Peterhack is a **fully external** tool. It does not modify game files on disk.
 
 | Tab | What it does |
 |---|---|
-| **VISUALS** | ESP dots, 2D boxes, skeleton, snap lines, OOF arrows, names, Steam ID, distance, health/shield bars |
+| **VISUALS** | ESP dots, 2D/corner boxes, skeleton, snap lines, OOF arrows, names, Steam ID, distance, health/shield bars, team filter, enemy-only, visible colors |
+| **COLORS** | Per-team and skeleton colors |
 | **PLAYERS** | Session player table, copy/save Steam64 IDs, blocklist, optional autokick |
 | **RADAR** | Top-down mini-map of players |
-| **AIMBOT** | Hold key aim (default MB5), FOV circle, smoothing, bone offset |
-| **EXPLOITS** | Memory toggles — no gun CD, no recoil, decoy CD/count, noclip, anti-kick watchdog, auto-rename |
-| **COLORS** | Per-team and skeleton colors |
-| **CAMOUFLAGE** | Dynamic 360° environment camo, quality slider, optional skip-front toggle, custom image paint, UV diagnostic |
+| **AIMBOT** | Hold key aim (default MB5), FOV circle, smoothing, bone offset, visible-only option |
+| **EXPLOITS** | Memory toggles, anti-kick, rename, bridge teleport/kill |
+| **CAMOUFLAGE** | Dynamic 360° environment camo, quality slider, pass options, custom image paint, UV diagnostic |
 | **CHANGELOG** | Version info and auto-update toggle |
 
-Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord** (opens invite link).
+Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord**.
 
 ---
 
 ## Features
 
 ### ESP Overlay
-- Player dots, 2D boxes, skeleton, snap lines, off-screen (OOF) arrows
-- Names, optional Steam64 ID, distance, health bar, shield bar
-- Blocklisted players highlighted in orange with `[BLOCKED]` tag
-- Team colors (Hunter / Survivor / local / fallback)
-- Distance-based dot scaling
-- FPS counter (overlay top-left)
-- Debounced player cache to reduce flicker
 
-### Players tab
-- Live session list (name, team, Steam64 ID)
-- **Copy Steam ID** / **Save to Blocklist**
-- Blocklist stored at `C:\peterhack\blocked_players.json`
-- **Auto-Kick** blocklisted players (host: Redpoint kick; non-host: optional leave lobby)
+| Feature | How it works |
+|---|---|
+| **Dot / Box / Corner Box / Skeleton** | Reads bone positions from the skeletal mesh component, projects world → screen, draws on the overlay each frame. |
+| **Snap lines** | Line from screen bottom-center to each player’s projected position. |
+| **OOF arrows** | Off-screen players get an arrow at the screen edge (or configurable radius) pointing toward them; optional name, distance, health. |
+| **Names / Steam64 / Distance** | Name from replicated player state; Steam ID from `FUniqueNetIdRepl` when replicated; distance from local pawn. |
+| **Health / Shield bars** | Reads replicated health/shield floats and draws bars above the player. |
+| **Team colors** | Hunter (red), Survivor (green), local (green), fallback enemy color. |
+| **Blocklist highlight** | Blocklisted Steam IDs shown in orange with `[BLOCKED]` tag. |
+| **Enemy Only + Visible colors** | When enabled, only enemies render; optional green/purple for visible vs occluded targets. |
+| **Distance scaling** | Dot radius scales with distance for readability. |
+| **Debounced cache** | Player list cached briefly to reduce ESP flicker when actors churn. |
+
+### Players Tab
+
+| Feature | How it works |
+|---|---|
+| **Session list** | Scans world actors for player states; shows name, team, Steam64 ID. |
+| **Copy Steam ID / Save to Blocklist** | Copies selected row’s Steam64; appends to `blocked_players.json`. |
+| **Auto-Kick** | When **host**: calls Redpoint `KickPlayerController` for blocklisted Steam IDs. When **non-host** with **Leave on block**: exits lobby if a blocklisted player joins. |
 
 ### Radar
-- Configurable size, range, and opacity
-- Same player data as ESP, drawn as a mini-map
+
+Configurable size, range, and opacity. Same player data as ESP, drawn as a top-down mini-map relative to your pawn.
 
 ### Aimbot
-- Hold-to-aim (default **MB5**)
-- FOV limit, smoothing, vertical bone offset
-- Optional FOV circle on overlay
 
-### Exploits (EXPLOITS tab)
-Memory writes applied when toggled on (throttled ~20 Hz, not every overlay frame):
-
-| Toggle | Effect |
+| Setting | How it works |
 |---|---|
-| No Gun Cooldown | Hunter gun cooldown → 0 |
-| No Recoil | Camera shake modifier alpha → 0 |
-| No Decoy Cooldown | Decoy cooldown timers → 0 |
-| Set Decoy Num | Sets max decoy spawn count |
-| Anti-Clipping | Disables collision on local mesh (noclip) |
-| Anti-Kick | Logs disconnect / pawn loss (watchdog only) |
-| Auto-Rename | Sets **CustomPlayerName** (in-game display name) |
+| **Hold key (default MB5)** | While held, finds the closest enemy within FOV to screen center. |
+| **FOV / Smoothing / Offset** | Limits target cone; lerps view angles toward target bone; vertical offset for head vs chest. |
+| **Visible check** | Optional — only aims at targets passing line-of-sight check. |
+| **FOV circle** | Draws aim cone on overlay when enabled. |
 
-Enable **Debug Logging** to emit `[TRAINER:TAG]` lines to `latest.log`.
+Writes `ControlRotation` on the local PlayerController via pymem.
 
-### Environment Camouflage (bridge)
+### Exploits (EXPLOITS Tab)
 
-Every **Paint Now** / **F10** runs a **360° environment camo wrap** via the in-game bridge. Camera angles are computed **dynamically** from your pawn root rotation and current view — standing, crouched, or lay-down emotes are handled automatically (no manual pose setup).
+Memory writes applied when toggled on (~20 Hz trainer tick):
 
-**Pass order:** **front → left → right → back** (back is last).
+| Toggle | How it works |
+|---|---|
+| **No Gun Cooldown** | Hunter gun cooldown timer → 0 each tick. |
+| **No Recoil** | Camera shake modifier alpha → 0 on the local camera manager. |
+| **No Decoy Cooldown** | Decoy cooldown fields on the runtime paintable component → 0. |
+| **Set Decoy Num** | Writes max decoy spawn count. |
+| **Anti-Clipping (noclip)** | Sets collision disabled on local body mesh + capsule. |
+| **Anti-Kick** | Bridge vtable hooks block kick/disconnect RPCs (see below). |
+| **Auto-Rename** | Bridge `set_player_name` → `SetName(Server)` on game thread; replicates **CustomPlayerName** nameplate. Debounced 1.5 s. |
+| **Rename button** | Manual one-shot rename from the text field (Enter or **Rename**); works in lobby without Auto-Rename. |
+| **Teleport / Kill Self** | Bridge TCP: `K2_SetActorLocation` / destroy local pawn. |
+| **Debug Logging** | Emits `[TRAINER:TAG]` lines to `latest.log`. |
 
-| Pass | When standing (`dynamic-upright`) | When lay-down / tilted (`dynamic-flat`, etc.) |
+#### Anti-Kick (detailed)
+
+Anti-kick runs **inside the injected bridge DLL**, not from Python memory writes.
+
+| Layer | Behavior |
+|---|---|
+| **Hook method** | **Vtable ProcessEvent hooks** on your local `PlayerController`, `PlayerState`, and `NetConnection` — does **not** patch the global ProcessEvent function (UE4SS-safe). |
+| **Blocked RPCs** | Explicit: `ClientWasKicked`, `ClientReturnToMainMenu`, `ClientReturnToMainMenuWithTextReason`, `PlayerState.Kick`, `NetConnection.Close`, etc. |
+| **Auto-scan** | Scans class hierarchies for kick/ban/disconnect/leave/redpoint/eos-like function names and adds them to the block list. |
+| **Kick logger** | Each block logged to `anti_kick.log` with seq, function name, owner class. Trainer polls `get_anti_kick_log` over TCP. |
+| **Auto-refresh** | Re-syncs hooks when your controller or player state pointer changes (e.g. lobby → match spawn). |
+| **Limitation** | Pure **EOS/Redpoint platform kicks** may still drop the socket at the network layer even when UE RPCs are blocked. Check logs for `NetConnection lost while world active`. |
+
+Enable Anti-Kick **after** joining a match for best results. Fully quit the game before updating `meccha-xenos-bridge.dll`.
+
+#### Rename (detailed)
+
+| Method | Path |
+|---|---|
+| **Auto-Rename toggle** | Trainer calls bridge `set_player_name` every 1.5 s when text changes. |
+| **Rename button / Enter** | One-shot `set_player_name` from the text field. |
+| **Bridge handler** | Queues `SetName(Server)` on the **game thread** via bridge message hook — avoids unsafe remote-thread ProcessEvent from Python. |
+
+Works in lobby as non-host (nameplate above character).
+
+### Bridge Commands (TCP `:47654`)
+
+| Command | Description |
+|---|---|
+| `ping` / `capabilities` | Health check and command list |
+| `paint_full_route` | Camera settle → UV sample → scene-capture → `ServerPaintBatch` |
+| `rotate` | `"target":"camera"` (ControlRotation) or `"target":"pawn"` |
+| `cancel_paint` | Cancel active paint queue |
+| `teleport` | `{x,y,z}` → `K2_SetActorLocation` |
+| `kill` | Destroy local pawn |
+| `set_fov` | Camera FOV override (1–179) |
+| `set_anti_kick` | Enable/disable vtable anti-kick hooks |
+| `get_anti_kick_log` | Fetch kick block log entries since seq |
+| `set_player_name` | Replicated rename via `SetName(Server)` |
+| `shutdown` | Stop bridge TCP server |
+
+Bridge auto-injects on game connect. Binaries copied to `C:\peterhack\camo\` on first use.
+
+### Environment Camouflage (Bridge)
+
+Every **Paint Now** / **F10** runs a **360° environment camo wrap** via the in-game bridge. Camera angles are computed **dynamically** from your pawn root rotation and current view — standing, crouched, or lay-down emotes are handled automatically.
+
+**Default pass order:** **front → left → right → back → head/shoulders → inner legs**
+
+| Pass | Standing (`dynamic-upright`) | Lay-down / tilted (`dynamic-flat`) |
 |---|---|---|
 | **Front** | Horizontal, pawn forward | Look **up** from below the body |
-| **Left / Right** | Horizontal sides | Horizontal sides (pitch 0°) |
+| **Left / Right** | Horizontal sides | Horizontal sides |
 | **Back** | Horizontal, opposite forward | Look **down** from above |
+| **Head / shoulders** | Downward front tilt (~−55°) | Body-relative downward tilt |
+| **Inner legs** | Upward front tilt (~+53°) | Side-up tilt (inner thigh UV) |
 
-Each pass sets **camera rotation only** (pawn does not spin), waits **1.5 s** (`camera_settle_ms`), UV-samples the mesh, scene-captures environment colors, and paints via `ServerPaintBatch`. Expect ~30–60 seconds per pass depending on **Camo quality** (1–20); four passes ≈ **2–4 minutes**.
+Each pass sets **camera rotation only** (pawn does not spin), waits **2.0 s** (`camera_settle_ms`), UV-samples the mesh, scene-captures environment colors, and paints via `ServerPaintBatch`. The bridge maps each UV stamp to the correct environment color by projecting the mesh **hit world position** into the scene-capture camera.
 
 **CAMOUFLAGE tab options:**
 
 | Control | Description |
 |---|---|
-| **Camo quality** | Slider 1–20 — stroke density per pass (higher = smoother, slower) |
-| **Disable front pass (only if flat map)** | Skips the front pass; runs left → right → back only |
-| **Paint Now** / **F10** | Start one full `camo_apply()` |
+| **Camo quality** | Slider 1–20 — stroke density per pass (higher = smoother, slower). ~30–60 s per pass; six passes ≈ **3–6 minutes** at quality 12+. |
+| **Disable front pass (only if flat map)** | Skips front; runs left → right → back + detail passes. Mutually exclusive with back-only. |
+| **Back pass only** | Paints **only** the back orbit pass (spine/rear). Mutually exclusive with skip-front. Front/back yaw corrected for camera pullback math. |
+| **Paint Now / F10** | Start one full `camo_apply()` |
 | **Stop Camo (F9)** | `cancel_paint` over TCP |
 
-**Noclip during camo:** On non-upright orbits, **noclip is enabled for the entire front pass** (camera settle + paint) so geometry does not block the below-looking-up view. It is restored before side/back passes. This is separate from the EXPLOITS noclip toggle; camo holds noclip even when that toggle is off.
+**Noclip during camo:** On non-upright orbits, noclip is enabled for the entire front pass so geometry does not block the below-looking-up view. Restored before side/back passes. Separate from the EXPLOITS noclip toggle.
 
 **Flow:**
 1. Peterhack injects **`meccha-xenos-bridge.dll`** via **`meccha-xenos-injector.exe`** (or reuses TCP on **47654** if already loaded).
-2. Saves your view, plans four look directions from body/view axes, runs **`paint_full_route`** once per pass.
-3. Front pass uses **body-anchored scene capture** (pullback from pawn center) when noclip is active.
+2. **Paint Now** / **F10** saves your view, plans look directions from body/view axes, runs **`paint_full_route`** once per pass.
+3. Front pass (and steep inner-legs pass) use **body-anchored scene capture** when needed.
 4. Restores your original camera when done.
-
-**F10** only calls `camo_apply()` in Peterhack — it is not sent to the game as a keybind.
-
-**Bridge TCP commands:**
-
-| Command | Description |
-|---|---|
-| `paint_full_route` | Camera settle → UV sample → scene-capture → paint (`camera_rotation_absolute`, `camera_settle_ms`, optional `camera_use_body_anchor`) |
-| `rotate` | `"target":"camera"` for ControlRotation; `"target":"pawn"` for pawn yaw |
-| `cancel_paint` | Cancel active paint and drain the queue |
-| `ping` / `capabilities` | Health check and command list |
-
-**Stop:** **F9** or **Stop Camo** → `cancel_paint` over TCP.
-
-**Bridge binaries** (copied to `C:\peterhack\camo\` on first use):
-
-| File | Role |
-|---|---|
-| `meccha-xenos-bridge.dll` | In-game TCP bridge (scene capture + server paint batch) |
-| `meccha-xenos-injector.exe` | Loads the bridge DLL into the game process |
-
-Peterhack ships prebuilt bridge binaries in `meccha_chameleon_tools/`. To rebuild locally, run `runtime/scripts/build.ps1` (Visual Studio) and copy `runtime-bridge.dll` → `meccha-xenos-bridge.dll`.
 
 ### Custom Character Paint — Apply Image
 
@@ -146,12 +200,12 @@ Separate from environment camo. Paint any PNG/JPG onto your character atlas:
 | Wrap mode | Description |
 |---|---|
 | **Projector (front → back)** | Image spans the full atlas front → back as one continuous wrap. |
-| **Centered (chest outward)** | Image center on chest; top → head, bottom → feet. |
+| **Centered (chest outward)** | Image center on chest; top → head, bottom → feet. Island-calibrated UV map for head/torso/legs regions. |
 
 - Auto-trims transparent / solid borders
 - White base coat clears old paint before apply
 - **Image Quality** slider (1 Draft → 5 Ultra)
-- **Run UV Test** — diagnostic overlay to calibrate placement
+- **Run UV Test** — diagnostic overlay (quadrants, islands, grid, slices, full) to calibrate placement
 
 ---
 
@@ -160,9 +214,10 @@ Separate from environment camo. Paint any PNG/JPG onto your character atlas:
 | Key | Action |
 |---|---|
 | **Insert** / **F1** | Toggle menu + ESP overlay |
-| **F10** | Apply environment camouflage (`camo_apply()` — four passes unless front disabled) |
+| **F10** | Apply environment camouflage |
 | **F9** | Stop / cancel camouflage paint |
 | **MB5** (default) | Aimbot hold |
+| **Enter** (in Rename field) | Manual rename |
 
 Drag the menu title bar to reposition. Menu hotkeys use `RegisterHotKey`; F9/F10 are polled each frame.
 
@@ -189,10 +244,34 @@ pip install -r requirements.txt
 1. Launch **MECCHA CHAMELEON** and join a match.
 2. Run **`Peterhack.bat`** (self-elevates to Administrator).
 3. Configure ESP, exploits, and colors in the menu tabs.
-4. For environment camo: open **CAMOUFLAGE**, set quality, optionally enable **Disable front pass** on flat maps, then **Paint Now** or **F10**.
-5. Use the **PLAYERS** tab to copy Steam IDs, manage your blocklist, or enable autokick.
+4. For environment camo: open **CAMOUFLAGE**, set quality and pass options, then **Paint Now** or **F10**.
+5. For anti-kick: enable in **EXPLOITS** after spawning in; check `anti_kick.log` if kicked.
+6. Use the **PLAYERS** tab to copy Steam IDs, manage your blocklist, or enable autokick.
 
 Pre-built EXE: download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main`, or build locally with PyInstaller (see `.github/workflows/build.yml`).
+
+---
+
+## Building the Bridge DLL
+
+Requires **Visual Studio** with C++ tools.
+
+```powershell
+runtime/scripts/build.ps1
+# Output: runtime/.build/bin/runtime-bridge.dll
+# Copy to meccha_chameleon_tools/meccha-xenos-bridge.dll and C:\peterhack\camo\
+```
+
+**Bridge source (in repo):**
+
+| Path | Role |
+|---|---|
+| `runtime/src/bridge.cpp` | TCP server, camo paint route, anti-kick vtable hooks, teleport/kill/rename/FOV |
+| `runtime/src/injector.cpp` | DLL injector |
+| `runtime/include/sdk.hpp` | UE5 struct layouts and offsets |
+| `runtime/scripts/build.ps1` | MSVC build script |
+
+Peterhack extends [SilentJMA/Meccha-Chameleon-Tools](https://github.com/SilentJMA/Meccha-Chameleon-Tools) with 6-pass dynamic camo, body-anchored scene capture, world-position UV color projection, vtable anti-kick, and game-thread rename.
 
 ---
 
@@ -211,20 +290,29 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 
 | Symptom | What to try |
 |---|---|
-| `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `C:\peterhack\logs\latest.log` |
-| `could not unload` / `runtime-bridge-*.dll` stuck | **Quit the game completely** and relaunch. Run Peterhack as Administrator. |
+| `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `latest.log` |
+| Anti-kick enabled but still kicked | Check `anti_kick.log` for `BLOCKED` lines. EOS/platform kicks may bypass UE RPCs. Enable after spawn; quit game before DLL update. |
+| Anti-kick crashes game on enable | Update to latest build (vtable hooks, not inline ProcessEvent). Fully quit game before replacing DLL. |
+| Rename stuck / reverts in lobby | Use **Rename** button; enable Debug Logging; ensure bridge connected. |
+| `could not unload` / DLL stuck | **Quit the game completely** and relaunch. Run Peterhack as Administrator. |
 | `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` |
 | Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |
-| `[TRAINER:NO-CLIP] restored collision` during front pass | Update to latest build — camo now holds noclip for the full front pass |
-| Front pass blocked by floor/geometry | Use latest build (front noclip + body anchor); on flat maps try **Disable front pass** |
-| Camo only paints one side / body spins | Update — rotate moves **camera only**, not the pawn |
-| Lay-down emote wrong angles | Update — dynamic orbit reads pose automatically; check log for `dynamic-flat` / `dynamic-upright` |
-| Camo takes ~2–4 minutes | Normal for four passes at quality 12+ |
-| Steam ID shows `—` in PLAYERS tab | Wait a few seconds for replication; select row and Copy again |
-| ESP feels laggy | Disable **Show Steam ID** if you do not need it; keep PLAYERS tab closed when not in use |
+| Front pass blocked by floor/geometry | Latest build uses front noclip + body anchor; on flat maps try **Disable front pass** |
+| Back pass paints wrong side | Update — front/back yaw swap fixed in latest build |
+| Camo takes ~3–6 minutes | Normal for six passes at quality 12+ |
+| Steam ID shows `—` in PLAYERS tab | Wait for replication; select row and Copy again |
+| ESP feels laggy | Disable **Show Steam ID**; keep PLAYERS tab closed when not in use |
 
 ---
 
 ## Disclaimer
 
 For educational purposes only. Use at your own risk.
+
+---
+
+## Credits
+
+- **[Cursor AI Composer 2.5](https://cursor.com)** — AI-assisted development (features, bridge hooks, debugging, docs)
+- **[SilentJMA/Meccha-Chameleon-Tools](https://github.com/SilentJMA/Meccha-Chameleon-Tools)** — Original bridge / camo foundation
+- **MECCHA CHAMELEON** community — testing and feedback

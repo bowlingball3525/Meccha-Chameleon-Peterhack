@@ -100,6 +100,9 @@ class TrainerMixin:
     OFF_CUSTOM_PLAYER_NAME_LINK = 0x03F0
     # UPlayer::Connection (via APlayerController::Player @ resolver)
     OFF_UPLAYER_CONNECTION = 0x0028
+    OFF_USTRUCT_CHILDREN = 0x48
+    OFF_UFIELD_NEXT = 0x28
+    OFF_USTRUCT_SUPER = 0x40
 
     ECollision_NoCollision = 0
     ECollision_QueryAndPhysics = 3
@@ -119,6 +122,13 @@ class TrainerMixin:
         self._autokick_last_scan = 0.0
         self._trainer_last_tick_ts = 0.0
         self._cdo_cache = {}
+        self._anti_kick_bridge_state = None
+        self._anti_kick_bridge_last_attempt = 0.0
+        self._anti_kick_blocks_reported = 0
+        self._anti_kick_log_seq = 0
+        self._anti_kick_watch_pc = 0
+        self._anti_kick_watch_ps = 0
+        self._anti_kick_refresh_last = 0.0
 
     def _trainer_enabled(self, config):
         return any((
@@ -363,21 +373,38 @@ class TrainerMixin:
             self._trainer_log("NO-CLIP", "restored collision", config=config, force=True)
 
     def _trainer_anti_kick(self, config):
+        want = bool(config.trainer_anti_kick)
+        if not want:
+            self._anti_kick_bridge_give_up = False
+        elif getattr(self, "_anti_kick_bridge_give_up", False):
+            return
+        now = time.monotonic()
         world = self._get_world()
         pawn = self._find_local_pawn() if world else 0
         ps = self._trainer_local_player_state(pawn) if pawn else 0
-        conn = 0
-        if world:
-            pc = self._get_local_controller(world)
-            if pc:
-                player = _rp(self.pm, pc + self.offsets.get("APlayerController::Player", 0x0348))
-                if player:
-                    conn = _rp(self.pm, player + self.OFF_UPLAYER_CONNECTION)
+        pc = self._get_local_controller(world) if world else 0
+        if getattr(self, "_anti_kick_bridge_state", None) != want:
+            if now - getattr(self, "_anti_kick_bridge_last_attempt", 0.0) >= 2.0:
+                self._anti_kick_bridge_last_attempt = now
+                self._sync_anti_kick_bridge(want, config)
+        elif want and getattr(self, "_anti_kick_bridge_state", False) and pc:
+            prev_pc = getattr(self, "_anti_kick_watch_pc", 0)
+            prev_ps = getattr(self, "_anti_kick_watch_ps", 0)
+            if (pc != prev_pc or ps != prev_ps) and now - getattr(self, "_anti_kick_refresh_last", 0.0) >= 3.0:
+                self._anti_kick_refresh_last = now
+                self._anti_kick_bridge_last_attempt = now
+                self._sync_anti_kick_bridge(True, config)
+
         prev = self._trainer_watch
+        conn = 0
+        if world and pc:
+            player = _rp(self.pm, pc + self.offsets.get("APlayerController::Player", 0x0348))
+            if player:
+                conn = _rp(self.pm, player + self.OFF_UPLAYER_CONNECTION)
         if prev["world"] and not world:
             self._trainer_log(
                 "ANTI-KICK",
-                "world lost — possible kick/disconnect (external tool cannot block NetClient Kick RPC)",
+                "world lost — disconnected (EOS/platform kick may bypass bridge hook)",
                 config=config,
                 level="error",
                 force=True,
@@ -393,11 +420,105 @@ class TrainerMixin:
         if prev["pawn"] and not pawn and world:
             self._trainer_log("ANTI-KICK", "local pawn lost", config=config, level="error", force=True)
         self._trainer_watch = {"world": world, "pawn": pawn, "ps": ps, "conn": conn}
+        if want:
+            self._anti_kick_watch_pc = pc
+            self._anti_kick_watch_ps = ps
+        if want and getattr(self, "_anti_kick_bridge_state", False):
+            self._poll_anti_kick_log(config)
+
+    def _poll_anti_kick_log(self, config):
+        if not hasattr(self, "_bridge_request"):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_anti_kick_log_last_poll", 0.0) < 2.0:
+            return
+        self._anti_kick_log_last_poll = now
+        try:
+            resp = self._bridge_request(
+                "get_anti_kick_log",
+                {"since_seq": int(getattr(self, "_anti_kick_log_seq", 0))},
+                timeout=10,
+            )
+        except Exception:
+            return
+        if not resp or not resp.get("success"):
+            return
+        meta = resp.get("metadata") or {}
+        entries = meta.get("entries") or []
+        for entry in entries:
+            func = entry.get("function") or "?"
+            owner = entry.get("owner") or "local"
+            detail = (entry.get("detail") or "").strip()
+            msg = f"blocked kick RPC {owner}.{func}"
+            if detail:
+                msg += f" — reason: {detail}"
+            self._trainer_log("ANTI-KICK", msg, config=config, force=True)
+        latest = meta.get("latest_seq")
+        if latest is not None:
+            self._anti_kick_log_seq = int(latest)
+
+    def _sync_anti_kick_bridge(self, enabled, config):
+        if not hasattr(self, "_bridge_request"):
+            self._trainer_log(
+                "ANTI-KICK",
+                "bridge API unavailable — restart Peterhack",
+                config=config,
+                level="error",
+                force=True,
+            )
+            return False
+        if enabled and not self._ensure_bridge():
+            err = getattr(self, "_camo_last_error", None) or "bridge not ready"
+            self._trainer_log("ANTI-KICK", f"waiting for bridge — {err}", config=config, level="debug")
+            return False
+        try:
+            resp = self._bridge_request("set_anti_kick", {"enabled": bool(enabled)}, timeout=20)
+        except Exception as exc:
+            self._trainer_log("ANTI-KICK", f"bridge request failed: {exc}", config=config, level="error", force=True)
+            return False
+        ok = bool(resp and resp.get("success"))
+        if ok:
+            self._anti_kick_bridge_state = bool(enabled)
+            meta = resp.get("metadata") or {}
+            blocked = meta.get("blocked_functions", "?")
+            hook_mode = meta.get("hook_mode") or ("chained" if meta.get("hook_chained") else "inline")
+            monitored = meta.get("monitored_functions") or []
+            net_conn = meta.get("net_connection")
+            extra = f" [{hook_mode}]" if hook_mode else ""
+            msg = f"{'enabled' if enabled else 'disabled'} via bridge (blocked RPCs={blocked}{extra})"
+            if enabled and net_conn and net_conn not in ("0x0", "0"):
+                msg += f" conn={net_conn}"
+            if enabled and monitored:
+                preview = ", ".join(str(x) for x in monitored[:8])
+                if len(monitored) > 8:
+                    preview += f", +{len(monitored) - 8} more"
+                msg += f" — watching: {preview}"
+                msg += " — log: C:\\peterhack\\logs\\anti_kick.log"
+            self._trainer_log("ANTI-KICK", msg, config=config, force=True)
+            if enabled:
+                self._anti_kick_log_seq = 0
+        else:
+            err = (resp or {}).get("message") or (resp or {}).get("stage") or "unknown error"
+            if enabled:
+                self._anti_kick_bridge_give_up = True
+                self._anti_kick_bridge_state = False
+                err = (
+                    f"{err} — toggle Anti-Kick off/on to retry. "
+                    "If this repeats, fully quit/relaunch the game or disable UE4SS/other ProcessEvent hooks."
+                )
+            self._trainer_log(
+                "ANTI-KICK",
+                f"bridge set_anti_kick failed: {err}",
+                config=config,
+                level="error",
+                force=True,
+            )
+        return ok
 
     # ------------------------------------------------------------------
     # Autokick / blocklist (Redpoint KickPlayerController when host)
     # ------------------------------------------------------------------
-    RVA_PROCESS_EVENT = 0x015D0950
+    RVA_PROCESS_EVENT = 0x15D0AD0
     AUTOKICK_COOLDOWN_SEC = 12.0
     AUTOKICK_LEAVE_COOLDOWN_SEC = 45.0
 
@@ -415,11 +536,31 @@ class TrainerMixin:
             if self.objects.obj_name(obj) != func_name:
                 continue
             outer = _rp(self.pm, obj + _OFF_UOBJECT_OUTER)
-            outer_name = self.objects.class_name(outer) if outer else ""
+            outer_name = self.objects.obj_name(outer) if outer else ""
             if owner_class_substr in outer_name:
                 self._ue_func_cache[key] = obj
                 return obj
         return 0
+
+    def _find_ue_function_on_object(self, obj, func_names):
+        """Walk the instance class super chain and match UFunction children."""
+        if isinstance(func_names, str):
+            func_names = (func_names,)
+        want = set(func_names)
+        cls = self.objects.obj_class(obj) if obj else 0
+        seen = set()
+        while cls and cls not in seen:
+            seen.add(cls)
+            child = _rp(self.pm, cls + self.OFF_USTRUCT_CHILDREN)
+            depth = 0
+            while child and depth < 4096:
+                name = self.objects.obj_name(child)
+                if name in want:
+                    return child, name
+                child = _rp(self.pm, child + self.OFF_UFIELD_NEXT)
+                depth += 1
+            cls = _rp(self.pm, cls + self.OFF_USTRUCT_SUPER)
+        return 0, ""
 
     def _find_class_default_object(self, class_substr):
         cached = self._cdo_cache.get(class_substr)
@@ -651,34 +792,97 @@ class TrainerMixin:
                     interval=15.0,
                 )
 
-    def _trainer_auto_rename(self, pawn, config):
+    def _trainer_apply_rename(self, pawn, config, name=None, *, force=False):
+        """Apply replicated rename via bridge. Returns (ok, message)."""
         ps = self._trainer_local_player_state(pawn)
         if not ps:
-            self._trainer_log("RENAME", "no PlayerState", config=config, level="debug", interval=10.0)
-            return
-        name = (config.trainer_rename_text or "").strip()
+            return False, "no PlayerState — join a lobby or match first"
+
+        name = (name if name is not None else (config.trainer_rename_text or "")).strip()[:32]
         if not name:
-            return
+            return False, "name is empty"
+
         now = time.monotonic()
-        if name == self._trainer_last_rename and (now - self._trainer_last_rename_ts) < 5.0:
-            return
-        off = self._custom_player_name_offset(ps)
-        cur = self.get_custom_player_name(ps)
-        if cur == name and self._trainer_last_rename == name:
-            return
-        ok = self._trainer_write_fstring(ps + off, name)
+        if not force:
+            pending = getattr(self, "_trainer_rename_pending_name", None)
+            if name != pending:
+                self._trainer_rename_pending_name = name
+                self._trainer_rename_pending_ts = now
+                return False, ""
+            if now - self._trainer_rename_pending_ts < 1.5:
+                return False, ""
+            if name == self._trainer_last_rename and (now - self._trainer_last_rename_ts) < 5.0:
+                return False, ""
+            cur = self.get_custom_player_name(ps)
+            if cur == name and self._trainer_last_rename == name:
+                return False, ""
+        else:
+            cur = self.get_custom_player_name(ps)
+
+        if getattr(self, "_trainer_rename_in_flight", False):
+            return False, "rename already in progress"
+
+        if not hasattr(self, "_bridge_request"):
+            self._trainer_log(
+                "RENAME",
+                "bridge API unavailable — restart Peterhack",
+                config=config,
+                level="error",
+                force=True,
+            )
+            return False, "bridge API unavailable — restart Peterhack"
+
+        if not self._resolve_bridge_port() and not self._ensure_bridge():
+            err = getattr(self, "_camo_last_error", None) or "bridge not ready — wait for auto-inject"
+            self._trainer_log("RENAME", err, config=config, level="debug", interval=10.0)
+            return False, err
+
+        cls = self.objects.class_name(ps) or "?"
+        self._trainer_rename_in_flight = True
+        try:
+            resp = self._bridge_request("set_player_name", {"name": name}, timeout=30)
+        except Exception as exc:
+            self._trainer_log("RENAME", f"bridge request failed: {exc}", config=config, level="error", force=True)
+            return False, str(exc)
+        finally:
+            self._trainer_rename_in_flight = False
+
+        ok = bool(resp and resp.get("success"))
         if ok:
             self._trainer_last_rename = name
             self._trainer_last_rename_ts = now
-            cls = self.objects.class_name(ps) or "?"
+            new_cur = self.get_custom_player_name(ps)
+            msg = f"'{cur or '?'}' -> '{name}' readback='{new_cur or '?'}'"
+            self._trainer_log("RENAME", f"SetName {msg} ({cls})", config=config, force=True)
+            return True, msg
+
+        err = (resp or {}).get("message") or (resp or {}).get("stage") or "unknown error"
+        self._trainer_log("RENAME", f"SetName failed via bridge: {err}", config=config, level="error", force=True)
+        off = self._custom_player_name_offset(ps)
+        if off and self._trainer_write_fstring(ps + off, name):
             self._trainer_log(
                 "RENAME",
-                f"CustomPlayerName @0x{off:X} '{cur or '?'}' -> '{name}' ({cls})",
+                f"SetName RPC failed — local FString only @0x{off:X} (not replicated)",
                 config=config,
+                level="error",
                 force=True,
             )
-        else:
-            self._trainer_log("RENAME", "CustomPlayerName FString write failed", config=config, level="error", force=True)
+            return False, f"RPC failed ({err}); local FString only (not replicated)"
+        return False, err
+
+    def trainer_rename_now(self, name, config=None, force=True):
+        """Single rename on demand (UI button). Returns (ok, message)."""
+        config = config or getattr(self, "config", None)
+        if not config:
+            return False, "config unavailable"
+        pawn = self._find_local_pawn()
+        return self._trainer_apply_rename(pawn, config, name, force=force)
+
+    def _trainer_auto_rename(self, pawn, config):
+        name = (config.trainer_rename_text or "").strip()[:32]
+        if not name:
+            return
+        self._trainer_apply_rename(pawn, config, name, force=False)
 
     def tick_trainer(self, config):
         """Apply enabled trainer features (throttled — not every overlay frame)."""
@@ -719,6 +923,8 @@ class TrainerMixin:
         if not pawn:
             if self._trainer_tick_count % 180 == 1:
                 self._trainer_log("TICK", "no local pawn (not in match?)", config=config, level="debug")
+            if config.trainer_auto_rename:
+                self._trainer_auto_rename(pawn, config)
             if config.trainer_anti_kick:
                 self._trainer_anti_kick(config)
             if getattr(config, "autokick_enabled", False):

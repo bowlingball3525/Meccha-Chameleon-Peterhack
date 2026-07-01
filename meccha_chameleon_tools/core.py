@@ -540,7 +540,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
     PROCESS_NAME = "PenguinHotel-Win64-Shipping.exe"
     MODULE_NAME = "PenguinHotel-Win64-Shipping.exe"
-    GWORLD_RVA = 0x09C7C620
+    GWORLD_RVA = 0x9C85620
 
     # APlayerState (Engine 5.6 dump)
     OFF_PLAYER_UNIQUE_ID = 0x02B8          # FUniqueNetIdRepl UniqueID
@@ -750,6 +750,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._last_paint_resolution = 0
         self._last_paint_grid = 32
         self._bridge_proc = None
+        self._bridge_ensure_lock = threading.Lock()
+        self._bridge_preload_started = False
+        self._bridge_preload_ok = None
+        self._bridge_preload_thread = None
         self._camo_abort = False
         self._init_trainer_state()
 
@@ -1501,6 +1505,36 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return None
 
     @staticmethod
+    def _is_player_enemy(local_is_hunter, target_is_hunter):
+        """True when target is on the opposing Hunter/Survivor team."""
+        if local_is_hunter is True and target_is_hunter is False:
+            return True
+        if local_is_hunter is False and target_is_hunter is True:
+            return True
+        return False
+
+    def _is_visible(self, actor):
+        """Approximate visibility — component hidden flag + actor bHidden."""
+        if not actor:
+            return True
+        try:
+            root = rp(self.pm, actor + self.offsets.get("AActor::RootComponent", 0x1A0))
+            if root:
+                vis = ru32(self.pm, root + 0x258)
+                if vis == 0:
+                    return False
+        except Exception:
+            pass
+        try:
+            hidden_off = self.offsets.get("AActor::bHidden", 0x178)
+            vis = ru32(self.pm, actor + hidden_off)
+            if vis == 1:
+                return False
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
     def _is_player_class(cls_name):
         """True for real playable character classes (not decoys, spectators, props)."""
         if not cls_name:
@@ -2080,7 +2114,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._players_cache = updated
         return self._players_cache[:cap]
 
-    def get_players(self, include_local=False, team_filter=False):
+    def get_players(self, include_local=False, team_filter=False, enemy_only=False):
         """Return up to MAX_ESP_PLAYERS entries.
 
         Uses a sticky cache when reads fail or return fewer players than before.
@@ -2096,6 +2130,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             fresh = list(self.iter_players(
                 include_local=include_local,
                 team_filter=team_filter,
+                enemy_only=enemy_only,
             ))
         except Exception:
             fresh = []
@@ -2107,7 +2142,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
         return self._players_cache[:cap]
 
-    def iter_players(self, include_local=False, team_filter=False):
+    def iter_players(self, include_local=False, team_filter=False, enemy_only=False):
         world = self._get_world()
         if not world:
             return
@@ -2115,6 +2150,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         pc = self._get_local_controller(world)
         local_pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"]) if pc else 0
         local_ps   = rp(self.pm, pc + self.offsets["AController::PlayerState"]) if pc else 0
+        local_is_hunter = self._read_is_hunter(local_pawn) if local_pawn else None
         local_pawn_cls = self.objects.class_name(local_pawn) if local_pawn else ""
         # If the acknowledged pawn is not a real playable character (e.g. the user
         # is dead and controlling a spectator/ragdoll) treat their class as unknown
@@ -2171,6 +2207,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                         if "Spectate" in pawn_cls:
                             continue
                     if not self._pawn_alive_for_esp(pawn, ps):
+                        continue
+                    target_is_hunter = self._read_is_hunter(pawn)
+                    if enemy_only and not self._is_player_enemy(local_is_hunter, target_is_hunter):
                         continue
                     pos = self.get_actor_root_pos(pawn)
                     if not pos:
@@ -2232,6 +2271,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                             continue
                     if not self._pawn_alive_for_esp(actor, 0):
                         continue
+                    target_is_hunter = self._read_is_hunter(actor)
+                    if enemy_only and not self._is_player_enemy(local_is_hunter, target_is_hunter):
+                        continue
                     pos = self.get_actor_root_pos(actor)
                     if not pos:
                         continue
@@ -2254,10 +2296,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
 
     # Camouflage — offsets from Dumper-7 dump
-    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-06-29)
+    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-07-01 game update)
     #
-    # Globals (Basic.hpp / OffsetsInfo.json):
-    #   GObjects 0x09F33450  GNames 0x09E16DF8  GWorld 0x09C7C620  ProcessEvent 0x015D0950
+    # Globals (OffsetsInfo.json / Basic.hpp):
+    #   GObjects 0x09F3C6D0  GNames 0x09E20078  GWorld 0x09C85620  ProcessEvent 0x015D0AD0
     #   FNAMEPOOL_DELTA 0x11C658  AppendString 0x013B3110  ProcessEventIdx 0x4C
     #
     # ABP_FirstPersonCharacter_cLeon_Character_C:
@@ -2579,30 +2621,30 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     # FunctionsInfo / exec thunks directly.  Re-verify prologues at runtime because
     # game patches shift these by small deltas (calling a stale RVA lands mid-function
     # and corrupts the heap — "ClearChannel ok=True" then crash / inject failure).
-    RVA_PAINT_AT_UV_DUMP          = 0x50E2AA0   # FunctionsInfo PaintAtUV exec
-    RVA_PAINT_AT_UV_LEGACY        = 0x50FE7A0   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
-    RVA_EXEC_PAINT_AT_UV          = 0x50E2AA0   # exec anchor for scan / self-test
-    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F4400   # deep ClearChannel native (RCX=comp, DL=channel)
-    RVA_EXPORT_CHANNEL_LEGACY     = 0x50F6C60   # deep ExportChannelToBytes worker
-    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FA5F0   # Import dispatch wrapper
-    RVA_EXEC_IMPORT_CHANNEL       = 0x50E1B50   # exec ImportChannelFromBytes (scan anchor)
-    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E13A0   # FunctionsInfo ClearChannel exec
-    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E1460   # FunctionsInfo ExportChannelToBytes exec
-    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E1B50   # FunctionsInfo ImportChannelFromBytes exec
-    RVA_BEGIN_STROKE_NATIVE       = 0x50E1360   # FunctionsInfo BeginStroke exec
-    RVA_END_STROKE_NATIVE         = 0x50E1440   # FunctionsInfo EndStroke exec
-    RVA_BEGIN_STROKE_LEGACY       = 0x50EFC80   # deep BeginStroke worker
-    RVA_END_STROKE_LEGACY         = 0x50F6590   # deep EndStroke worker
-    RVA_IMPORT_RT_NATIVE          = 0x5104030   # copies TArray bytes into AlbedoRenderTarget
-    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D07E0   # FunctionsInfo RequestFullTextureSync (do NOT call)
-    RVA_APPLY_PAINT_TO_MATERIAL   = 0x5103270   # internal RT→material worker (do NOT call directly)
+    RVA_PAINT_AT_UV_DUMP          = 0x50E5300   # FunctionsInfo PaintAtUV exec
+    RVA_PAINT_AT_UV_LEGACY        = 0x5101000   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
+    RVA_EXEC_PAINT_AT_UV          = 0x50E5300   # exec anchor for scan / self-test
+    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F6C60   # deep ClearChannel native (RCX=comp, DL=channel)
+    RVA_EXPORT_CHANNEL_LEGACY     = 0x50F94C0   # deep ExportChannelToBytes worker
+    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FCE50   # Import dispatch wrapper
+    RVA_EXEC_IMPORT_CHANNEL       = 0x50E3D90   # exec ImportChannelFromBytes (scan anchor)
+    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E35E0   # FunctionsInfo ClearChannel exec
+    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E36A0   # FunctionsInfo ExportChannelToBytes exec
+    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E3D90   # FunctionsInfo ImportChannelFromBytes exec
+    RVA_BEGIN_STROKE_NATIVE       = 0x50E35A0   # FunctionsInfo BeginStroke exec
+    RVA_END_STROKE_NATIVE         = 0x50E3680   # FunctionsInfo EndStroke exec
+    RVA_BEGIN_STROKE_LEGACY       = 0x50F24E0   # deep BeginStroke worker
+    RVA_END_STROKE_LEGACY         = 0x50F8DF0   # deep EndStroke worker
+    RVA_IMPORT_RT_NATIVE          = 0x5106890   # copies TArray bytes into AlbedoRenderTarget
+    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D19C0   # FunctionsInfo RequestFullTextureSync (do NOT call)
+    RVA_APPLY_PAINT_TO_MATERIAL   = 0x5105AD0   # internal RT→material worker (do NOT call directly)
     OFF_PAINT_CHANNELS_DIRTY      = 0x016B      # DISABLED — overlaps DynamicMaterialInstance @ +0x0168
-    RVA_REQUEST_TEXTURE_SYNC        = 0x50FCDB0   # DO NOT call from Peterhack — delayed AV crash
-    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E2860   # PaintAtScreenPosition exec (FunctionsInfo)
-    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E1990   # HitTestAtScreenPosition exec (FunctionsInfo)
-    RVA_GET_PAINT_MESH_NATIVE     = 0x50E1710   # GetInitializedPaintMesh exec (FunctionsInfo)
-    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E2860   # PaintAtScreenPosition scan anchor
-    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E1990   # HitTestAtScreenPosition scan anchor
+    RVA_REQUEST_TEXTURE_SYNC        = 0x50FF610   # DO NOT call from Peterhack — delayed AV crash
+    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E50C0   # PaintAtScreenPosition exec (FunctionsInfo)
+    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E3BD0   # HitTestAtScreenPosition exec (FunctionsInfo)
+    RVA_GET_PAINT_MESH_NATIVE     = 0x50E3950   # GetInitializedPaintMesh exec (FunctionsInfo)
+    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E50C0   # PaintAtScreenPosition scan anchor
+    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E3BD0   # HitTestAtScreenPosition scan anchor
     EPaintChannel_Albedo = 0
     EPaintChannel_All = 4
 
@@ -4921,10 +4963,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     def _verify_paint_build_offsets(self):
         """Log dump vs live prologue checks for the current game build."""
         dump_globals = (
-            ("GObjects", 0x09F33450),
-            ("GNames", 0x09E16DF8),
-            ("GWorld", 0x09C7C620),
-            ("ProcessEvent", 0x015D0950),
+            ("GObjects", 0x09F3C6D0),
+            ("GNames", 0x09E20078),
+            ("GWorld", 0x09C85620),
+            ("ProcessEvent", 0x015D0AD0),
         )
         workers = (
             ("PaintAtUV", self.RVA_PAINT_AT_UV_LEGACY),
