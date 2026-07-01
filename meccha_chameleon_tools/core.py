@@ -1631,12 +1631,13 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self.set_blocked_steam_ids(ids)
         return ids
 
-    def get_session_players(self, force=False):
-        """All PlayerState entries in the current session (lobby + match). Cached ~1s."""
+    def get_session_players(self, force=False, resolve_steam=False):
+        """All PlayerState entries in the current session (lobby + match). Cached ~2s."""
         import time as _time
 
         now = _time.monotonic()
-        if not force and self._session_players_cache and (now - self._session_players_cache_ts) < 1.0:
+        cache_ttl = 2.0 if resolve_steam else 2.5
+        if not force and self._session_players_cache and (now - self._session_players_cache_ts) < cache_ttl:
             return list(self._session_players_cache)
 
         world = self._get_world()
@@ -1658,6 +1659,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             self._session_players_cache = []
             self._session_players_cache_ts = now
             return []
+        want_steam = resolve_steam or (self._steam_features_active and force)
         players = []
         for i in range(min(pa_count, self.MAX_ESP_PLAYERS)):
             ps = rp(self.pm, pa_data + i * 8)
@@ -1665,7 +1667,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 continue
             pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
             ih = self._read_is_hunter(pawn) if pawn else None
-            if self._steam_features_active or force:
+            if want_steam:
                 steam_id = self.get_player_steam_id(ps)
             else:
                 steam_id = self.peek_steam_id(ps)

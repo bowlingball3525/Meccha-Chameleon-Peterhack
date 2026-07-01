@@ -520,6 +520,7 @@ class Menu(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._drag_pos = None
         self._key_recorder = KeyRecorder(self._on_key_recorded, parent=self)
+        self._magnet_key_recorder = KeyRecorder(self._on_magnet_key_recorded, parent=self)
         self._paint_last_apply = 0.0
         self._paint_busy = False
         _queued = Qt.QueuedConnection
@@ -543,6 +544,10 @@ class Menu(QWidget):
         self._player_rows = []
         self._blocklist_entries = load_blocklist()
         self.esp.refresh_blocklist_cache(force=True)
+        if hasattr(self.esp, "set_rename_notify"):
+            self.esp.set_rename_notify(
+                lambda ok, msg: self.trainer_rename_finished.emit(ok, msg or "")
+            )
         self._build_ui()
         self._player_list_timer = QTimer(self)
         self._player_list_timer.timeout.connect(self._refresh_players_tab)
@@ -679,43 +684,23 @@ class Menu(QWidget):
         )
 
     def _run_trainer_rename(self):
-        if getattr(self, "_trainer_rename_busy", False):
-            return
-        if getattr(self, "_trainer_rename_thread", None) and self._trainer_rename_thread.is_alive():
-            return
         name = self.txt_trainer_rename.text().strip()[:32]
         if not name:
             self.lbl_trainer_rename_status.setText("Enter a name first.")
             return
         self.config.trainer_rename_text = name
-        self._trainer_rename_busy = True
-        self.btn_trainer_rename.setEnabled(False)
-        self.lbl_trainer_rename_status.setText(f"Renaming to '{name}'...")
-        self._trainer_rename_thread = threading.Thread(
-            target=self._trainer_rename_worker,
-            args=(name,),
-            daemon=True,
-        )
-        self._trainer_rename_thread.start()
-
-    def _trainer_rename_worker(self, name):
-        ok = False
-        msg = "Rename failed."
-        try:
-            ok, msg = self.esp.trainer_rename_now(name, self.config, force=True)
-            if not msg:
-                msg = "Renamed." if ok else "Rename failed."
-        except Exception as exc:
-            msg = str(exc)
-            ok = False
-        self.trainer_rename_finished.emit(ok, msg)
+        if hasattr(self.esp, "queue_trainer_rename"):
+            self.esp.queue_trainer_rename(name, self.config, force=True)
+            self.lbl_trainer_rename_status.setText(f"Queued '{name}'...")
+        else:
+            self.lbl_trainer_rename_status.setText("Rename unavailable — restart Peterhack.")
 
     def _trainer_rename_done(self, ok, msg):
-        self._trainer_rename_busy = False
-        self._trainer_rename_thread = None
-        self.btn_trainer_rename.setEnabled(True)
         short = msg if len(msg) <= 140 else msg[:137] + "..."
-        self.lbl_trainer_rename_status.setText(("OK — " if ok else "Failed — ") + short)
+        if ok:
+            self.lbl_trainer_rename_status.setText("OK — " + short)
+        else:
+            self.lbl_trainer_rename_status.setText("Failed — " + short)
 
     def _run_bridge_teleport(self):
         if getattr(self, "_bridge_exploit_busy", False):
@@ -958,6 +943,12 @@ class Menu(QWidget):
         self.btn_record_key.setEnabled(True)
         self.btn_record_key.setText("Record Key")
 
+    def _on_magnet_key_recorded(self, name):
+        self.config.trainer_magnet_key = name
+        self.lbl_magnet_key.setText(f"Magnet toggle key: {name}")
+        self.btn_record_magnet_key.setEnabled(True)
+        self.btn_record_magnet_key.setText("Record Key")
+
     def _build_ui(self):
         import os as _os
         container = QFrame(self)
@@ -1118,7 +1109,7 @@ class Menu(QWidget):
                 self._update_steam_features_active()
                 self._refresh_players_tab()
                 if not self._player_list_timer.isActive():
-                    self._player_list_timer.start(3000)
+                    self._player_list_timer.start(5000)
             else:
                 self._player_list_timer.stop()
                 self._update_steam_features_active()
@@ -1228,17 +1219,19 @@ class Menu(QWidget):
         self.tbl_players.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_players.verticalHeader().setVisible(False)
         self.tbl_players.setShowGrid(False)
-        self.tbl_players.setAlternatingRowColors(True)
-        self.tbl_players.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.tbl_players.setAlternatingRowColors(False)
+        self.tbl_players.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.tbl_players.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.tbl_players.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.tbl_players.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tbl_players.setMinimumHeight(120)
         self.tbl_players.setStyleSheet(
             "QTableWidget { background: #141e10; color: #d4e4c8; gridline-color: #2a4a1a; }"
+            " QTableWidget::item { background: #141e10; color: #d4e4c8; padding: 3px 6px; }"
+            " QTableWidget::item:selected { background: #2a5a1a; color: #e8ffe0; }"
             " QHeaderView::section { background: #1a2814; color: #7ec850; padding: 4px; border: none; }"
-            " QScrollBar:vertical { background: #111a0d; width: 10px; border-radius: 5px; }"
-            " QScrollBar::handle:vertical { background: #3a6a2a; border-radius: 5px; min-height: 20px; }"
+            " QScrollBar:vertical { background: #111a0d; width: 12px; border-radius: 5px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: #3a6a2a; border-radius: 5px; min-height: 24px; }"
             " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
             " QScrollBar:horizontal { background: #111a0d; height: 10px; border-radius: 5px; }"
             " QScrollBar::handle:horizontal { background: #3a6a2a; border-radius: 5px; min-width: 20px; }"
@@ -1260,8 +1253,15 @@ class Menu(QWidget):
         self.btn_save_block = QPushButton("Save to Blocklist")
         self.btn_save_block.setFocusPolicy(Qt.NoFocus)
         self.btn_save_block.clicked.connect(self._save_selected_to_blocklist)
+        self.btn_kill_survivor = QPushButton("Kill Selected Survivor")
+        self.btn_kill_survivor.setFocusPolicy(Qt.NoFocus)
+        self.btn_kill_survivor.setToolTip(
+            "Hunter only: calls KillPlayer on the selected survivor (host/session rules apply)."
+        )
+        self.btn_kill_survivor.clicked.connect(self._kill_selected_survivor)
         btn_row.addWidget(self.btn_copy_steam_id)
         btn_row.addWidget(self.btn_save_block)
+        btn_row.addWidget(self.btn_kill_survivor)
         lo.addLayout(btn_row)
 
         lo.addWidget(QLabel("Blocklist (saved to C:\\peterhack\\blocked_players.json)"))
@@ -1305,7 +1305,6 @@ class Menu(QWidget):
             getattr(self.config, "show_steam_id", False)
             or bool(getattr(self.esp, "_blocklist_cache_ids", set()))
             or getattr(self.config, "autokick_enabled", False)
-            or on_players_tab
         )
         self.esp.set_steam_features_active(active)
 
@@ -1359,6 +1358,7 @@ class Menu(QWidget):
         self._blocklist_entries = load_blocklist()
         self.esp.refresh_blocklist_cache(force=True)
         self.esp.invalidate_session_players_cache()
+        self._players_tab_sig = None
         self._players_tab_blocked = None
         self.lst_blocklist.clear()
         for entry in self._blocklist_entries:
@@ -1370,37 +1370,86 @@ class Menu(QWidget):
                 label += f"  ({added})"
             self.lst_blocklist.addItem(label)
 
+    def _player_row_signature(self, players, blocked):
+        parts = []
+        for p in players:
+            parts.append(
+                (
+                    p.get("player_state"),
+                    p.get("pawn"),
+                    p.get("player_name"),
+                    p.get("is_hunter"),
+                    (p.get("steam_id") or "")[:20],
+                    p.get("is_local"),
+                )
+            )
+        return (tuple(parts), frozenset(blocked or ()))
+
     def _refresh_players_tab(self):
         if not hasattr(self, "tbl_players"):
             return
         if self._pages.get("PLAYERS") is not self.stack.currentWidget():
             return
         try:
-            self.esp.set_steam_features_active(True)
-            players = self.esp.get_session_players(force=True)
+            players = self.esp.get_session_players(force=False, resolve_steam=False)
         except Exception:
             players = []
         blocked = self._blocklist_entries and blocklist_ids(self._blocklist_entries) or set()
-        if players == self._player_rows and blocked == getattr(self, "_players_tab_blocked", set()):
+        sig = self._player_row_signature(players, blocked)
+        if sig == getattr(self, "_players_tab_sig", None):
             return
-        self._players_tab_blocked = blocked
+        self._players_tab_sig = sig
         self._player_rows = players
-        self.tbl_players.setRowCount(len(players))
-        for row, pdata in enumerate(players):
-            name = pdata.get("player_name") or pdata.get("steam_name") or "?"
-            if pdata.get("is_local"):
-                name = f"{name} (you)"
-            ih = pdata.get("is_hunter")
-            team = "Hunter" if ih is True else ("Survivor" if ih is False else "?")
-            sid = (pdata.get("steam_id") or "").strip() or "—"
-            flag = "BLOCKED" if sid in blocked else ("LOCAL" if pdata.get("is_local") else "")
-            for col, text in enumerate((name, team, sid, flag)):
-                item = QTableWidgetItem(text)
-                if sid in blocked:
-                    item.setForeground(QColor(255, 140, 60))
-                elif pdata.get("is_local"):
-                    item.setForeground(QColor(126, 200, 80))
-                self.tbl_players.setItem(row, col, item)
+        sel_row = getattr(self, "_players_last_selected_row", -1)
+        self.tbl_players.setUpdatesEnabled(False)
+        self.tbl_players.blockSignals(True)
+        try:
+            self.tbl_players.setRowCount(len(players))
+            bg = QColor(20, 30, 16)
+            fg = QColor(212, 228, 200)
+            for row, pdata in enumerate(players):
+                name = pdata.get("player_name") or pdata.get("steam_name") or "?"
+                if pdata.get("is_local"):
+                    name = f"{name} (you)"
+                ih = pdata.get("is_hunter")
+                team = "Hunter" if ih is True else ("Survivor" if ih is False else "?")
+                sid = (pdata.get("steam_id") or "").strip() or "—"
+                flag = "BLOCKED" if sid in blocked else ("LOCAL" if pdata.get("is_local") else "")
+                for col, text in enumerate((name, team, sid, flag)):
+                    item = QTableWidgetItem(text)
+                    item.setBackground(bg)
+                    if sid in blocked:
+                        item.setForeground(QColor(255, 140, 60))
+                    elif pdata.get("is_local"):
+                        item.setForeground(QColor(126, 200, 80))
+                    else:
+                        item.setForeground(fg)
+                    self.tbl_players.setItem(row, col, item)
+                self.tbl_players.setRowHeight(row, 22)
+            if 0 <= sel_row < len(players):
+                self.tbl_players.selectRow(sel_row)
+        finally:
+            self.tbl_players.blockSignals(False)
+            self.tbl_players.setUpdatesEnabled(True)
+
+    def _kill_selected_survivor(self):
+        pdata = self._selected_player_row()
+        if not pdata:
+            self._players_status("Select a survivor first")
+            return
+        if pdata.get("is_hunter") is not False:
+            self._players_status("Selected player is not a survivor")
+            return
+        pawn = pdata.get("pawn") or 0
+        if not pawn:
+            self._players_status("Survivor pawn not available yet")
+            return
+        if not hasattr(self.esp, "kill_survivor_pawn"):
+            self._players_status("Kill not available")
+            return
+        ok, err = self.esp.kill_survivor_pawn(pawn, config=self.config)
+        name = pdata.get("player_name") or "survivor"
+        self._players_status(f"Killed {name}" if ok else f"Kill failed: {err}")
 
     def _copy_selected_steam_id(self):
         pdata = self._selected_player_row()
@@ -1443,6 +1492,13 @@ class Menu(QWidget):
             self._players_status("Removed from blocklist")
         else:
             self._players_status("Failed to update blocklist")
+
+    def _on_trainer_rename_text_changed(self, text):
+        self.config.trainer_rename_text = text.strip()
+        if hasattr(self.esp, "_trainer_auto_rename_queued_for"):
+            self.esp._trainer_auto_rename_queued_for = None
+        if hasattr(self.esp, "_trainer_rename_pending_name"):
+            self.esp._trainer_rename_pending_name = None
 
     def _build_radar_tab(self):
         p = self._pages["RADAR"]
@@ -1538,6 +1594,12 @@ class Menu(QWidget):
         lo.addWidget(self._chk("No Gun Cooldown (Hunter)", "trainer_no_gun_cooldown"))
         lo.addWidget(self._chk("No Recoil", "trainer_no_recoil"))
         lo.addWidget(self._chk("No Decoy Cooldown", "trainer_no_decoy_cooldown"))
+        cb_anti_detect = self._chk("Anti Detection (Survivor)", "trainer_anti_detection")
+        cb_anti_detect.setToolTip(
+            "Clears OverlapCheckCapsules each tick so buried survivors are not revealed as \"Too Buried\"."
+        )
+        lo.addWidget(cb_anti_detect)
+        lo.addWidget(self._chk("Infinite Bullets (Hunter)", "trainer_infinite_bullets"))
         lo.addWidget(self._chk("Set Decoy Num", "trainer_set_decoy_num"))
 
         dr = QHBoxLayout()
@@ -1550,6 +1612,20 @@ class Menu(QWidget):
         )
         dr.addWidget(self.spn_decoy_count)
         lo.addLayout(dr)
+
+        magnet_row = QHBoxLayout()
+        self.lbl_magnet_key = QLabel("Magnet toggle key: " + getattr(self.config, "trainer_magnet_key", "G"))
+        self.btn_record_magnet_key = QPushButton("Record Key")
+        self.btn_record_magnet_key.setToolTip(
+            "Press the key to toggle survivor magnet (default G). Pulls survivors in a line along your view."
+        )
+        self.btn_record_magnet_key.clicked.connect(self._start_magnet_key_record)
+        magnet_row.addWidget(self.lbl_magnet_key)
+        magnet_row.addWidget(self.btn_record_magnet_key)
+        lo.addLayout(magnet_row)
+        self.lbl_magnet_status = QLabel("Magnet: OFF")
+        self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
+        lo.addWidget(self.lbl_magnet_status)
 
         lo.addWidget(self._chk("Anti-Clipping (noclip)", "trainer_anti_clipping"))
         cb_anti_kick = self._chk("Anti-Kick", "trainer_anti_kick")
@@ -1572,9 +1648,7 @@ class Menu(QWidget):
             "Calls SetName(Server) on your PlayerState — replicates CustomPlayerName\n"
             "so the nameplate above your character updates for everyone."
         )
-        self.txt_trainer_rename.textChanged.connect(
-            lambda t: setattr(self.config, "trainer_rename_text", t.strip())
-        )
+        self.txt_trainer_rename.textChanged.connect(self._on_trainer_rename_text_changed)
         self.txt_trainer_rename.returnPressed.connect(self._run_trainer_rename)
         rr.addWidget(self.txt_trainer_rename)
         self.btn_trainer_rename = QPushButton("Rename")
@@ -1643,6 +1717,15 @@ class Menu(QWidget):
         self.btn_bridge_kill.clicked.connect(self._run_bridge_kill)
         kill_row.addWidget(self.btn_bridge_kill)
         lo.addLayout(kill_row)
+
+        hunter_row = QHBoxLayout()
+        self.btn_kill_all_survivors = QPushButton("Kill All Survivors")
+        self.btn_kill_all_survivors.setToolTip(
+            "Hunter only: KillPlayer on every survivor in the session (one click, staggered)."
+        )
+        self.btn_kill_all_survivors.clicked.connect(self._run_kill_all_survivors)
+        hunter_row.addWidget(self.btn_kill_all_survivors)
+        lo.addLayout(hunter_row)
 
         self.lbl_bridge_exploit_status = QLabel("")
         self.lbl_bridge_exploit_status.setWordWrap(True)
@@ -2120,6 +2203,16 @@ class Menu(QWidget):
             "=== Peterhack Changelog ===\n"
             "\n"
             "--- Jul 1, 2026 (latest) ---\n"
+            "\n"
+            "[chameleonEsp feature port + player list fixes]\n"
+            "  + Anti Detection (Survivor) — clears OverlapCheckCapsules (Too Buried).\n"
+            "  + Infinite Bullets (Hunter), Magnet toggle (default G, rebindable).\n"
+            "  + Kill Selected Survivor (PLAYERS tab) + Kill All Survivors (EXPLOITS).\n"
+            "  + Player list lag/white-row/scrollbar fixes; lighter Steam ID refresh.\n"
+            "\n"
+            "[Rename — non-blocking queue]\n"
+            "  + Auto-Rename + manual Rename run on background thread.\n"
+            "  + Latest name wins; ~0.45 s rate limit; UI no longer freezes when spamming.\n"
             "\n"
             "[Anti-Kick — vtable hook + kick logger]\n"
             "  + Replaced global ProcessEvent inline patch with vtable hooks on\n"
@@ -2722,6 +2815,39 @@ class Menu(QWidget):
         self.btn_record_key.setText('Press key...')
         self._key_recorder.start()
 
+    def _start_magnet_key_record(self):
+        self.btn_record_magnet_key.setEnabled(False)
+        self.btn_record_magnet_key.setText("Press key...")
+        self._magnet_key_recorder.start()
+
+    def _run_kill_all_survivors(self):
+        if not hasattr(self.esp, "kill_all_survivors"):
+            self.lbl_bridge_exploit_status.setText("Kill not available.")
+            return
+        self.lbl_bridge_exploit_status.setText("Killing all survivors...")
+        QApplication.processEvents()
+        killed, errors = self.esp.kill_all_survivors(config=self.config)
+        err_txt = errors[0] if errors else ""
+        if killed:
+            msg = f"KillPlayer sent for {killed} survivor(s)."
+            if err_txt:
+                msg += f" ({len(errors)} failed)"
+        else:
+            msg = err_txt or "No survivors killed (not hunter or none in session)."
+        self.lbl_bridge_exploit_status.setText(msg)
+
+    def _update_magnet_status_label(self):
+        if not hasattr(self, "lbl_magnet_status"):
+            return
+        active = getattr(self.esp, "_magnet_active", False)
+        key = getattr(self.config, "trainer_magnet_key", "G")
+        if active:
+            self.lbl_magnet_status.setText(f"Magnet: ON — press {key} to disable")
+            self.lbl_magnet_status.setStyleSheet("color: #ff6666; font-size: 10px; font-weight: bold;")
+        else:
+            self.lbl_magnet_status.setText(f"Magnet: OFF — press {key} to toggle (hunter)")
+            self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
+
     def _on_update_check_failed(self, message):
         QMessageBox.warning(self, "Update failed", message)
 
@@ -3070,6 +3196,9 @@ class Overlay(QWidget):
                 menu._on_hotkey_f9()
                 self._f9_last_fire_ms = now_ms
             self._key_states["f9"] = f9_down
+
+        if menu and hasattr(menu, "_update_magnet_status_label"):
+            menu._update_magnet_status_label()
 
     def _toggle_camouflage(self):
         """Delegate to Menu — F10 polling and legacy callers."""
@@ -4113,6 +4242,9 @@ class Overlay(QWidget):
             _draw_label(painter, 10, 74, "CAMO ON (3D)", QColor(*self._camouflage_color))
         elif not self._camouflage_active:
             _draw_label(painter, 10, 74, "CAMO F10", QColor(150, 150, 150))
+
+        if getattr(self.esp, "_magnet_active", False):
+            _draw_label(painter, 10, 91, "MAGNET ACTIVE", QColor(255, 80, 80))
 
         # Aimbot
         if self.config.aimbot_enabled:

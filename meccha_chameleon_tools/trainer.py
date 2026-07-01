@@ -1,5 +1,7 @@
 """In-game exploit toggles and ProcessEvent helpers with debug logging."""
+import math
 import struct
+import threading
 import time
 import traceback
 
@@ -73,6 +75,12 @@ class TrainerMixin:
 
     # BP_FirstPersonCharacter_cLeon_Character_Hunter_C
     OFF_GUN_COOL_TIME = 0x0D20
+    OFF_INFINITY_BULLET = 0x0D94
+    OFF_MY_PLAYER_STATE = 0x0808
+    OFF_IS_HUNTER = 0x0C3A
+    # BP_FirstPersonCharacter_cLeon_Character_Survivor_C
+    OFF_OVERLAP_CHECK_CAPSULES = 0x0CE0
+    OFF_UFUNCTION_PARMS_SIZE = 0x58
     # ABP_FirstPersonCharacter_cLeon_Character_C
     OFF_DECOY_COOL_TIMES = 0x0CA0
     OFF_DECOY_COOL_DEFAULT = 0x0CB0
@@ -129,6 +137,75 @@ class TrainerMixin:
         self._anti_kick_watch_pc = 0
         self._anti_kick_watch_ps = 0
         self._anti_kick_refresh_last = 0.0
+        self._magnet_active = False
+        self._magnet_key_was_down = False
+        self._rename_lock = threading.Lock()
+        self._rename_pending = None
+        self._rename_worker_alive = False
+        self._rename_notify = None
+        self._rename_last_send_ts = 0.0
+        self._rename_min_interval = 0.45
+        self._trainer_auto_rename_queued_for = None
+        self._trainer_rename_bridge_timeout = 10
+
+    def set_rename_notify(self, callback):
+        """Optional callable(ok, msg) after a queued rename finishes (may run on worker thread)."""
+        self._rename_notify = callback
+
+    def queue_trainer_rename(self, name, config=None, force=False):
+        """Queue a rename on a background thread; latest name wins (never blocks UI)."""
+        name = (name or "").strip()[:32]
+        if not name:
+            return False
+        if config is None:
+            config = getattr(self, "config", None)
+        with self._rename_lock:
+            self._rename_pending = (name, bool(force), config)
+            if not self._rename_worker_alive:
+                self._rename_worker_alive = True
+                threading.Thread(target=self._rename_worker_loop, daemon=True).start()
+        return True
+
+    def _rename_worker_loop(self):
+        try:
+            while True:
+                with self._rename_lock:
+                    if not self._rename_pending:
+                        break
+                    name, force, config = self._rename_pending
+                    self._rename_pending = None
+
+                now = time.monotonic()
+                wait = self._rename_min_interval - (now - self._rename_last_send_ts)
+                if wait > 0:
+                    time.sleep(wait)
+                    with self._rename_lock:
+                        if self._rename_pending:
+                            continue
+
+                pawn = self._find_local_pawn()
+                ok, msg = self._trainer_apply_rename(pawn, config, name, force=force)
+                self._rename_last_send_ts = time.monotonic()
+
+                notify = getattr(self, "_rename_notify", None)
+                if notify:
+                    try:
+                        notify(ok, msg or ("Renamed." if ok else "Rename failed."))
+                    except Exception:
+                        pass
+
+                with self._rename_lock:
+                    if not self._rename_pending:
+                        time.sleep(0.05)
+                        if not self._rename_pending:
+                            break
+        finally:
+            with self._rename_lock:
+                if self._rename_pending:
+                    self._rename_worker_alive = True
+                    threading.Thread(target=self._rename_worker_loop, daemon=True).start()
+                else:
+                    self._rename_worker_alive = False
 
     def _trainer_enabled(self, config):
         return any((
@@ -137,6 +214,8 @@ class TrainerMixin:
             config.trainer_no_decoy_cooldown,
             config.trainer_set_decoy_num,
             config.trainer_anti_clipping,
+            config.trainer_anti_detection,
+            config.trainer_infinite_bullets,
             config.trainer_anti_kick,
             config.trainer_auto_rename,
         ))
@@ -275,15 +354,167 @@ class TrainerMixin:
         if not pawn:
             return
         try:
-            _wdouble(self.pm, pawn + self.OFF_DECOY_COOL_DEFAULT, 0.0)
+            ready = 30.0
+            _wdouble(self.pm, pawn + self.OFF_DECOY_COOL_DEFAULT, ready)
             data, count = _read_tarray_ptr(self.pm, pawn + self.OFF_DECOY_COOL_TIMES)
             if data and count > 0 and count < 64:
                 for i in range(count):
-                    _wdouble(self.pm, data + i * 8, 0.0)
+                    _wdouble(self.pm, data + i * 8, ready)
             elif count == 0:
                 self._trainer_log("DECOY-CD", "DecoyCoolTimes empty", config=config, level="debug", interval=10.0)
         except Exception as exc:
             self._trainer_error("DECOY-CD", exc, config)
+
+    def _trainer_anti_detection(self, pawn, config):
+        if not pawn or self._read_is_hunter(pawn) is not False:
+            return
+        try:
+            if _wint32(self.pm, pawn + self.OFF_OVERLAP_CHECK_CAPSULES + 8, 0):
+                self._trainer_log(
+                    "ANTI-DETECT",
+                    "cleared OverlapCheckCapsules",
+                    config=config,
+                    level="debug",
+                    interval=8.0,
+                )
+        except Exception as exc:
+            self._trainer_error("ANTI-DETECT", exc, config)
+
+    def _trainer_infinite_bullets(self, pawn, config):
+        if not pawn or self._read_is_hunter(pawn) is not True:
+            return
+        try:
+            raw = self.pm.read_bytes(pawn + self.OFF_INFINITY_BULLET, 1)[0]
+            if raw == 0:
+                _wbyte(self.pm, pawn + self.OFF_INFINITY_BULLET, 1)
+                self._trainer_log("INF-BULLETS", "InfinityBullet -> true", config=config, level="debug", interval=8.0)
+        except Exception as exc:
+            self._trainer_error("INF-BULLETS", exc, config)
+
+    @staticmethod
+    def _forward_from_control_rotation(pitch_deg, yaw_deg):
+        pr = math.radians(float(pitch_deg))
+        yr = math.radians(float(yaw_deg))
+        cp = math.cos(pr)
+        return (
+            math.cos(yr) * cp,
+            math.sin(yr) * cp,
+            math.sin(pr),
+        )
+
+    def _teleport_pawn_pe(self, pawn, x, y, z):
+        if not pawn:
+            return False
+        fn, _ = self._find_ue_function_on_object(pawn, "K2_SetActorLocation")
+        if not fn:
+            return False
+        psize = max(_ru32(self.pm, fn + self.OFF_UFUNCTION_PARMS_SIZE), 0x128)
+        buf = bytearray(psize)
+        struct.pack_into("<ddd", buf, 0, float(x), float(y), float(z))
+        if psize > 24:
+            buf[24] = 0
+        if psize > 0x120:
+            buf[0x120] = 1
+        return self._process_event_call(pawn, fn, bytes(buf))
+
+    def _trainer_magnet_key_toggle(self, config):
+        try:
+            from meccha_chameleon_tools.ui import vk_from_name
+            import ctypes
+            vk = vk_from_name(getattr(config, "trainer_magnet_key", "G"))
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+            if down and not self._magnet_key_was_down:
+                self._magnet_active = not self._magnet_active
+                self._trainer_log(
+                    "MAGNET",
+                    f"{'ON' if self._magnet_active else 'OFF'} (key {config.trainer_magnet_key})",
+                    config=config,
+                    force=True,
+                )
+            self._magnet_key_was_down = down
+        except Exception as exc:
+            self._trainer_error("MAGNET", exc, config)
+
+    def _trainer_magnet(self, hunter_pawn, config):
+        if not self._magnet_active or not hunter_pawn:
+            return
+        if self._read_is_hunter(hunter_pawn) is not True:
+            return
+        loc = self.get_actor_root_pos(hunter_pawn) if hasattr(self, "get_actor_root_pos") else None
+        rot = self.get_control_rotation() if hasattr(self, "get_control_rotation") else None
+        if not loc or not rot:
+            return
+        fx, fy, fz = self._forward_from_control_rotation(rot[0], rot[1])
+        depth = 0
+        try:
+            players = self.get_session_players(force=False) if hasattr(self, "get_session_players") else []
+            for pdata in players:
+                if pdata.get("is_local"):
+                    continue
+                if pdata.get("is_hunter") is not False:
+                    continue
+                actor = pdata.get("pawn") or 0
+                if not actor:
+                    continue
+                spread = depth * 120.0
+                dist = 150.0 + spread
+                tx = loc[0] + fx * dist
+                ty = loc[1] + fy * dist
+                tz = loc[2] + fz * dist
+                self._teleport_pawn_pe(actor, tx, ty, tz)
+                depth += 1
+        except Exception as exc:
+            self._trainer_error("MAGNET", exc, config)
+
+    def kill_survivor_pawn(self, target_pawn, config=None):
+        hunter = self._find_local_pawn()
+        if not hunter or not target_pawn:
+            return False, "no hunter or target pawn"
+        if self._read_is_hunter(hunter) is not True:
+            return False, "local player is not hunter"
+        if self._read_is_hunter(target_pawn) is not False:
+            return False, "target is not a survivor"
+        fn, _ = self._find_ue_function_on_object(hunter, "KillPlayer")
+        if not fn:
+            fn = self._find_ue_function(
+                "BP_FirstPersonCharacter_cLeon_Character_Hunter_C", "KillPlayer"
+            )
+        if not fn:
+            return False, "KillPlayer UFunction not found"
+        my_ps = _rp(self.pm, hunter + self.OFF_MY_PLAYER_STATE)
+        if not my_ps:
+            world = self._get_world() if hasattr(self, "_get_world") else 0
+            pc = self._get_local_controller(world) if world else 0
+            my_ps = _rp(self.pm, pc + self.offsets.get("AController::PlayerState", 0x2B0)) if pc else 0
+        params = struct.pack("<QQ", int(target_pawn), int(my_ps))
+        ok = self._process_event_call(hunter, fn, params)
+        if config is not None:
+            self._trainer_log(
+                "KILL",
+                f"KillPlayer target=0x{target_pawn:X} ok={ok}",
+                config=config,
+                force=True,
+            )
+        return ok, "ok" if ok else "ProcessEvent failed"
+
+    def kill_all_survivors(self, config=None):
+        killed = 0
+        errors = []
+        for pdata in self.get_session_players(force=False):
+            if pdata.get("is_local"):
+                continue
+            if pdata.get("is_hunter") is not False:
+                continue
+            pawn = pdata.get("pawn") or 0
+            if not pawn:
+                continue
+            ok, err = self.kill_survivor_pawn(pawn, config=config)
+            if ok:
+                killed += 1
+            else:
+                errors.append(err)
+            time.sleep(0.05)
+        return killed, errors
 
     def _trainer_set_decoy_num(self, pawn, config):
         comp = self._trainer_paintable_comp(pawn)
@@ -819,9 +1050,6 @@ class TrainerMixin:
         else:
             cur = self.get_custom_player_name(ps)
 
-        if getattr(self, "_trainer_rename_in_flight", False):
-            return False, "rename already in progress"
-
         if not hasattr(self, "_bridge_request"):
             self._trainer_log(
                 "RENAME",
@@ -838,26 +1066,28 @@ class TrainerMixin:
             return False, err
 
         cls = self.objects.class_name(ps) or "?"
-        self._trainer_rename_in_flight = True
+        timeout = getattr(self, "_trainer_rename_bridge_timeout", 10)
         try:
-            resp = self._bridge_request("set_player_name", {"name": name}, timeout=30)
+            resp = self._bridge_request("set_player_name", {"name": name}, timeout=timeout)
         except Exception as exc:
             self._trainer_log("RENAME", f"bridge request failed: {exc}", config=config, level="error", force=True)
             return False, str(exc)
-        finally:
-            self._trainer_rename_in_flight = False
 
         ok = bool(resp and resp.get("success"))
         if ok:
             self._trainer_last_rename = name
             self._trainer_last_rename_ts = now
+            if getattr(self, "_trainer_auto_rename_queued_for", None) == name:
+                self._trainer_auto_rename_queued_for = None
             new_cur = self.get_custom_player_name(ps)
             msg = f"'{cur or '?'}' -> '{name}' readback='{new_cur or '?'}'"
-            self._trainer_log("RENAME", f"SetName {msg} ({cls})", config=config, force=True)
+            self._trainer_log("RENAME", f"SetName {msg} ({cls})", config=config, interval=2.0 if force else 3.0)
             return True, msg
 
         err = (resp or {}).get("message") or (resp or {}).get("stage") or "unknown error"
         self._trainer_log("RENAME", f"SetName failed via bridge: {err}", config=config, level="error", force=True)
+        if getattr(self, "_trainer_auto_rename_queued_for", None) == name:
+            self._trainer_auto_rename_queued_for = None
         off = self._custom_player_name_offset(ps)
         if off and self._trainer_write_fstring(ps + off, name):
             self._trainer_log(
@@ -871,18 +1101,42 @@ class TrainerMixin:
         return False, err
 
     def trainer_rename_now(self, name, config=None, force=True):
-        """Single rename on demand (UI button). Returns (ok, message)."""
+        """Queue a rename (non-blocking). Returns (True, 'queued') or (False, reason)."""
         config = config or getattr(self, "config", None)
         if not config:
             return False, "config unavailable"
-        pawn = self._find_local_pawn()
-        return self._trainer_apply_rename(pawn, config, name, force=force)
+        if self.queue_trainer_rename(name, config, force=force):
+            return True, "queued"
+        return False, "name is empty"
 
     def _trainer_auto_rename(self, pawn, config):
         name = (config.trainer_rename_text or "").strip()[:32]
         if not name:
+            self._trainer_auto_rename_queued_for = None
             return
-        self._trainer_apply_rename(pawn, config, name, force=False)
+
+        now = time.monotonic()
+        pending = getattr(self, "_trainer_rename_pending_name", None)
+        if name != pending:
+            self._trainer_rename_pending_name = name
+            self._trainer_rename_pending_ts = now
+            self._trainer_auto_rename_queued_for = None
+            return
+        if now - self._trainer_rename_pending_ts < 1.5:
+            return
+        if name == self._trainer_last_rename and (now - self._trainer_last_rename_ts) < 5.0:
+            return
+        ps = self._trainer_local_player_state(pawn)
+        cur = self.get_custom_player_name(ps) if ps else None
+        if cur == name and self._trainer_last_rename == name:
+            return
+        if getattr(self, "_trainer_auto_rename_queued_for", None) == name:
+            return
+        with self._rename_lock:
+            if self._rename_pending and self._rename_pending[0] == name:
+                return
+        self._trainer_auto_rename_queued_for = name
+        self.queue_trainer_rename(name, config, force=False)
 
     def tick_trainer(self, config):
         """Apply enabled trainer features (throttled — not every overlay frame)."""
@@ -895,6 +1149,11 @@ class TrainerMixin:
                 pawn = self._find_local_pawn()
                 if pawn and self._trainer_anticlip_saved is None:
                     self._trainer_anti_clipping(pawn, config, True)
+            if config and self._game_process_alive():
+                self._trainer_magnet_key_toggle(config)
+                pawn = self._find_local_pawn()
+                if self._magnet_active and pawn:
+                    self._trainer_magnet(pawn, config)
             return
 
         now = time.monotonic()
@@ -910,6 +1169,8 @@ class TrainerMixin:
         except Exception as exc:
             self._trainer_error("TICK", exc, config)
             return
+
+        self._trainer_magnet_key_toggle(config)
 
         pawn = self._find_local_pawn()
         if camo_noclip_hold:
@@ -938,6 +1199,12 @@ class TrainerMixin:
                 self._trainer_no_recoil(config)
             if config.trainer_no_decoy_cooldown:
                 self._trainer_no_decoy_cooldown(pawn, config)
+            if config.trainer_anti_detection:
+                self._trainer_anti_detection(pawn, config)
+            if config.trainer_infinite_bullets:
+                self._trainer_infinite_bullets(pawn, config)
+            if self._magnet_active:
+                self._trainer_magnet(pawn, config)
             if config.trainer_set_decoy_num:
                 self._trainer_set_decoy_num(pawn, config)
             elif self._trainer_last_decoy_num is not None:

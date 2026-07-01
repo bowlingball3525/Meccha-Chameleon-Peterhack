@@ -48,10 +48,10 @@ Peterhack is a **fully external** cheat. It does not modify game files on disk.
 |---|---|
 | **VISUALS** | ESP dots, 2D/corner boxes, skeleton, snap lines, OOF arrows, names, Steam ID, distance, health/shield bars, team filter, enemy-only, visible colors |
 | **COLORS** | Per-team and skeleton colors |
-| **PLAYERS** | Session player table, copy/save Steam64 IDs, blocklist, optional autokick |
+| **PLAYERS** | Session player table, kill selected survivor, copy/save Steam64 IDs, blocklist, optional autokick |
 | **RADAR** | Top-down mini-map of players |
 | **AIMBOT** | Hold key aim (default MB5), FOV circle, smoothing, bone offset, visible-only option |
-| **EXPLOITS** | Memory toggles, anti-kick, rename, bridge teleport/kill |
+| **EXPLOITS** | Memory toggles, hunter/survivor exploits, magnet, anti-kick, rename, teleport/kill |
 | **CAMOUFLAGE** | Dynamic 360° environment camo, quality slider, pass options, custom image paint, UV diagnostic |
 | **CHANGELOG** | Version info and auto-update toggle |
 
@@ -80,9 +80,12 @@ Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord**.
 
 | Feature | How it works |
 |---|---|
-| **Session list** | Scans world actors for player states; shows name, team, Steam64 ID. |
+| **Session list** | Reads `GameState.PlayerArray`; cached ~2.5 s to avoid lag. Steam IDs resolved on demand (copy/save), not every refresh. |
 | **Copy Steam ID / Save to Blocklist** | Copies selected row’s Steam64; appends to `blocked_players.json`. |
+| **Kill Selected Survivor** | Hunter only — calls `KillPlayer` on the selected survivor’s pawn via ProcessEvent. |
 | **Auto-Kick** | When **host**: calls Redpoint `KickPlayerController` for blocklisted Steam IDs. When **non-host** with **Leave on block**: exits lobby if a blocklisted player joins. |
+
+Player list UI uses explicit row colors (no broken alternating white rows) and a always-visible scrollbar.
 
 ### Radar
 
@@ -107,14 +110,20 @@ Memory writes applied when toggled on (~20 Hz trainer tick):
 |---|---|
 | **No Gun Cooldown** | Hunter gun cooldown timer → 0 each tick. |
 | **No Recoil** | Camera shake modifier alpha → 0 on the local camera manager. |
-| **No Decoy Cooldown** | Decoy cooldown fields on the runtime paintable component → 0. |
+| **No Decoy Cooldown** | Sets decoy cooldown slots to ready (30.0) each tick — survivor. |
+| **Anti Detection (Survivor)** | Clears `OverlapCheckCapsules` so buried survivors are not revealed as “Too Buried”. |
+| **Infinite Bullets (Hunter)** | Sets `InfinityBullet` flag each tick. |
+| **Magnet (Hunter)** | Toggle with **G** (custom key via **Record Key**). Pulls all survivors into a line along your view direction. Shows **MAGNET ACTIVE** on overlay. |
+| **Kill All Survivors** | One-click button — `KillPlayer` on every survivor in session (staggered). |
 | **Set Decoy Num** | Writes max decoy spawn count. |
 | **Anti-Clipping (noclip)** | Sets collision disabled on local body mesh + capsule. |
 | **Anti-Kick** | Bridge vtable hooks block kick/disconnect RPCs (see below). |
-| **Auto-Rename** | Bridge `set_player_name` → `SetName(Server)` on game thread; replicates **CustomPlayerName** nameplate. Debounced 1.5 s. |
-| **Rename button** | Manual one-shot rename from the text field (Enter or **Rename**); works in lobby without Auto-Rename. |
+| **Auto-Rename** | Queued background rename via bridge; debounced 1.5 s after typing stops. |
+| **Rename button** | Manual rename (Enter or **Rename**); queued on background thread — safe to spam without freezing UI. |
 | **Teleport / Kill Self** | Bridge TCP: `K2_SetActorLocation` / destroy local pawn. |
 | **Debug Logging** | Emits `[TRAINER:TAG]` lines to `latest.log`. |
+
+Hunter/survivor exploits ported from [phxgg/chameleonEsp](https://github.com/phxgg/chameleonEsp) (external memory + ProcessEvent, same offsets).
 
 #### Anti-Kick (detailed)
 
@@ -135,11 +144,12 @@ Enable Anti-Kick **after** joining a match for best results. Fully quit the game
 
 | Method | Path |
 |---|---|
-| **Auto-Rename toggle** | Trainer calls bridge `set_player_name` every 1.5 s when text changes. |
-| **Rename button / Enter** | One-shot `set_player_name` from the text field. |
-| **Bridge handler** | Queues `SetName(Server)` on the **game thread** via bridge message hook — avoids unsafe remote-thread ProcessEvent from Python. |
+| **Auto-Rename toggle** | After 1.5 s debounce, queues `set_player_name` on a **background worker** (never blocks the UI). |
+| **Rename button / Enter** | Queues the same worker; latest name wins if you spam click or type. |
+| **Bridge handler** | Runs `SetName(Server)` on the **game thread** via bridge message hook. |
+| **Rate limit** | ~0.45 s minimum between bridge rename calls; 10 s TCP timeout. |
 
-Works in lobby as non-host (nameplate above character).
+Works in lobby as non-host (nameplate above character). Spamming rename no longer freezes the menu.
 
 ### Bridge Commands (TCP `:47654`)
 
@@ -217,7 +227,8 @@ Separate from environment camo. Paint any PNG/JPG onto your character atlas:
 | **F10** | Apply environment camouflage |
 | **F9** | Stop / cancel camouflage paint |
 | **MB5** (default) | Aimbot hold |
-| **Enter** (in Rename field) | Manual rename |
+| **Enter** (in Rename field) | Queue manual rename |
+| **G** (default) | Toggle survivor magnet (hunter) — rebind in EXPLOITS tab |
 
 Drag the menu title bar to reposition. Menu hotkeys use `RegisterHotKey`; F9/F10 are polled each frame.
 
@@ -293,7 +304,10 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 | `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `latest.log` |
 | Anti-kick enabled but still kicked | Check `anti_kick.log` for `BLOCKED` lines. EOS/platform kicks may bypass UE RPCs. Enable after spawn; quit game before DLL update. |
 | Anti-kick crashes game on enable | Update to latest build (vtable hooks, not inline ProcessEvent). Fully quit game before replacing DLL. |
+| Rename UI freezes when spamming | Update — renames use a background queue; UI stays responsive. |
 | Rename stuck / reverts in lobby | Use **Rename** button; enable Debug Logging; ensure bridge connected. |
+| Magnet does nothing | You must be **Hunter**; press **G** (or your bound key) to toggle ON. |
+| Kill Selected / Kill All fails | Hunter only; host/session rules apply — check `[TRAINER:KILL]` in log. |
 | `could not unload` / DLL stuck | **Quit the game completely** and relaunch. Run Peterhack as Administrator. |
 | `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` |
 | Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |

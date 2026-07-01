@@ -70,6 +70,9 @@ class Config:
     trainer_set_decoy_num: bool = False
     trainer_decoy_count: int = 5
     trainer_anti_clipping: bool = False
+    trainer_anti_detection: bool = False
+    trainer_infinite_bullets: bool = False
+    trainer_magnet_key: str = "G"
     trainer_anti_kick: bool = False
     trainer_auto_rename: bool = False
     trainer_rename_text: str = "Player"
