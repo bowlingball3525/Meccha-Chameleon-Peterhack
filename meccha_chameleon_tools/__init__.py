@@ -177,11 +177,16 @@ def main():
     config = load_config()
     config = _enable_camouflage(config)
 
+    from meccha_chameleon_tools.webhook import notify_peterhack_launch
+    notify_peterhack_launch(config)
+
     wait = GameWaitWindow()
     _esp_holder = []
 
     def _on_game_ready(esp):
         _esp_holder.append(esp)
+        from meccha_chameleon_tools.webhook import bind_webhook_config
+        bind_webhook_config(esp, config)
         menu = Menu(config, esp)
         overlay = Overlay(esp, config, menu=menu)
         menu.attach_overlay(overlay)

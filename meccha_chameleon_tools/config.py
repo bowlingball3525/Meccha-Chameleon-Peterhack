@@ -17,6 +17,7 @@ class Config:
     skeleton_esp: bool = False
     show_local: bool = True
     show_names: bool = True
+    show_steam_id: bool = False
     show_distance: bool = True
     snap_lines: bool = True
     team_filter: bool = False
@@ -67,6 +68,8 @@ class Config:
     trainer_anti_kick: bool = False
     trainer_auto_rename: bool = False
     trainer_rename_text: str = "Player"
+    autokick_enabled: bool = False
+    autokick_leave_on_block: bool = True
 
     # Radar
     radar_enabled: bool = False
@@ -77,11 +80,12 @@ class Config:
     # Camouflage / Paint
     camouflage_enabled: bool = True
     auto_update: bool = True  # check GitHub main on startup and apply newer source
+    discord_webhook_url: str = ""  # optional override; else DEFAULT_WEBHOOK_URL in webhook.py
     camouflage_sample_size: int = 32   # legacy — now driven by paint_quality
     camouflage_quality: int = 2        # legacy — now driven by paint_quality
     camouflage_opacity: int = 200
     camouflage_hide_local_body: bool = True  # hide local mesh during screen sampling
-    camo_full_body_wrap: bool = False        # bridge 4-pass wrap: left/right/front/back
+    camo_full_body_wrap: bool = True         # always 360° wrap (left/right/front/back)
     paint_image_path: str = ""
     paint_image_opacity: int = 255
     paint_image_grid: int = 32

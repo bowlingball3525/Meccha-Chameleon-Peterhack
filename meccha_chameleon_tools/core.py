@@ -7,6 +7,7 @@ offset resolution, and game state reading.
 import struct
 import math
 import os
+import re
 import ctypes
 import threading
 import pymem
@@ -541,11 +542,22 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     MODULE_NAME = "PenguinHotel-Win64-Shipping.exe"
     GWORLD_RVA = 0x09C7C620
 
+    # APlayerState (Engine 5.6 dump)
+    OFF_PLAYER_UNIQUE_ID = 0x02B8          # FUniqueNetIdRepl UniqueID
+    OFF_PLAYER_SAVED_NET_ADDR = 0x02F8     # FString SavedNetworkAddress
+    OFF_PLAYER_NAME_PRIVATE = 0x0340       # FString PlayerNamePrivate (Steam display name)
+    OFF_PC_CACHED_CONNECTION_PLAYER_ID = 0x0700  # APlayerController::CachedConnectionPlayerId
+    STEAM64_MIN = 76561197960265728
+    STEAM64_MAX = 76561199999999999
+    _STEAM64_RE = re.compile(r"7656119\d{10}")
+
     # ESP session debounce — ignore brief memory-read glitches (overlay ~60 Hz).
-    ESP_WORLD_MISS_LIMIT = 15       # ~250 ms without UWorld before clearing
-    ESP_PA_EMPTY_LIMIT = 24         # ~400 ms empty PlayerArray before match-end
-    ESP_SESSION_CHANGE_LIMIT = 10   # ~170 ms new world/gs before cache reset
-    ESP_POS_MISS_LIMIT = 10         # frames before dropping a cached player
+    ESP_WORLD_STALE_SEC = 2.0       # reuse last-good UWorld this long on read miss
+    ESP_DISCONNECT_SEC = 3.0        # no UWorld this long → treat as left server
+    ESP_PA_EMPTY_LIMIT = 90         # ~1.5 s empty PlayerArray before match-end clear
+    ESP_SESSION_CHANGE_LIMIT = 30   # ~500 ms new world before cache reset
+    ESP_FRESH_MISS_LIMIT = 60       # frames to keep a player missing from a partial read
+    ESP_POS_MISS_LIMIT = 30         # frames before dropping a cached player (pos miss)
     ESP_DEAD_STREAK_LIMIT = 4       # consecutive dead reads before hiding a player
 
     GUOBJECT_SIG = bytes([
@@ -698,16 +710,36 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._paint_keep_unfrozen = False      # stay unfrozen after first inject in a session
         self._paint_session_resumed = False    # avoid double-resume in _game_frozen finally
         self._players_cache = []               # ESP player list; brief fallback on empty reads
-        self._esp_session_key = None           # (world_ptr, gamestate_ptr) — change clears cache
+        self._esp_session_key = None           # UWorld ptr — change clears cache
         self._esp_session_ready = False
         self._esp_last_player_array_count = 0
-        self._esp_world_miss_streak = 0
         self._esp_pa_empty_streak = 0
         self._esp_session_change_streak = 0
         self._esp_pending_session_key = None
+        self._esp_world_last_seen = 0.0
+        self._last_camera = None
         self._world_last_good = 0
         self._world_last_good_time = 0.0
         self._esp_dead_streak = {}             # pawn -> consecutive dead reads
+        self._discord_session_notified = False
+        self._steam_id_cache = {}
+        self._blocked_steam_ids = set()
+        self._ps_pc_cache = {}
+        self._ps_pc_cache_ts = 0.0
+        self._steam_features_active = False
+        self._steam_lazy_ts = 0.0
+        self._steam_lazy_ps_queue = []
+        self._actor_scan_frame = 0
+        self._ue_func_cache = {}
+        self._session_players_cache = []
+        self._session_players_cache_ts = 0.0
+        self._blocklist_cache_ids = set()
+        self._blocklist_file_mtime = -1.0
+        self._blocklist_cache_ts = 0.0
+        try:
+            self.refresh_blocklist_cache(force=True)
+        except Exception:
+            pass
         self._export_worker_rva = None
         self._import_worker_rva = None
         self._clear_worker_rva = None
@@ -803,7 +835,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return world
 
         last = self._world_last_good
-        if last and (_time.monotonic() - self._world_last_good_time) < 0.2:
+        if last and (_time.monotonic() - self._world_last_good_time) < self.ESP_WORLD_STALE_SEC:
             return last
         return 0
 
@@ -859,7 +891,12 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         for pov_addr in sources:
             cam = _read_pov(pov_addr)
             if cam:
+                self._last_camera = cam
                 return cam
+
+        last_cam = getattr(self, "_last_camera", None)
+        if last_cam:
+            return last_cam
 
         # Last resort: controller rotation + acknowledged pawn/root position.
         cr_off = self.offsets.get("AController::ControlRotation", 0x320)
@@ -869,8 +906,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"])
         loc = self.get_actor_root_pos(pawn) if pawn else None
         if loc and self._is_valid_world_loc(loc):
-            return {"loc": loc, "rot": rot, "fov": 90.0}
-        return None
+            cam = {"loc": loc, "rot": rot, "fov": 90.0}
+            self._last_camera = cam
+            return cam
+        return last_cam if last_cam else None
 
     def get_viewport_size(self):
         """Return game client width/height in pixels."""
@@ -1409,16 +1448,38 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         except Exception:
             return ""
 
-    def get_player_name(self, ps: int) -> str:
-        """Read the player display name from APlayerState.
-        Tries PlayerNamePrivate (0x340, base class) first, then CustomPlayerName
-        (0x388, ABP_FirstPersonPlayerState_Online_C) as a fallback."""
+    def get_custom_player_name(self, ps: int) -> str:
+        """In-game display name (CustomPlayerName) — not Steam / PlayerNamePrivate."""
         if not ps:
             return ""
-        name = self._read_fstring(ps + 0x340)     # APlayerState::PlayerNamePrivate
-        if not name:
-            name = self._read_fstring(ps + 0x388) # CustomPlayerName (online variant)
-        return name
+        off = self._custom_player_name_offset(ps)
+        if off:
+            return self._read_fstring(ps + off)
+        for try_off in (0x0388, 0x03F0):
+            name = self._read_fstring(ps + try_off)
+            if name:
+                return name
+        return ""
+
+    def _custom_player_name_offset(self, ps: int) -> int:
+        """FString offset for CustomPlayerName on this PlayerState class, or 0."""
+        if not ps:
+            return 0
+        cls = self.objects.class_name(ps) or ""
+        if "PlayerState_LINK" in cls:
+            return 0x03F0
+        if "PlayerState_Online" in cls:
+            return 0x0388
+        return 0x0388  # default online layout
+
+    def get_player_name(self, ps: int) -> str:
+        """Display name for ESP — CustomPlayerName first, then PlayerNamePrivate (Steam)."""
+        if not ps:
+            return ""
+        custom = self.get_custom_player_name(ps)
+        if custom:
+            return custom
+        return self._read_fstring(ps + self.OFF_PLAYER_NAME_PRIVATE)
 
     def _read_is_hunter(self, pawn: int):
         """Return True=Hunter, False=Survivor, None=unreadable. IsHunter @ pawn+0x0C3A."""
@@ -1449,6 +1510,397 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             print(msg, flush=True)
         self._players_cache = []
         self._esp_dead_streak.clear()
+        self._steam_id_cache.clear()
+        self._ps_pc_cache.clear()
+        self._ps_pc_cache_ts = 0.0
+
+    def set_blocked_steam_ids(self, ids):
+        """Cache blocklist Steam IDs for ESP highlighting."""
+        self._blocked_steam_ids = set(ids or [])
+
+    def is_blocked_steam_id(self, steam_id: str) -> bool:
+        sid = (steam_id or "").strip()
+        return bool(sid and sid in getattr(self, "_blocked_steam_ids", set()))
+
+    def _get_player_controller(self, ps: int, pawn: int = 0) -> int:
+        """Resolve APlayerController* via pawn Controller or cached PS→PC map."""
+        if not pawn and ps:
+            pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
+        if pawn:
+            pc = rp(self.pm, pawn + self.offsets.get("APawn::Controller", 0x2D8))
+            if pc:
+                return pc
+        if ps:
+            self._refresh_ps_pc_cache()
+            return self._ps_pc_cache.get(ps, 0)
+        return 0
+
+    def _refresh_ps_pc_cache(self):
+        """Map PlayerState → PlayerController (lobby / no-pawn cases). Cached ~5s."""
+        import time as _time
+
+        now = _time.monotonic()
+        if self._ps_pc_cache and (now - self._ps_pc_cache_ts) < 5.0:
+            return
+        mapping = {}
+        ps_off = self.offsets.get("AController::PlayerState", 0x2B0)
+        try:
+            for obj in self.objects.iter_objects():
+                if len(mapping) >= 32:
+                    break
+                cls_name = self.objects.class_name(obj) or ""
+                if "PlayerController" not in cls_name:
+                    continue
+                ps = rp(self.pm, obj + ps_off)
+                if ps and ps not in mapping:
+                    mapping[ps] = obj
+        except Exception:
+            pass
+        self._ps_pc_cache = mapping
+        self._ps_pc_cache_ts = now
+
+    def invalidate_session_players_cache(self):
+        self._session_players_cache_ts = 0.0
+
+    def refresh_blocklist_cache(self, force=False):
+        """Load blocklist from disk at most every few seconds (avoid per-frame disk I/O)."""
+        import os
+        import time as _time
+        from meccha_chameleon_tools.blocklist import load_blocklist, blocklist_ids, BLOCKLIST_FILE
+
+        now = _time.monotonic()
+        if not force and (now - self._blocklist_cache_ts) < 5.0:
+            return self._blocklist_cache_ids
+        try:
+            mtime = os.path.getmtime(BLOCKLIST_FILE) if os.path.isfile(BLOCKLIST_FILE) else 0.0
+        except Exception:
+            mtime = 0.0
+        if not force and mtime == self._blocklist_file_mtime:
+            self._blocklist_cache_ts = now
+            return self._blocklist_cache_ids
+        entries = load_blocklist()
+        ids = blocklist_ids(entries)
+        self._blocklist_cache_ids = ids
+        self._blocklist_file_mtime = mtime
+        self._blocklist_cache_ts = now
+        self.set_blocked_steam_ids(ids)
+        return ids
+
+    def get_session_players(self, force=False):
+        """All PlayerState entries in the current session (lobby + match). Cached ~1s."""
+        import time as _time
+
+        now = _time.monotonic()
+        if not force and self._session_players_cache and (now - self._session_players_cache_ts) < 1.0:
+            return list(self._session_players_cache)
+
+        world = self._get_world()
+        if not world:
+            self._session_players_cache = []
+            self._session_players_cache_ts = now
+            return []
+        gamestate = rp(self.pm, world + self.offsets["UWorld::GameState"])
+        if not gamestate:
+            self._session_players_cache = []
+            self._session_players_cache_ts = now
+            return []
+        pc = self._get_local_controller(world)
+        local_ps = rp(self.pm, pc + self.offsets["AController::PlayerState"]) if pc else 0
+        pa_data, pa_count, _ = read_array(
+            self.pm, gamestate + self.offsets["AGameStateBase::PlayerArray"]
+        )
+        if not pa_data or pa_count <= 0:
+            self._session_players_cache = []
+            self._session_players_cache_ts = now
+            return []
+        players = []
+        for i in range(min(pa_count, self.MAX_ESP_PLAYERS)):
+            ps = rp(self.pm, pa_data + i * 8)
+            if not ps:
+                continue
+            pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
+            ih = self._read_is_hunter(pawn) if pawn else None
+            if self._steam_features_active or force:
+                steam_id = self.get_player_steam_id(ps)
+            else:
+                steam_id = self.peek_steam_id(ps)
+            players.append({
+                "idx": i,
+                "player_state": ps,
+                "pawn": pawn,
+                "is_local": ps == local_ps,
+                "player_name": self.get_player_name(ps),
+                "steam_name": self.get_player_steam_name(ps),
+                "steam_id": steam_id,
+                "is_hunter": ih,
+            })
+        self._session_players_cache = players
+        self._session_players_cache_ts = now
+        return list(players)
+
+    @classmethod
+    def _extract_steam64(cls, text):
+        if not text:
+            return ""
+        match = cls._STEAM64_RE.search(str(text))
+        return match.group(0) if match else ""
+
+    def _read_unique_net_id_bytes(self, repl_base: int) -> bytes:
+        """Read FUniqueNetIdRepl.ReplicationBytes at repl_base."""
+        if not repl_base:
+            return b""
+        data_ptr = rp(self.pm, repl_base + 0x20)
+        count = ru32(self.pm, repl_base + 0x28)
+        if not data_ptr or count <= 0 or count > 512:
+            return b""
+        try:
+            return self.pm.read_bytes(data_ptr, count)
+        except Exception:
+            return b""
+
+    def _steam_id_from_net_id_repl(self, repl_base: int) -> str:
+        raw = self._read_unique_net_id_bytes(repl_base)
+        found = self._parse_steam64_from_bytes(raw)
+        if found:
+            return found
+        return self._parse_steam64_from_bytes(self._read_net_id_repl_blob(repl_base))
+
+    def _read_net_id_repl_blob(self, repl_base: int) -> bytes:
+        """Read the full 0x30-byte FUniqueNetIdRepl struct."""
+        if not repl_base:
+            return b""
+        try:
+            return self.pm.read_bytes(repl_base, 0x30)
+        except Exception:
+            return b""
+
+    def _scan_steam64_near_player_state(self, ps: int) -> str:
+        """Scan UniqueID + SavedNetworkAddress region for an embedded Steam64."""
+        if not ps:
+            return ""
+        try:
+            blob = self.pm.read_bytes(ps + self.OFF_PLAYER_UNIQUE_ID, 0x60)
+        except Exception:
+            return ""
+        return self._parse_steam64_from_bytes(blob)
+
+    def _ue_steam_id_for_player_state(self, ps: int) -> str:
+        """Last resort: ask the game to decode FUniqueNetIdRepl (Redpoint EOS)."""
+        if not ps:
+            return ""
+        caller = self._find_class_default_object("OnlineHelpers")
+        if not caller:
+            return ""
+        fn_get = self._find_ue_function("OnlineHelpers", "GetPlayerStateUniqueNetId")
+        fn_conv = self._find_ue_function("OnlineHelpers", "Conv_FUniqueNetIdReplToString")
+        if not fn_get or not fn_conv:
+            return ""
+
+        get_params = struct.pack("<Q", int(ps)) + (b"\x00" * 0x30)
+        get_out = self._process_event_call_out(caller, fn_get, get_params)
+        if not get_out:
+            return ""
+        net_id = get_out[8:8 + 0x30]
+        if not any(net_id):
+            return ""
+
+        conv_params = net_id + (b"\x00" * 0x10)
+        conv_out = self._process_event_call_out(caller, fn_conv, conv_params)
+        if not conv_out:
+            return ""
+        try:
+            data_ptr = struct.unpack("<Q", conv_out[0x30:0x38])[0]
+            arr_num = struct.unpack("<I", conv_out[0x38:0x3C])[0]
+            if not data_ptr or arr_num <= 0 or arr_num > 256:
+                return ""
+            raw = self.pm.read_bytes(data_ptr, arr_num * 2)
+            text = raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
+        except Exception:
+            return ""
+        return self._extract_steam64(text)
+
+    def _parse_steam64_from_bytes(self, raw: bytes) -> str:
+        if not raw:
+            return ""
+        for enc in ("utf-8", "utf-16-le", "latin-1"):
+            try:
+                text = raw.decode(enc, errors="ignore")
+                found = self._extract_steam64(text)
+                if found:
+                    return found
+                for part in re.split(r"[:|\\|]", text):
+                    part = part.strip()
+                    if self._STEAM64_RE.fullmatch(part):
+                        return part
+            except Exception:
+                continue
+        for size in (8, 4):
+            if len(raw) < size:
+                continue
+            for off in range(max(0, len(raw) - size + 1)):
+                chunk = raw[off:off + size]
+                val = int.from_bytes(chunk, "little", signed=False)
+                if self.STEAM64_MIN <= val <= self.STEAM64_MAX:
+                    return str(val)
+        return ""
+
+    def _read_player_steam_id(self, ps: int, use_ue_fallback=False) -> str:
+        """Return Steam64 id string from PlayerState / controller, or '' if unavailable."""
+        if not ps:
+            return ""
+
+        found = self._steam_id_from_net_id_repl(ps + self.OFF_PLAYER_UNIQUE_ID)
+        if found:
+            return found
+
+        found = self._scan_steam64_near_player_state(ps)
+        if found:
+            return found
+
+        saved = self._read_fstring(ps + self.OFF_PLAYER_SAVED_NET_ADDR)
+        found = self._extract_steam64(saved)
+        if found:
+            return found
+
+        pc = self._get_player_controller(ps)
+        if pc:
+            found = self._steam_id_from_net_id_repl(
+                pc + self.OFF_PC_CACHED_CONNECTION_PLAYER_ID,
+            )
+            if found:
+                return found
+
+        if use_ue_fallback:
+            found = self._ue_steam_id_for_player_state(ps)
+            if found:
+                return found
+
+        return ""
+
+    def set_steam_features_active(self, active: bool):
+        """When False, ESP hot path never reads Steam IDs from memory."""
+        self._steam_features_active = bool(active)
+
+    def peek_steam_id(self, ps: int) -> str:
+        """Return cached Steam64 only — no memory reads (safe on overlay hot path)."""
+        if not ps:
+            return ""
+        cached = self._steam_id_cache.get(ps)
+        if cached is None:
+            return ""
+        if isinstance(cached, tuple):
+            return cached[0] or ""
+        return cached or ""
+
+    def refresh_steam_ids_lazy(self, player_states=None, max_resolve=3):
+        """Background Steam ID resolution — at most a few lookups per second."""
+        import time as _time
+
+        if not self._steam_features_active:
+            return
+        now = _time.monotonic()
+        if now - self._steam_lazy_ts < 1.0:
+            return
+        self._steam_lazy_ts = now
+
+        ps_list = []
+        seen = set()
+        for p in self._players_cache:
+            ps = p.get("player_state", 0)
+            if ps and ps not in seen and not self.peek_steam_id(ps):
+                ps_list.append(ps)
+                seen.add(ps)
+        for p in getattr(self, "_session_players_cache", []):
+            ps = p.get("player_state", 0)
+            if ps and ps not in seen and not self.peek_steam_id(ps):
+                ps_list.append(ps)
+                seen.add(ps)
+
+        resolved = 0
+        for ps in ps_list:
+            if resolved >= max_resolve:
+                break
+            if self.peek_steam_id(ps):
+                continue
+            self.get_player_steam_id(ps)
+            resolved += 1
+
+    def _esp_steam_id(self, ps: int) -> str:
+        """Cached Steam ID for ESP — never triggers memory reads on the overlay path."""
+        return self.peek_steam_id(ps)
+
+    def get_player_steam_id(self, ps: int, force: bool = False) -> str:
+        """Cached Steam64 lookup for a PlayerState (retries while ID is replicating)."""
+        import time as _time
+
+        if not ps:
+            return ""
+        now = _time.monotonic()
+        cached = self._steam_id_cache.get(ps)
+        if cached is not None and not force:
+            if isinstance(cached, tuple):
+                steam_id, cached_at = cached
+            else:
+                steam_id, cached_at = cached, 0.0
+            if steam_id:
+                return steam_id
+            if now - cached_at < 3.0:
+                return ""
+
+        steam_id = self._read_player_steam_id(ps, use_ue_fallback=force)
+        self._steam_id_cache[ps] = (steam_id, now)
+        return steam_id
+
+    def get_player_steam_name(self, ps: int) -> str:
+        """Steam/platform name from PlayerNamePrivate (not in-game display name)."""
+        if not ps:
+            return ""
+        return self._read_fstring(ps + self.OFF_PLAYER_NAME_PRIVATE)
+
+    def _maybe_notify_discord_session(self):
+        """Post one Discord webhook when local player is identified in a match."""
+        if self._discord_session_notified:
+            return
+        config = getattr(self, "_webhook_config", None)
+        if config is None:
+            return
+
+        world = self._get_world()
+        if not world:
+            return
+        pc = self._get_local_controller(world)
+        if not pc:
+            return
+        ps = rp(self.pm, pc + self.offsets.get("AController::PlayerState", 0x2B0))
+        pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"])
+        if not ps and not pawn:
+            return
+
+        display = self.get_custom_player_name(ps) if ps else ""
+        steam_name = self.get_player_steam_name(ps) if ps else ""
+        steam_id = self.get_player_steam_id(ps) if ps else ""
+        if not display and not steam_name and not steam_id and not pawn:
+            return
+
+        ih = self._read_is_hunter(pawn) if pawn else None
+        if ih is True:
+            team = "Hunter"
+        elif ih is False:
+            team = "Survivor"
+        else:
+            team = "Unknown"
+
+        from meccha_chameleon_tools.webhook import notify_peterhack_in_match
+
+        notify_peterhack_in_match(
+            config,
+            display_name=display or steam_name or "?",
+            steam_name=steam_name or "?",
+            steam_id=steam_id or "?",
+            team=team,
+            game_pid=getattr(self.pm, "process_id", 0),
+        )
+        self._discord_session_notified = True
 
     def _is_pawn_alive(self, pawn, player_state=0):
         """False for confirmed dead pawns. Dead flag only on FirstPersonCharacter."""
@@ -1499,29 +1951,37 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         Transient read failures (empty PlayerArray, null UWorld for a frame)
         are debounced so ESP does not flicker off mid-match.
         """
+        import time as _time
+
         world, gs, pa_count = self._esp_session_snapshot()
-        key = (world, gs)
+        now = _time.monotonic()
 
-        if not world:
-            self._esp_world_miss_streak += 1
-            if self._esp_world_miss_streak >= self.ESP_WORLD_MISS_LIMIT:
-                if self._players_cache:
-                    self.clear_players_cache("left world / disconnected")
-                self._esp_session_key = None
-                self._esp_session_ready = False
-                self._esp_last_player_array_count = 0
-                self._esp_world_miss_streak = 0
-                self._esp_pa_empty_streak = 0
-                self._esp_session_change_streak = 0
-                self._esp_pending_session_key = None
-                return False
-            return True
+        if world:
+            self._esp_world_last_seen = now
+        elif not self._esp_world_last_seen:
+            self._esp_world_last_seen = now
 
-        self._esp_world_miss_streak = 0
+        if now - self._esp_world_last_seen >= self.ESP_DISCONNECT_SEC:
+            if self._players_cache:
+                self.clear_players_cache("left world / disconnected")
+            self._discord_session_notified = False
+            self._esp_session_key = None
+            self._esp_session_ready = False
+            self._esp_last_player_array_count = 0
+            self._esp_pa_empty_streak = 0
+            self._esp_session_change_streak = 0
+            self._esp_pending_session_key = None
+            return False
 
-        if self._esp_session_ready and key != self._esp_session_key:
-            if self._esp_pending_session_key != key:
-                self._esp_pending_session_key = key
+        session_world = world or self._world_last_good or 0
+        if (
+            session_world
+            and self._esp_session_ready
+            and self._esp_session_key
+            and session_world != self._esp_session_key
+        ):
+            if self._esp_pending_session_key != session_world:
+                self._esp_pending_session_key = session_world
                 self._esp_session_change_streak = 1
             else:
                 self._esp_session_change_streak += 1
@@ -1534,7 +1994,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             self._esp_pending_session_key = None
 
         prev_pa = self._esp_last_player_array_count
-        if self._esp_session_ready and prev_pa >= 2 and pa_count == 0:
+        if self._esp_session_ready and world and prev_pa >= 2 and pa_count == 0:
             self._esp_pa_empty_streak += 1
             if self._esp_pa_empty_streak >= self.ESP_PA_EMPTY_LIMIT:
                 self.clear_players_cache("match ended (PlayerArray empty)")
@@ -1542,10 +2002,48 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         else:
             self._esp_pa_empty_streak = 0
 
-        self._esp_session_key = key
-        self._esp_session_ready = True
-        self._esp_last_player_array_count = pa_count
+        if session_world:
+            self._esp_session_key = session_world
+            self._esp_session_ready = True
+        if world:
+            self._esp_last_player_array_count = pa_count
         return True
+
+    def _merge_players_cache(self, fresh, cap):
+        """Merge a partial fresh read with cache — never drop players on one bad frame."""
+        fresh_actors = set()
+        merged = []
+        for p in fresh:
+            actor = p.get("actor")
+            if not actor:
+                continue
+            fresh_actors.add(actor)
+            entry = dict(p)
+            entry["_fresh_miss"] = 0
+            entry["_pos_miss"] = 0
+            if not entry.get("steam_id"):
+                sid = self.peek_steam_id(entry.get("player_state", 0))
+                if sid:
+                    entry["steam_id"] = sid
+            merged.append(entry)
+
+        for p in self._players_cache:
+            if len(merged) >= cap:
+                break
+            actor = p.get("actor")
+            if not actor or actor in fresh_actors:
+                continue
+            ps = p.get("player_state", 0)
+            if not self._pawn_alive_for_esp(actor, ps):
+                continue
+            miss = int(p.get("_fresh_miss", 0)) + 1
+            if miss >= self.ESP_FRESH_MISS_LIMIT:
+                continue
+            entry = dict(p)
+            entry["_fresh_miss"] = miss
+            merged.append(entry)
+
+        return merged[:cap]
 
     def _refresh_cached_players(self, cap):
         """Keep last-known players alive through brief empty reads / pos glitches."""
@@ -1574,12 +2072,13 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     def get_players(self, include_local=False, team_filter=False):
         """Return up to MAX_ESP_PLAYERS entries.
 
-        Uses a short-lived cache only when a frame read returns nobody — never
-        re-adds stale cached players over a fresh read. Dead pawns are excluded.
-        Cache clears on disconnect, server change, or match end.
+        Uses a sticky cache when reads fail or return fewer players than before.
+        Dead pawns are excluded. Cache clears on disconnect, server change, or match end.
         """
         if not self._tick_esp_session():
-            return []
+            return self._players_cache[: self.MAX_ESP_PLAYERS]
+
+        self._maybe_notify_discord_session()
 
         cap = self.MAX_ESP_PLAYERS
         try:
@@ -1591,7 +2090,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             fresh = []
 
         if fresh:
-            self._players_cache = fresh[:cap]
+            self._players_cache = self._merge_players_cache(fresh, cap)
         elif self._players_cache:
             return self._refresh_cached_players(cap)
 
@@ -1631,6 +2130,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     "player_state": local_ps,
                     "is_hunter": self._read_is_hunter(local_pawn),
                     "player_name": self.get_player_name(local_ps),
+                    "steam_id": self._esp_steam_id(local_ps),
                 }
 
         if total >= self.MAX_ESP_PLAYERS:
@@ -1674,12 +2174,19 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                         "player_state": ps,
                         "is_hunter": self._read_is_hunter(pawn),
                         "player_name": self.get_player_name(ps),
+                        "steam_id": self._esp_steam_id(ps),
                     }
 
         if total >= self.MAX_ESP_PLAYERS:
             return
 
-        # Supplemental actor scan — always runs as a safety net.
+        # Supplemental actor scan — throttled fallback (was every frame, caused lag).
+        self._actor_scan_frame = getattr(self, "_actor_scan_frame", 0) + 1
+        if total > 0 and self._actor_scan_frame % 30 != 0:
+            return
+        if total == 0 and self._actor_scan_frame % 10 != 0:
+            return
+
         # Catches players whose APlayerState::PawnPrivate is temporarily null or
         # stale (respawn transition, replication lag) that the PlayerArray loop
         # above would have silently skipped.  seen_pawns deduplicates cleanly so
@@ -1697,7 +2204,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 actors_off = 0x98
             actors_data, actors_count, _ = read_array(self.pm, level + actors_off)
             if actors_data and 0 < actors_count <= 8192:
-                cap = min(actors_count, 4096)
+                cap = min(actors_count, 512)
                 for i in range(cap):
                     if total >= self.MAX_ESP_PLAYERS:
                         break
@@ -1719,14 +2226,19 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                         continue
                     seen_pawns.add(actor)
                     total += 1
+                    ps_actor = rp(
+                        self.pm,
+                        actor + self.offsets.get("APawn::PlayerState", 0x2C0),
+                    )
                     yield {
                         "is_local": False,
                         "pos": pos,
                         "idx": i,
                         "actor": actor,
-                        "player_state": 0,
+                        "player_state": ps_actor or 0,
                         "is_hunter": self._read_is_hunter(actor),
                         "player_name": "",   # actor-scan fallback: no PlayerState
+                        "steam_id": self._esp_steam_id(ps_actor),
                     }
 
 

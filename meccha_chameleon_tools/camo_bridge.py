@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Camouflage bridge — SilentJMA Meccha-Chameleon-Tools v1.8.0.1.
+Camouflage bridge for Peterhack.
 
-Fully automatic: launch bridge EXE → inject DLL → TCP paint_full_route.
-The controller picks a dynamic TCP port (not always 47654) — we discover it.
+Injects meccha-xenos-bridge.dll and talks over localhost TCP (paint, rotate, cancel).
 """
 import json
 import os
 import sys
 import glob
+import ctypes
 import subprocess as _subprocess
 
 from meccha_chameleon_tools.log_util import PETERHACK_ROOT
@@ -19,10 +19,10 @@ BRIDGE_FIXED_PORT = 47654
 
 
 class CamoBridgeMixin:
-    """Bridge EXE + DLL camouflage (v1.8.0.1)."""
+    """In-game bridge via meccha-xenos-bridge.dll."""
 
     DLL_NAME = "meccha-xenos-bridge.dll"
-    EXE_NAME = "meccha-camouflage.exe"
+    EXE_NAME = "meccha-camouflage.exe"  # legacy bundle artifact — not launched by Peterhack
     INJECTOR_NAME = "meccha-xenos-injector.exe"
     BRIDGE_HOST = "127.0.0.1"
     BRIDGE_PORT = BRIDGE_FIXED_PORT
@@ -64,6 +64,8 @@ class CamoBridgeMixin:
         "runtime-bridge",
         "xenos-bridge",
     )
+    RUNTIME_BRIDGE_MARKERS = ("runtime-bridge",)
+    XENOS_BRIDGE_MARKERS = ("meccha-xenos-bridge", "xenos-bridge")
 
     def _bridge_dll_loaded(self):
         """Return (loaded, module_names) for camouflage bridge DLLs in the game process."""
@@ -279,6 +281,68 @@ class CamoBridgeMixin:
         except Exception:
             pass
         self.cleanup()
+        self._stop_legacy_camo_controller()
+
+    def _stop_legacy_camo_controller(self):
+        """Kill stale meccha-camouflage.exe — it injects runtime-bridge and locks camo files."""
+        import time as _t
+
+        stopped = []
+        try:
+            result = _subprocess.run(
+                ["taskkill", "/F", "/IM", self.EXE_NAME, "/T"],
+                capture_output=True,
+                timeout=8,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if result.returncode == 0:
+                stopped.append(self.EXE_NAME)
+            elif result.returncode == 128:
+                pass  # process not found
+            else:
+                err = (result.stderr or b"").decode(errors="replace").strip()
+                if err and "not found" not in err.lower():
+                    print(f"[CAMO] could not stop {self.EXE_NAME}: {err}", flush=True)
+        except Exception as exc:
+            print(f"[CAMO] taskkill {self.EXE_NAME}: {exc}", flush=True)
+
+        proc = getattr(self, "_bridge_proc", None)
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(3)
+                stopped.append("bridge_proc")
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._bridge_proc = None
+
+        if stopped:
+            print(f"[CAMO] stopped legacy controller ({', '.join(stopped)})", flush=True)
+            _t.sleep(0.5)
+        self._purge_stale_runtime_bridge_files()
+        return bool(stopped)
+
+    @classmethod
+    def _purge_stale_runtime_bridge_files(cls):
+        """Remove runtime-bridge sidecars left by meccha-camouflage.exe."""
+        import glob as _glob
+
+        native_dir = os.path.join(cls.RUNTIME_DIR, "native")
+        if not os.path.isdir(native_dir):
+            return
+        removed = 0
+        for pattern in ("runtime-bridge*.dll", "runtime-bridge*.dll.port"):
+            for path in _glob.glob(os.path.join(native_dir, pattern)):
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            print(f"[CAMO] purged {removed} stale runtime-bridge file(s)", flush=True)
 
     def _extract_stable_camo_files(self):
         import shutil
@@ -286,15 +350,41 @@ class CamoBridgeMixin:
         os.makedirs(self.CAMO_DIR, exist_ok=True)
         os.makedirs(self.RUNTIME_DIR, exist_ok=True)
         missing = []
+
+        def _safe_copy(src_fn, dst_fn):
+            if not os.path.isfile(src_fn):
+                return os.path.isfile(dst_fn)
+            try:
+                shutil.copy2(src_fn, dst_fn)
+                return True
+            except (PermissionError, OSError) as exc:
+                winerr = getattr(exc, "winerror", None)
+                if os.path.isfile(dst_fn) and os.path.getsize(dst_fn) > 0:
+                    if winerr == 32 or isinstance(exc, PermissionError):
+                        print(
+                            f"[CAMO] {os.path.basename(dst_fn)} in use — "
+                            "using existing copy",
+                            flush=True,
+                        )
+                        return True
+                raise
+
         for src_fn, dst_fn, label in (
-            (self._get_exe_path(), self._get_stable_exe_path(), self.EXE_NAME),
             (self._get_dll_path(), self._get_stable_dll_path(), self.DLL_NAME),
             (self._get_injector_path(), self._get_stable_injector_path(), self.INJECTOR_NAME),
         ):
-            if os.path.isfile(src_fn):
-                shutil.copy2(src_fn, dst_fn)
-            elif not os.path.isfile(dst_fn):
-                missing.append(label)
+            try:
+                if not _safe_copy(src_fn, dst_fn):
+                    missing.append(label)
+            except Exception as exc:
+                if os.path.isfile(dst_fn) and os.path.getsize(dst_fn) > 0:
+                    print(
+                        f"[CAMO] could not refresh {label}: {exc} — using existing",
+                        flush=True,
+                    )
+                else:
+                    missing.append(label)
+
         if not missing:
             print(f"[CAMO] bridge files ready in {self.CAMO_DIR}", flush=True)
         return missing
@@ -326,9 +416,85 @@ class CamoBridgeMixin:
         loaded, names = self._bridge_dll_loaded()
         if not loaded:
             return False, [], False, False
-        has_xenos = any("meccha-xenos-bridge" in n for n in names)
-        has_runtime = any("runtime-bridge" in n for n in names)
+        has_xenos = any(any(m in n for m in self.XENOS_BRIDGE_MARKERS) for n in names)
+        has_runtime = any(any(m in n for m in self.RUNTIME_BRIDGE_MARKERS) for n in names)
         return True, names, has_xenos, has_runtime
+
+    def _unload_game_bridge_modules(self, *name_markers):
+        """FreeLibrary selected bridge DLLs in the game process."""
+        unloaded = []
+        if not getattr(self, "pm", None):
+            return unloaded
+        markers = tuple(m.lower() for m in name_markers if m)
+        if not markers:
+            return unloaded
+
+        kernel32 = ctypes.windll.kernel32
+        h_process = self.pm.process_handle
+        free_lib = kernel32.GetProcAddress(
+            kernel32.GetModuleHandleW("Kernel32.dll"), b"FreeLibrary",
+        )
+        if not free_lib:
+            return unloaded
+
+        seen_bases = set()
+
+        def _try_unload(name, base):
+            base = int(base or 0)
+            low = (name or "").lower()
+            if base <= 0x10000 or base in seen_bases:
+                return
+            if not any(m in low for m in markers):
+                return
+            seen_bases.add(base)
+            print(f"[CAMO] unloading {name} @ 0x{base:X}", flush=True)
+            h_thread = kernel32.CreateRemoteThread(
+                h_process, None, 0, free_lib, base, 0, None,
+            )
+            if h_thread:
+                kernel32.WaitForSingleObject(h_thread, 8000)
+                kernel32.CloseHandle(h_thread)
+                unloaded.append(name)
+
+        list_modules = getattr(self, "_list_game_modules", None)
+        if callable(list_modules):
+            for name, base in list_modules():
+                _try_unload(name, base)
+        if unloaded:
+            print(
+                f"[CAMO] unloaded {len(unloaded)} module(s): {', '.join(unloaded)}",
+                flush=True,
+            )
+        return unloaded
+
+    def _bridge_shutdown(self):
+        """Ask the in-game TCP bridge to stop (best-effort before unload)."""
+        try:
+            port = getattr(self, "_bridge_port", None)
+            if port:
+                self._bridge_request("shutdown", {}, timeout=3)
+            else:
+                for port in self._discover_bridge_ports()[:3]:
+                    self._bridge_request_on_port(port, "shutdown", {}, timeout=3)
+        except Exception:
+            pass
+
+    def _unload_all_bridge_modules(self):
+        """FreeLibrary every camouflage bridge DLL in the game process."""
+        self._bridge_shutdown()
+        return self._unload_game_bridge_modules(*self.BRIDGE_DLL_MARKERS)
+
+    def _replace_runtime_bridge_with_xenos(self):
+        """Drop embedded runtime-bridge so the full xenos DLL can load."""
+        import time as _t
+
+        self._stop_legacy_camo_controller()
+        self._bridge_shutdown()
+        _t.sleep(0.4)
+        self._bridge_port = None
+        removed = self._unload_game_bridge_modules(*self.RUNTIME_BRIDGE_MARKERS)
+        _t.sleep(0.3)
+        return bool(removed)
 
     def _log_bridge_capabilities(self):
         resp = self._bridge_request("capabilities", {}, timeout=5)
@@ -347,21 +513,42 @@ class CamoBridgeMixin:
         return bool(probe and probe.get("success"))
 
     def _try_direct_inject(self, port=BRIDGE_FIXED_PORT, force=False):
-        """Inject SilentJMA meccha-xenos-bridge.dll (full TCP command set)."""
-        loaded, mod_names, has_xenos, _has_runtime = self._bridge_dll_state()
-        if loaded and has_xenos and not force:
+        """Inject meccha-xenos-bridge.dll (full TCP command set)."""
+        loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
+        tcp_ok = bool(self._resolve_bridge_port()) if has_xenos else False
+
+        if loaded and has_xenos and not force and tcp_ok:
             print(
                 f"[CAMO] meccha-xenos-bridge already loaded ({', '.join(mod_names)})",
                 flush=True,
             )
             return True
+
         if loaded and not force:
-            print(
-                f"[CAMO] other bridge loaded ({', '.join(mod_names)}) — "
-                f"restart game before inject",
-                flush=True,
-            )
-            return False
+            if has_runtime or has_xenos:
+                print(
+                    f"[CAMO] stale bridge in game ({', '.join(mod_names)}) — "
+                    "unloading before inject",
+                    flush=True,
+                )
+                self._unload_all_bridge_modules()
+                import time as _t
+                _t.sleep(0.4)
+                loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
+                if loaded:
+                    print(
+                        "[CAMO] bridge DLL(s) still loaded after unload — "
+                        "restart the game and retry Paint Now.",
+                        flush=True,
+                    )
+                    return False
+            else:
+                print(
+                    f"[CAMO] unknown bridge loaded ({', '.join(mod_names)}) — "
+                    "restart game before inject",
+                    flush=True,
+                )
+                return False
         inj = self._get_stable_injector_path()
         dll = self._get_stable_dll_path()
         proc_name = getattr(self, "PROCESS_NAME", "PenguinHotel-Win64-Shipping.exe")
@@ -396,49 +583,54 @@ class CamoBridgeMixin:
         return False
 
     def _ensure_bridge(self):
-        """Inject SilentJMA xenos bridge DLL, then launch controller (TCP command server)."""
+        """Ensure meccha-xenos-bridge.dll is loaded — the only in-game bridge we use."""
         import time as _t
 
         if not getattr(self, "pm", None) or not self.pm.process_id:
             print("[CAMO] no game pid", flush=True)
             return False
 
-        pid = self.pm.process_id
-        loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
+        self._stop_legacy_camo_controller()
+        self._bridge_port = None
 
-        if self._resolve_bridge_port():
-            if has_runtime and not has_xenos:
+        loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
+        tcp_ok = bool(self._resolve_bridge_port())
+        has_rotate = self._bridge_has_rotate() if tcp_ok else False
+
+        ready = tcp_ok and has_xenos and not has_runtime
+        if ready:
+            print("[CAMO] meccha-xenos-bridge ready (TCP)", flush=True)
+            self._log_bridge_capabilities()
+            if tcp_ok and not has_rotate:
+                print("[CAMO] bridge rotate via native camera fallback if needed", flush=True)
+            return True
+
+        reasons = []
+        if has_runtime:
+            reasons.append("runtime-bridge loaded")
+        if has_xenos and not tcp_ok:
+            reasons.append("xenos TCP dead")
+        if tcp_ok and not has_rotate:
+            reasons.append("rotate via fallback")
+        if loaded and not has_xenos:
+            reasons.append("unknown bridge")
+        print(
+            f"[CAMO] bridge reset ({', '.join(reasons) or 'not loaded'}) — "
+            f"injecting {self.DLL_NAME}...",
+            flush=True,
+        )
+
+        if loaded:
+            self._unload_all_bridge_modules()
+            _t.sleep(0.5)
+            still_loaded, still_names, _, _ = self._bridge_dll_state()
+            if still_loaded:
                 print(
-                    "[CAMO] TCP up but embedded runtime-bridge is loaded (no rotate). "
-                    "Restart the game so Peterhack can inject meccha-xenos-bridge.dll.",
+                    f"[CAMO] could not unload: {', '.join(still_names)} — "
+                    "restart the game, then retry Paint Now.",
                     flush=True,
                 )
                 return False
-            print("[CAMO] bridge already up (TCP)", flush=True)
-            self._log_bridge_capabilities()
-            return True
-
-        if loaded and has_runtime and not has_xenos:
-            print(
-                f"[CAMO] wrong bridge in game ({', '.join(mod_names)}) — "
-                "restart the game, then Paint Now (needs meccha-xenos-bridge.dll).",
-                flush=True,
-            )
-            return False
-
-        if loaded and has_xenos:
-            print(
-                f"[CAMO] {self.DLL_NAME} in game — waiting for TCP...",
-                flush=True,
-            )
-            if self._wait_for_bridge_tcp("xenos bridge"):
-                self._log_bridge_capabilities()
-                return True
-            print(
-                "[CAMO] xenos bridge loaded but TCP dead — restart the game.",
-                flush=True,
-            )
-            return False
 
         try:
             missing = self._extract_stable_camo_files()
@@ -453,57 +645,17 @@ class CamoBridgeMixin:
             print(f"[CAMO] extract failed: {exc}", flush=True)
             return False
 
-        dll = self._get_stable_dll_path()
-        self._write_port_sidecar(dll, BRIDGE_FIXED_PORT)
+        self._write_port_sidecar(self._get_stable_dll_path(), BRIDGE_FIXED_PORT)
 
-        exe_path = self._get_stable_exe_path()
-        if not os.path.isfile(exe_path):
-            print(f"[CAMO] EXE not found at {exe_path}", flush=True)
-            return False
-
-        proc = getattr(self, "_bridge_proc", None)
-        if proc and proc.poll() is None:
-            print("[CAMO] restarting bridge controller (not responding on TCP)", flush=True)
-            self.cleanup()
-
-        # Inject full SilentJMA bridge BEFORE controller (controller skips inject if TCP up).
-        if not self._try_direct_inject(BRIDGE_FIXED_PORT):
+        if not self._try_direct_inject(BRIDGE_FIXED_PORT, force=True):
             print(
                 "[CAMO] inject failed — run Peterhack as administrator.",
                 flush=True,
             )
             return False
 
-        for _ in range(30):
-            if self._resolve_bridge_port():
-                break
-            _t.sleep(0.5)
-
-        print(
-            f"[CAMO] launching bridge controller (port {BRIDGE_FIXED_PORT})...",
-            flush=True,
-        )
-        print(f"[CAMO] runtime log dir: {self.RUNTIME_DIR}", flush=True)
-        try:
-            self._bridge_proc = _subprocess.Popen(
-                [
-                    exe_path,
-                    "--bridge-port", str(BRIDGE_FIXED_PORT),
-                    "--bridge-host", self.BRIDGE_HOST,
-                    "--log-dir", self.RUNTIME_DIR,
-                ],
-                cwd=os.path.dirname(exe_path),
-                creationflags=CREATE_NO_WINDOW,
-            )
-        except Exception as exc:
-            print(f"[CAMO] failed to launch controller: {exc}", flush=True)
-            if self._resolve_bridge_port():
-                self._log_bridge_capabilities()
-                return True
-            return False
-
-        print("[CAMO] waiting for bridge TCP...", flush=True)
-        if self._wait_for_bridge_tcp("bridge"):
+        print("[CAMO] waiting for meccha-xenos-bridge TCP...", flush=True)
+        if self._wait_for_bridge_tcp("xenos bridge", attempts=80):
             self._log_bridge_capabilities()
             return True
 
@@ -630,9 +782,10 @@ class CamoBridgeMixin:
             except Exception:
                 pass
 
-    def camo_apply(self, r=None, g=None, b=None, a=None, full_wrap=False):
-        """Environment camouflage via bridge paint_full_route."""
+    def camo_apply(self, r=None, g=None, b=None, a=None, full_wrap=True):
+        """Environment camouflage via bridge paint_full_route (always 360° wrap)."""
         del r, g, b, a
+        full_wrap = True
         if not getattr(self, "pm", None) or not self.pm:
             print("[CAMO] no pymem handle", flush=True)
             return False

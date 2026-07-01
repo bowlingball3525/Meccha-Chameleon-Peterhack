@@ -4,7 +4,7 @@
 
 # Meccha Chameleon — Peterhack
 
-External ESP, aimbot, exploits, and character-paint tools for **MECCHA CHAMELEON** (UE5.6 / `PenguinHotel-Win64-Shipping.exe`).
+External ESP, aimbot, exploits, player tracking, and character-paint tools for **MECCHA CHAMELEON** (UE5.6 / `PenguinHotel-Win64-Shipping.exe`).
 
 **Discord:** https://discord.gg/7T3damu79F
 
@@ -18,13 +18,13 @@ Peterhack is a **fully external** tool. It does not modify game files on disk.
 2. **Read game state** — It resolves UE5 offsets (GWorld, actors, bones, health, team, etc.) and builds a player list each frame.
 3. **Draw overlay** — A transparent PyQt5 window sits on top of the game and renders ESP, radar, and the aimbot FOV circle.
 4. **Write memory (optional)** — Exploits and aimbot apply small targeted writes (cooldowns, recoil, view angles, collision flags, etc.).
-5. **Camouflage (bridge)** — Environment camo uses bundled **SilentJMA Meccha-Chameleon-Tools v1.8.0.1** binaries (`meccha-camouflage.exe`, `meccha-xenos-bridge.dll`, `meccha-xenos-injector.exe`). Peterhack extracts them to **`C:\peterhack\camo\`**, injects the full xenos bridge DLL, then launches the controller. Peterhack talks to the DLL over **localhost TCP** on port **47654** (`paint_full_route`, `rotate`, `cancel_paint`, etc.).
+5. **Camouflage (bridge)** — Environment camo injects **`meccha-xenos-bridge.dll`** into the game, then talks over **localhost TCP** port **47654** (`paint_full_route`, `rotate`, `cancel_paint`, etc.). Bridge files live in **`C:\peterhack\camo\`**.
 6. **Custom image paint (native)** — PNG/JPG skins use Peterhack’s own remote-call path (`ImportChannel` / UV stamping) and are separate from bridge camouflage.
 
-**Requirements:** Run as **Administrator** (`Peterhack.bat` self-elevates). The game must be running and you should be **in a match** (not the main menu) before applying camo.
+**Requirements:** Run as **Administrator** (`Peterhack.bat` self-elevates). Be **in a match** (not the main menu) before applying camo.
 
 **Logs:** `C:\peterhack\logs\latest.log`  
-**Camo runtime:** `C:\peterhack\camo\runtime\` (bridge status, port sidecars)
+**Blocklist:** `C:\peterhack\blocked_players.json`
 
 ---
 
@@ -32,12 +32,13 @@ Peterhack is a **fully external** tool. It does not modify game files on disk.
 
 | Tab | What it does |
 |---|---|
-| **VISUALS** | ESP dots, 2D boxes, skeleton, snap lines, OOF arrows, names, distance, health/shield bars |
+| **VISUALS** | ESP dots, 2D boxes, skeleton, snap lines, OOF arrows, names, Steam ID, distance, health/shield bars |
+| **PLAYERS** | Session player table, copy/save Steam64 IDs, blocklist, optional autokick |
 | **RADAR** | Top-down mini-map of players |
 | **AIMBOT** | Hold key aim (default MB5), FOV circle, smoothing, bone offset |
 | **EXPLOITS** | Memory toggles — no gun CD, no recoil, decoy CD/count, noclip, anti-kick watchdog, auto-rename |
 | **COLORS** | Per-team and skeleton colors |
-| **CAMOUFLAGE** | Environment camo + custom image paint + UV diagnostic |
+| **CAMOUFLAGE** | Full 360° environment camo + custom image paint + UV diagnostic |
 | **CHANGELOG** | Version info and auto-update toggle |
 
 Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord** (opens invite link).
@@ -48,11 +49,18 @@ Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord** (opens invit
 
 ### ESP Overlay
 - Player dots, 2D boxes, skeleton, snap lines, off-screen (OOF) arrows
-- Names, distance, health bar, shield bar
+- Names, optional Steam64 ID, distance, health bar, shield bar
+- Blocklisted players highlighted in orange with `[BLOCKED]` tag
 - Team colors (Hunter / Survivor / local / fallback)
 - Distance-based dot scaling
 - FPS counter (overlay top-left)
 - Debounced player cache to reduce flicker
+
+### Players tab
+- Live session list (name, team, Steam64 ID)
+- **Copy Steam ID** / **Save to Blocklist**
+- Blocklist stored at `C:\peterhack\blocked_players.json`
+- **Auto-Kick** blocklisted players (host: Redpoint kick; non-host: optional leave lobby)
 
 ### Radar
 - Configurable size, range, and opacity
@@ -64,7 +72,7 @@ Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord** (opens invit
 - Optional FOV circle on overlay
 
 ### Exploits (EXPLOITS tab)
-Memory writes applied each overlay frame when toggled on:
+Memory writes applied when toggled on (throttled ~20 Hz, not every overlay frame):
 
 | Toggle | Effect |
 |---|---|
@@ -74,20 +82,13 @@ Memory writes applied each overlay frame when toggled on:
 | Set Decoy Num | Sets max decoy spawn count |
 | Anti-Clipping | Disables collision on local mesh (noclip) |
 | Anti-Kick | Logs disconnect / pawn loss (watchdog only) |
-| Auto-Rename | Writes custom name to PlayerState FString fields |
+| Auto-Rename | Sets **CustomPlayerName** (in-game display name) |
 
 Enable **Debug Logging** to emit `[TRAINER:TAG]` lines to `latest.log`.
 
 ### Environment Camouflage (bridge)
 
-Both wrap modes use the **same bridge engine**. The wrap checkbox controls how many scene-capture passes run.
-
-| Setting | Behavior |
-|---|---|
-| **Wrap OFF** (default) | One `paint_full_route` pass — samples the scene in front of your character and paints your texture (front-facing camo). |
-| **Wrap ON (full 360°)** | Four passes so lateral flanks get painted — ends facing forward. |
-
-**Wrap pass order (Wrap ON):**
+Every **Paint Now** / **F10** runs **full 360° wrap** (four scene-capture passes). There is no front-only mode.
 
 | Pass | Label | Yaw |
 |---|---|---|
@@ -96,31 +97,27 @@ Both wrap modes use the **same bridge engine**. The wrap checkbox controls how m
 | 3 | Front | 180° |
 | 4 | Back | 0° (restores forward view) |
 
-Each pass rotates the pawn/camera, scene-captures the environment, and paints visible mesh UVs via server paint batch. Expect ~30–40 seconds per pass (~2–3 minutes total with wrap).
+Each pass rotates the pawn/camera, scene-captures the environment, and paints visible mesh UVs. Expect ~30–40 seconds per pass (~2–3 minutes total).
 
-**Flow when you click Paint Now (or press F10):**
-1. Peterhack checks if the bridge TCP server is already up (ping on port **47654** or discovered sidecar).
-2. Scans the game process for an already-loaded bridge DLL — **no double inject** if `meccha-xenos-bridge.dll` is present.
-3. If not loaded: extracts binaries to `C:\peterhack\camo\`, writes a `.port` sidecar, **injects `meccha-xenos-bridge.dll` first** via `meccha-xenos-injector.exe`, then launches `meccha-camouflage.exe` (controller skips re-inject if TCP is already up).
-4. For each pass: optional `rotate` → `paint_full_route` over TCP (scene-capture + server paint batch replication).
-5. Sends `cancel_paint` and quiesces paint flags when done; view rotation is restored after wrap.
+**Flow:**
+1. Peterhack injects **`meccha-xenos-bridge.dll`** via **`meccha-xenos-injector.exe`** (or reuses an existing bridge if TCP on port **47654** responds).
+2. For each pass: `rotate` (bridge or native camera fallback) → `paint_full_route` over TCP.
+3. Sends `cancel_paint` and restores view rotation when done.
 
 **Bridge TCP commands:**
 
 | Command | Description |
 |---|---|
-| `paint_full_route` | Native template brush paint (scene-capture basecolor → UV strokes). |
-| `rotate` | Rotate local pawn by yaw delta (`K2_SetActorRotation`). Native camera fallback if unavailable. |
-| `cancel_paint` | Cancel active paint and drain the queue. |
-| `ping` / `capabilities` | Health check and supported command list. |
-| `teleport`, `set_fov`, `kill` | Exposed by bridge; not used by Peterhack UI. |
+| `paint_full_route` | Scene-capture basecolor → UV stroke paint |
+| `rotate` | Rotate local pawn by yaw delta |
+| `cancel_paint` | Cancel active paint and drain the queue |
+| `ping` / `capabilities` | Health check and command list |
 
 **Stop:** **F9** or **Stop Camo** → `cancel_paint` over TCP.
 
-Bridge binaries (bundled in `meccha_chameleon_tools/`, extracted to `C:\peterhack\camo\`):
-- `meccha-camouflage.exe` — controller / TCP client service
-- `meccha-xenos-bridge.dll` — in-game TCP bridge + full paint pipeline (inject this one)
-- `meccha-xenos-injector.exe` — loads the xenos bridge DLL into the game process
+Bundled binaries (extracted to `C:\peterhack\camo\` on first use):
+- **`meccha-xenos-bridge.dll`** — in-game TCP bridge
+- **`meccha-xenos-injector.exe`** — loads the bridge DLL
 
 ### Custom Character Paint — Apply Image
 
@@ -134,8 +131,7 @@ Separate from environment camo. Paint any PNG/JPG onto your character atlas:
 - Auto-trims transparent / solid borders
 - White base coat clears old paint before apply
 - **Image Quality** slider (1 Draft → 5 Ultra)
-- **Run UV Test** — diagnostic overlay (quadrants, islands, grid) to calibrate placement
-- Game process priority lowered while painting (restored after)
+- **Run UV Test** — diagnostic overlay to calibrate placement
 
 ---
 
@@ -144,11 +140,11 @@ Separate from environment camo. Paint any PNG/JPG onto your character atlas:
 | Key | Action |
 |---|---|
 | **Insert** / **F1** | Toggle menu + ESP overlay |
-| **F10** | Apply environment camouflage (same as Paint Now) |
+| **F10** | Apply environment camouflage (360° wrap) |
 | **F9** | Stop / cancel camouflage paint |
 | **MB5** (default) | Aimbot hold |
 
-Drag the menu title bar to reposition. Menu hotkeys use `RegisterHotKey`; F9/F10 are polled each frame so they do not conflict with the bridge controller.
+Drag the menu title bar to reposition. Menu hotkeys use `RegisterHotKey`; F9/F10 are polled each frame.
 
 ---
 
@@ -172,8 +168,9 @@ pip install -r requirements.txt
 
 1. Launch **MECCHA CHAMELEON** and join a match.
 2. Run **`Peterhack.bat`** (self-elevates to Administrator).
-3. Use the menu tabs to configure ESP, exploits, and camo.
-4. For environment camo: enable **Enable Camouflage**, optionally **Wrap around character (full 360°)**, then **Paint Now**.
+3. Configure ESP, exploits, and colors in the menu tabs.
+4. For environment camo: press **F10** or click **Paint Now** on the CAMOUFLAGE tab.
+5. Use the **PLAYERS** tab to copy Steam IDs, manage your blocklist, or enable autokick.
 
 Pre-built EXE: download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main`, or build locally with PyInstaller (see `.github/workflows/build.yml`).
 
@@ -190,16 +187,16 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 
 ---
 
-## Troubleshooting (camo)
+## Troubleshooting
 
 | Symptom | What to try |
 |---|---|
-| `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `C:\peterhack\logs\latest.log` and `C:\peterhack\camo\runtime\` |
-| `wrong bridge in game` / `runtime-bridge` loaded | Restart the game — controller’s embedded DLL lacks `rotate`; Peterhack needs a fresh inject of `meccha-xenos-bridge.dll` |
-| Bridge DLL loaded but TCP dead | Restart the game (Peterhack will not inject twice into the same session) |
-| Only front painted / white sides | Enable **Wrap around character (full 360°)** — single pass only paints camera-facing surfaces |
-| `unknown bridge command` on rotate | Same as runtime-bridge issue — restart game and retry |
-| Paint takes a long time with wrap | Normal — four full scene-capture passes (~2–3 min total) |
+| `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `C:\peterhack\logs\latest.log` |
+| `could not unload` bridge DLL | **Restart the game**, then Paint Now again |
+| Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |
+| Camo takes ~2–3 minutes | Normal for full 360° wrap (four passes) |
+| Steam ID shows `—` in PLAYERS tab | Wait a few seconds for replication; select row and Copy again |
+| ESP feels laggy | Disable **Show Steam ID** if you do not need it; keep PLAYERS tab closed when not in use |
 
 ---
 

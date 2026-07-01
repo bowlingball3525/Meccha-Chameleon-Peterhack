@@ -3,6 +3,8 @@ import struct
 import time
 import traceback
 
+_OFF_UOBJECT_OUTER = 0x20  # UObjectBase::OuterPrivate
+
 
 def _rp(pm, addr):
     try:
@@ -91,9 +93,11 @@ class TrainerMixin:
     OFF_CACHED_CAMERA_SHAKE = 0x2760
     # UCameraModifier
     OFF_CAM_MOD_ALPHA = 0x0040
-    # APlayerState / online variant
-    OFF_PLAYER_NAME = 0x0340
-    OFF_CUSTOM_PLAYER_NAME = 0x0388
+    # APlayerState — Steam / platform replicated name (do not use for in-game rename)
+    OFF_PLAYER_NAME_PRIVATE = 0x0340
+    # CustomPlayerName — in-game display name the player chooses in lobby
+    OFF_CUSTOM_PLAYER_NAME_ONLINE = 0x0388
+    OFF_CUSTOM_PLAYER_NAME_LINK = 0x03F0
     # UPlayer::Connection (via APlayerController::Player @ resolver)
     OFF_UPLAYER_CONNECTION = 0x0028
 
@@ -109,6 +113,12 @@ class TrainerMixin:
         self._trainer_anticlip_saved = None
         self._trainer_watch = {"world": 0, "pawn": 0, "ps": 0, "conn": 0}
         self._trainer_tick_count = 0
+        self._ue_func_cache = {}
+        self._autokick_last_attempt = {}
+        self._autokick_leave_until = 0.0
+        self._autokick_last_scan = 0.0
+        self._trainer_last_tick_ts = 0.0
+        self._cdo_cache = {}
 
     def _trainer_enabled(self, config):
         return any((
@@ -120,6 +130,9 @@ class TrainerMixin:
             config.trainer_anti_kick,
             config.trainer_auto_rename,
         ))
+
+    def _trainer_any_active(self, config):
+        return self._trainer_enabled(config) or bool(getattr(config, "autokick_enabled", False))
 
     def _trainer_log(self, tag, msg, *, config=None, level="info", interval=3.0, force=False):
         if config is not None and not config.trainer_debug and level != "error":
@@ -381,6 +394,236 @@ class TrainerMixin:
             self._trainer_log("ANTI-KICK", "local pawn lost", config=config, level="error", force=True)
         self._trainer_watch = {"world": world, "pawn": pawn, "ps": ps, "conn": conn}
 
+    # ------------------------------------------------------------------
+    # Autokick / blocklist (Redpoint KickPlayerController when host)
+    # ------------------------------------------------------------------
+    RVA_PROCESS_EVENT = 0x015D0950
+    AUTOKICK_COOLDOWN_SEC = 12.0
+    AUTOKICK_LEAVE_COOLDOWN_SEC = 45.0
+
+    def _find_ue_function(self, owner_class_substr, func_name):
+        key = f"{owner_class_substr}::{func_name}"
+        cached = self._ue_func_cache.get(key)
+        if cached:
+            return cached
+        func_meta = self.objects.find_class("Function")
+        if not func_meta:
+            return 0
+        for obj in self.objects.iter_objects():
+            if self.objects.obj_class(obj) != func_meta:
+                continue
+            if self.objects.obj_name(obj) != func_name:
+                continue
+            outer = _rp(self.pm, obj + _OFF_UOBJECT_OUTER)
+            outer_name = self.objects.class_name(outer) if outer else ""
+            if owner_class_substr in outer_name:
+                self._ue_func_cache[key] = obj
+                return obj
+        return 0
+
+    def _find_class_default_object(self, class_substr):
+        cached = self._cdo_cache.get(class_substr)
+        if cached:
+            return cached
+        for obj in self.objects.iter_objects():
+            name = self.objects.obj_name(obj)
+            if name.startswith("Default__") and class_substr in name:
+                self._cdo_cache[class_substr] = obj
+                return obj
+        return 0
+
+    def _process_event_call_out(self, caller_obj, ufunc, params_bytes, timeout_ms=8000):
+        """ProcessEvent; returns the params struct read back from game memory."""
+        if not caller_obj or not ufunc or not params_bytes:
+            return None
+        base = self._module_base()
+        if not base:
+            return None
+        pe = base + self.RVA_PROCESS_EVENT
+        inj = self._inject_handle()
+        if not inj:
+            return None
+
+        params_mem = self._remote_alloc(inj, len(params_bytes))
+        if not params_mem:
+            return None
+
+        def q(v):
+            return struct.pack("<Q", v)
+
+        try:
+            self.pm.write_bytes(int(params_mem), params_bytes, len(params_bytes))
+        except Exception:
+            self._remote_free(inj, params_mem)
+            return None
+
+        sc = b"\x55\x48\x89\xE5\x48\x83\xE4\xF0\x48\x83\xEC\x20"
+        sc += b"\x48\xB9" + q(int(caller_obj))
+        sc += b"\x48\xBA" + q(int(ufunc))
+        sc += b"\x49\xB8" + q(int(params_mem))
+        sc += b"\x48\xB8" + q(int(pe)) + b"\xFF\xD0"
+        sc += b"\x48\x83\xC4\x20\x48\x89\xEC\x5D\xC3"
+        sc = sc.ljust(256, b"\x90")
+
+        code_mem = self._remote_alloc(inj, len(sc))
+        if not code_mem:
+            self._remote_free(inj, params_mem)
+            return None
+        try:
+            self.pm.write_bytes(int(code_mem), sc, len(sc))
+            self._flush_remote_code(inj, int(code_mem), len(sc))
+        except Exception:
+            self._remote_free(inj, code_mem)
+            self._remote_free(inj, params_mem)
+            return None
+
+        ok = self._run_remote_shellcode(inj, int(code_mem), timeout_ms=timeout_ms)
+        out = None
+        if ok:
+            try:
+                out = self.pm.read_bytes(int(params_mem), len(params_bytes))
+            except Exception:
+                out = None
+        self._remote_free(inj, code_mem)
+        self._remote_free(inj, params_mem)
+        return out if ok else None
+
+    def _process_event_call(self, caller_obj, ufunc, params_bytes, timeout_ms=8000):
+        """Invoke UObject::ProcessEvent(caller, ufunc, params) in the game process."""
+        return self._process_event_call_out(caller_obj, ufunc, params_bytes, timeout_ms) is not None
+
+    def _kick_player_controller(self, target_pc, config=None):
+        """Host-only Redpoint KickPlayerController."""
+        if not target_pc:
+            return False
+        ufunc = self._find_ue_function("RedpointFrameworkBlueprintLibrary", "KickPlayerController")
+        caller = self._find_class_default_object("RedpointFrameworkBlueprintLibrary")
+        if not ufunc or not caller:
+            self._trainer_log(
+                "AUTOKICK", "KickPlayerController UFunction not found",
+                config=config, level="debug", interval=30.0,
+            )
+            return False
+        params = struct.pack("<Q", int(target_pc)) + (b"\x00" * 16) + (b"\x00" * 8)
+        base = self._module_base()
+        if not base:
+            return False
+        pe = base + self.RVA_PROCESS_EVENT
+        inj = self._inject_handle()
+        if not inj:
+            return False
+        params_mem = self._remote_alloc(inj, len(params))
+        if not params_mem:
+            return False
+
+        def q(v):
+            return struct.pack("<Q", v)
+
+        try:
+            self.pm.write_bytes(int(params_mem), params, len(params))
+        except Exception:
+            self._remote_free(inj, params_mem)
+            return False
+
+        sc = b"\x55\x48\x89\xE5\x48\x83\xE4\xF0\x48\x83\xEC\x20"
+        sc += b"\x48\xB9" + q(int(caller))
+        sc += b"\x48\xBA" + q(int(ufunc))
+        sc += b"\x49\xB8" + q(int(params_mem))
+        sc += b"\x48\xB8" + q(int(pe)) + b"\xFF\xD0"
+        sc += b"\x48\x83\xC4\x20\x48\x89\xEC\x5D\xC3"
+        sc = sc.ljust(256, b"\x90")
+        code_mem = self._remote_alloc(inj, len(sc))
+        if not code_mem:
+            self._remote_free(inj, params_mem)
+            return False
+        try:
+            self.pm.write_bytes(int(code_mem), sc, len(sc))
+            self._flush_remote_code(inj, int(code_mem), len(sc))
+        except Exception:
+            self._remote_free(inj, code_mem)
+            self._remote_free(inj, params_mem)
+            return False
+
+        thread_ok = self._run_remote_shellcode(inj, int(code_mem), timeout_ms=8000)
+        kicked = False
+        if thread_ok:
+            try:
+                kicked = self.pm.read_bytes(int(params_mem) + 0x18, 1)[0] != 0
+            except Exception:
+                kicked = False
+        if thread_ok:
+            self._remote_free(inj, code_mem)
+            self._remote_free(inj, params_mem)
+        self._trainer_log(
+            "AUTOKICK",
+            f"KickPlayerController pc=0x{target_pc:X} ok={kicked}",
+            config=config,
+            force=True,
+        )
+        return kicked
+
+    def _leave_match(self, config=None):
+        """Leave lobby/match when a blocked player is present (non-host fallback)."""
+        now = time.monotonic()
+        if now < self._autokick_leave_until:
+            return False
+        world = self._get_world()
+        if not world:
+            return False
+        pc = self._get_local_controller(world)
+        if not pc:
+            return False
+        ufunc = self._find_ue_function("PlayerController", "ClientReturnToMainMenuWithTextReason")
+        if not ufunc:
+            self._trainer_log(
+                "AUTOKICK", "ClientReturnToMainMenuWithTextReason not found",
+                config=config, level="error", force=True,
+            )
+            return False
+        params = b"\x00" * 16
+        ok = self._process_event_call(pc, ufunc, params)
+        if ok:
+            self._autokick_leave_until = now + self.AUTOKICK_LEAVE_COOLDOWN_SEC
+            self._trainer_log("AUTOKICK", "leaving lobby (blocked player)", config=config, force=True)
+        return ok
+
+    def _trainer_autokick(self, config):
+        now = time.monotonic()
+        if now - self._autokick_last_scan < 2.5:
+            return
+        self._autokick_last_scan = now
+
+        blocked = self.refresh_blocklist_cache()
+        if not blocked:
+            return
+        for pdata in self.get_session_players():
+            if pdata.get("is_local"):
+                continue
+            sid = (pdata.get("steam_id") or "").strip()
+            if not sid or sid not in blocked:
+                continue
+            last = self._autokick_last_attempt.get(sid, 0.0)
+            if now - last < self.AUTOKICK_COOLDOWN_SEC:
+                continue
+            self._autokick_last_attempt[sid] = now
+            label = pdata.get("player_name") or pdata.get("steam_name") or sid
+            ps = pdata.get("player_state", 0)
+            pawn = pdata.get("pawn", 0)
+            target_pc = self._get_player_controller(ps, pawn)
+            kicked = self._kick_player_controller(target_pc, config=config) if target_pc else False
+            if kicked:
+                continue
+            if getattr(config, "autokick_leave_on_block", True):
+                self._leave_match(config=config)
+            else:
+                self._trainer_log(
+                    "AUTOKICK",
+                    f"blocked player in lobby: {label} ({sid}) — not host, kick skipped",
+                    config=config,
+                    level="debug",
+                    interval=15.0,
+                )
+
     def _trainer_auto_rename(self, pawn, config):
         ps = self._trainer_local_player_state(pawn)
         if not ps:
@@ -392,29 +635,36 @@ class TrainerMixin:
         now = time.monotonic()
         if name == self._trainer_last_rename and (now - self._trainer_last_rename_ts) < 5.0:
             return
-        cur = self.get_player_name(ps)
+        off = self._custom_player_name_offset(ps)
+        cur = self.get_custom_player_name(ps)
         if cur == name and self._trainer_last_rename == name:
             return
-        ok_private = self._trainer_write_fstring(ps + self.OFF_PLAYER_NAME, name)
-        ok_custom = self._trainer_write_fstring(ps + self.OFF_CUSTOM_PLAYER_NAME, name)
-        if ok_private or ok_custom:
+        ok = self._trainer_write_fstring(ps + off, name)
+        if ok:
             self._trainer_last_rename = name
             self._trainer_last_rename_ts = now
+            cls = self.objects.class_name(ps) or "?"
             self._trainer_log(
                 "RENAME",
-                f"'{cur or '?'}' -> '{name}' (private={ok_private} custom={ok_custom})",
+                f"CustomPlayerName @0x{off:X} '{cur or '?'}' -> '{name}' ({cls})",
                 config=config,
                 force=True,
             )
         else:
-            self._trainer_log("RENAME", "FString write failed", config=config, level="error", force=True)
+            self._trainer_log("RENAME", "CustomPlayerName FString write failed", config=config, level="error", force=True)
 
     def tick_trainer(self, config):
-        """Apply enabled trainer features once per overlay frame."""
-        if not config or not self._trainer_enabled(config):
+        """Apply enabled trainer features (throttled — not every overlay frame)."""
+        if not config or not self._trainer_any_active(config):
             if self._trainer_anticlip_saved is not None:
                 self._trainer_anti_clipping(0, config, False)
             return
+
+        now = time.monotonic()
+        if now - self._trainer_last_tick_ts < 0.05:
+            return
+        self._trainer_last_tick_ts = now
+
         self._trainer_tick_count += 1
         try:
             if not self._game_process_alive():
@@ -435,6 +685,8 @@ class TrainerMixin:
                 self._trainer_log("TICK", "no local pawn (not in match?)", config=config, level="debug")
             if config.trainer_anti_kick:
                 self._trainer_anti_kick(config)
+            if getattr(config, "autokick_enabled", False):
+                self._trainer_autokick(config)
             return
 
         try:
@@ -452,5 +704,7 @@ class TrainerMixin:
                 self._trainer_auto_rename(pawn, config)
             if config.trainer_anti_kick:
                 self._trainer_anti_kick(config)
+            if getattr(config, "autokick_enabled", False):
+                self._trainer_autokick(config)
         except Exception as exc:
             self._trainer_error("TICK", exc, config)
