@@ -4,56 +4,129 @@
 
 # Meccha Chameleon — Peterhack
 
-A heavily modified ESP and character-paint tool for **MECCHA CHAMELEON** (UE5.6).
+External ESP, aimbot, exploits, and character-paint tools for **MECCHA CHAMELEON** (UE5.6 / `PenguinHotel-Win64-Shipping.exe`).
+
+**Discord:** https://discord.gg/7T3damu79F
+
+---
+
+## How It Works
+
+Peterhack is a **fully external** tool. It does not modify game files on disk.
+
+1. **Attach** — On launch, Peterhack finds the game process and opens it with `pymem` (read/write memory from outside the game).
+2. **Read game state** — It resolves UE5 offsets (GWorld, actors, bones, health, team, etc.) and builds a player list each frame.
+3. **Draw overlay** — A transparent PyQt5 window sits on top of the game and renders ESP, radar, and the aimbot FOV circle.
+4. **Write memory (optional)** — Exploits and aimbot apply small targeted writes (cooldowns, recoil, view angles, collision flags, etc.).
+5. **Camouflage (bridge)** — Environment camo uses bundled **SilentJMA Meccha-Chameleon-Tools v1.8.0.1** binaries. Peterhack launches `meccha-camouflage.exe`, which injects `meccha-xenos-bridge.dll` into the game. Peterhack talks to the DLL over **localhost TCP** (`paint_full_route`, `rotate`, `cancel_paint`).
+6. **Custom image paint (native)** — PNG/JPG skins use Peterhack’s own remote-call path (`ImportChannel` / UV stamping) and are separate from bridge camouflage.
+
+**Requirements:** Run as **Administrator** (`Peterhack.bat` self-elevates). The game must be running and you should be **in a match** (not the main menu) before applying camo.
+
+**Logs:** `C:\peterhack\logs\latest.log`
+
+---
+
+## Menu Tabs
+
+| Tab | What it does |
+|---|---|
+| **VISUALS** | ESP dots, 2D boxes, skeleton, snap lines, OOF arrows, names, distance, health/shield bars |
+| **RADAR** | Top-down mini-map of players |
+| **AIMBOT** | Hold key aim (default MB5), FOV circle, smoothing, bone offset |
+| **EXPLOITS** | Memory toggles — no gun CD, no recoil, decoy CD/count, noclip, anti-kick watchdog, auto-rename |
+| **COLORS** | Per-team and skeleton colors |
+| **CAMOUFLAGE** | Environment camo + custom image paint + UV diagnostic |
+| **CHANGELOG** | Version info and auto-update toggle |
+
+Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord** (opens invite link).
 
 ---
 
 ## Features
 
 ### ESP Overlay
-- Player dots, boxes, skeleton, snap lines, OOF arrows
-- Name, distance, health/shield bars
-- Radar mini-map
-- Aimbot with FOV circle and visibility check
-- FPS indicator in the overlay top-left
+- Player dots, 2D boxes, skeleton, snap lines, off-screen (OOF) arrows
+- Names, distance, health bar, shield bar
+- Team colors (Hunter / Survivor / local / fallback)
+- Distance-based dot scaling
+- FPS counter (overlay top-left)
+- Debounced player cache to reduce flicker
+
+### Radar
+- Configurable size, range, and opacity
+- Same player data as ESP, drawn as a mini-map
+
+### Aimbot
+- Hold-to-aim (default **MB5**)
+- FOV limit, smoothing, vertical bone offset
+- Optional FOV circle on overlay
+
+### Exploits (EXPLOITS tab)
+Memory writes applied each overlay frame when toggled on:
+
+| Toggle | Effect |
+|---|---|
+| No Gun Cooldown | Hunter gun cooldown → 0 |
+| No Recoil | Camera shake modifier alpha → 0 |
+| No Decoy Cooldown | Decoy cooldown timers → 0 |
+| Set Decoy Num | Sets max decoy spawn count |
+| Anti-Clipping | Disables collision on local mesh (noclip) |
+| Anti-Kick | Logs disconnect / pawn loss (watchdog only) |
+| Auto-Rename | Writes custom name to PlayerState FString fields |
+
+Enable **Debug Logging** to emit `[TRAINER:TAG]` lines to `latest.log`.
+
+### Environment Camouflage (bridge)
+
+Both wrap modes use the **same bridge engine**. The wrap checkbox only controls whether a second pass runs.
+
+| Setting | Behavior |
+|---|---|
+| **Wrap OFF** (default) | One `paint_full_route` pass — samples the scene in front of your character and paints your texture (front-facing camo). |
+| **Wrap ON** | Front pass, then rotate pawn **+180° yaw** via bridge, then a second back pass — full-body environment camo. |
+
+**Flow when you click Paint Now (or press F10):**
+1. Peterhack checks if the bridge TCP server is already up (ping on discovered port).
+2. If not, it scans the game process for an already-loaded bridge DLL — **no double inject** if found.
+3. If the DLL is not loaded, it launches `meccha-camouflage.exe` (controller), waits for inject, then connects on port **47654** (or the port reported in `%LOCALAPPDATA%\MecchaCamouflage\runtime\last_status.json`).
+4. Sends `paint_full_route` over TCP; bridge uses scene-capture + server paint batch replication.
+5. Sends `cancel_paint` and quiesces paint flags when done.
+
+**Stop:** **F9** or **Stop Camo** → `cancel_paint` over TCP.
+
+Bridge binaries (bundled in `meccha_chameleon_tools/`):
+- `meccha-camouflage.exe` — controller / injector service
+- `meccha-xenos-bridge.dll` — in-game TCP bridge + paint pipeline
+- `meccha-xenos-injector.exe` — direct inject fallback
 
 ### Custom Character Paint — Apply Image
-Paint any PNG/JPG directly onto your character's texture atlas with two wrap modes:
 
-| Mode | Description |
+Separate from environment camo. Paint any PNG/JPG onto your character atlas:
+
+| Wrap mode | Description |
 |---|---|
-| **Projector (front → back)** | Image starts at the front side seam, wraps continuously around to the back. The full image is visible front and back as one piece. |
-| **Centered (chest outward)** | Image center sits on the chest. Top of image → character head, bottom → feet. Seam hidden at the spine. |
+| **Projector (front → back)** | Image spans the full atlas front → back as one continuous wrap. |
+| **Centered (chest outward)** | Image center on chest; top → head, bottom → feet. |
 
-- Auto-trims transparent and solid-color borders before painting
-- White base coat clears previous paint before applying
-- Independent **Image Quality** slider (1 = Draft → 5 = Ultra)
-- Game process priority is lowered while painting to free CPU (restores automatically)
+- Auto-trims transparent / solid borders
+- White base coat clears old paint before apply
+- **Image Quality** slider (1 Draft → 5 Ultra)
+- **Run UV Test** — diagnostic overlay (quadrants, islands, grid) to calibrate placement
+- Game process priority lowered while painting (restored after)
 
-### Camouflage
-| Mode | Engine | Description |
-|---|---|---|
-| **Wrap ON** | Bridge | Front `paint_full_route`, rotate pawn +180° via `K2_SetActorRotation`, back pass. |
-| **Wrap OFF** | Peterhack native | Screen-sample + UV/import paint (camera-facing only). |
+---
 
-- Bridge binaries live in `meccha_chameleon_tools/camo/` (bundled with Peterhack).
-- First wrap apply: Peterhack auto-pulses F10 to inject the DLL; click the game if prompted.
-- **Stop** closes the bridge EXE and cancels paint (F9).
-- Logs: `C:\peterhack\logs\latest.log`
+## Hotkeys
 
-### Trainer
-- TRAINER tab: No Gun CD, No Recoil, and related toggles with `[TRAINER:TAG]` debug lines in `latest.log`.
+| Key | Action |
+|---|---|
+| **Insert** / **F1** | Toggle menu + ESP overlay |
+| **F10** | Apply environment camouflage (same as Paint Now) |
+| **F9** | Stop / cancel camouflage paint |
+| **MB5** (default) | Aimbot hold |
 
-### Launcher
-- `Peterhack.bat` — auto-elevates to Administrator, no manual "Run as Admin" needed
-
-### Auto-update
-Peterhack checks the [GitHub main branch](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack) on every launch (no releases required). If newer source is available it downloads and applies it automatically, then restarts.
-
-- **ZIP download users** — files are merged in place; `esp_config.json` and paint presets are preserved.
-- **Git clone users** — uses `git fetch` + `git reset --hard` when Git is installed.
-- Toggle off in the **CHANGELOG** tab, or launch with `python -m meccha_chameleon_tools --no-update`.
-- Version is shown on the CHANGELOG tab (`VERSION` file / git commit).
+Drag the menu title bar to reposition. Menu hotkeys use `RegisterHotKey`; F9/F10 are polled each frame so they do not conflict with the bridge controller.
 
 ---
 
@@ -64,9 +137,8 @@ Python 3.10+
 PyQt5
 pymem
 pywin32
+Pillow
 ```
-
-Install dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -76,19 +148,33 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Launch MECCHA CHAMELEON and get into a match.
-2. Run `Peterhack.bat` as Administrator (it self-elevates automatically).
-3. The overlay and control panel will appear.
+1. Launch **MECCHA CHAMELEON** and join a match.
+2. Run **`Peterhack.bat`** (self-elevates to Administrator).
+3. Use the menu tabs to configure ESP, exploits, and camo.
+4. For environment camo: enable **Enable Camouflage**, optionally **Wrap around character**, then **Paint Now**.
+
+Pre-built EXE: download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main`, or build locally with PyInstaller (see `.github/workflows/build.yml`).
 
 ---
 
-## Hotkeys
+## Auto-update
 
-| Key | Action |
+On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack) for newer source and apply it automatically, then restart.
+
+- **ZIP users** — files merged in place; `esp_config.json` and paint presets preserved.
+- **Git clone users** — `git fetch` + `git reset --hard` when Git is installed.
+- Disable in the **CHANGELOG** tab, or run: `python -m meccha_chameleon_tools --no-update`
+- Current version shown on the CHANGELOG tab (`VERSION` file = git commit).
+
+---
+
+## Troubleshooting (camo)
+
+| Symptom | What to try |
 |---|---|
-| F9 | Stop camouflage / toggle ESP (overlay poll) |
-| F10 | Apply camouflage (overlay poll; bridge EXE also listens globally) |
-| MB5 (default) | Aimbot hold |
+| `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `latest.log` and `%LOCALAPPDATA%\MecchaCamouflage\runtime\last_status.json` |
+| Bridge DLL loaded but TCP dead | Restart the game (Peterhack will not inject twice) |
+| Only front half painted | Enable **Wrap around character (front + back)** |
 
 ---
 
