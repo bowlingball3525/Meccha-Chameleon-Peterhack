@@ -50,7 +50,10 @@ class GameWaitWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         title = QLabel("Waiting for MECCHA CHAMELEON…")
-        title.setFont(QFont("", 11, QFont.Bold))
+        title_font = QFont()
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        title.setFont(title_font)
         self.status = QLabel(
             f"Start the game ({MecchaESP.PROCESS_NAME}).\n"
             "Peterhack will connect automatically."
@@ -64,8 +67,7 @@ class GameWaitWindow(QWidget):
     def start(self, on_ready):
         self._on_ready = on_ready
         self._dismissed = False
-        app = QApplication.instance()
-        self._timer = QTimer(app)
+        self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._timer.start(self.POLL_MS)
         self._poll()
@@ -157,8 +159,14 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
+    from meccha_chameleon_tools.qt_util import configure_app_font
+    configure_app_font(app)
+
     def _qt_message_handler(mode, context, message):
-        print(f"[QT] {message}", flush=True)
+        msg = (message or "").strip()
+        if not msg:
+            return
+        print(f"[QT] {msg}", flush=True)
 
     try:
         from PyQt5.QtCore import qInstallMessageHandler
@@ -173,10 +181,6 @@ def main():
     _esp_holder = []
 
     def _on_game_ready(esp):
-        try:
-            esp.stop_injected_bridge_paint(pulses=5)
-        except Exception:
-            pass
         _esp_holder.append(esp)
         menu = Menu(config, esp)
         overlay = Overlay(esp, config, menu=menu)

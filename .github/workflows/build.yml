@@ -27,7 +27,12 @@ jobs:
           pip install pyinstaller
 
       - name: Build EXE with PyInstaller
-        run: pyinstaller --onefile --windowed --name Peterhack meccha_chameleon_tools/__main__.py
+        run: |
+          pyinstaller --onefile --windowed --name Peterhack ^
+            --add-data "meccha_chameleon_tools/meccha-camouflage.exe;meccha_chameleon_tools" ^
+            --add-data "meccha_chameleon_tools/meccha-xenos-bridge.dll;meccha_chameleon_tools" ^
+            --add-data "meccha_chameleon_tools/meccha-xenos-injector.exe;meccha_chameleon_tools" ^
+            meccha_chameleon_tools/__main__.py
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v4

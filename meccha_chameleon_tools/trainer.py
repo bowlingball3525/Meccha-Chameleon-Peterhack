@@ -193,15 +193,15 @@ class TrainerMixin:
         data_ptr = _rp(self.pm, addr)
         arr_max = _ru32(self.pm, addr + 16)
         if data_ptr and data_ptr > 0x100000 and arr_max >= char_count:
-            self.pm.write_bytes(data_ptr, encoded)
+            self.pm.write_bytes(data_ptr, encoded, len(encoded))
             _wint32(self.pm, addr + 8, char_count)
             return True
         new_mem = self._remote_alloc(self._inject_handle(), len(encoded))
         if not new_mem:
             return False
         try:
-            self.pm.write_bytes(new_mem, encoded)
-            self.pm.write_bytes(addr, struct.pack("<Q", new_mem))
+            self.pm.write_bytes(new_mem, encoded, len(encoded))
+            self.pm.write_bytes(addr, struct.pack("<Q", new_mem), 8)
             _wint32(self.pm, addr + 8, char_count)
             _wint32(self.pm, addr + 16, char_count)
             return True

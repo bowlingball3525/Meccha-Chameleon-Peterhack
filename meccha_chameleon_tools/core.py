@@ -470,6 +470,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     CAMO_MAX_BRUSH_PX = 32.0     # huge brushes corrupt RT / crash on unfreeze flush
     CAMO_MAX_STAMPS = 16384      # paint full grid when possible — subsampling causes gaps
     CAMO_WRAP_MAX_STAMPS = 16384 # wrap uses same dense dot grid as camera-facing
+    CAMO_MAX_SCREEN_STAMPS = 4096  # PaintAtScreenPosition raycasts — cap like image paint
     CAMO_DOT_OVERLAP = 0.46      # brush radius ≈ half UV cell → hard dots tile, not streaks
     CAMO_DOT_HARDNESS = 1.0      # crisp circular stamps (no soft smear)
     PAINT_LIVE_BATCH_PAUSE = 0.022  # seconds between live batches (camo unfrozen path)
@@ -717,14 +718,6 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._last_paint_resolution = 0
         self._last_paint_grid = 32
         self._bridge_proc = None
-        self._bridge_dll_injected = False
-        self._bridge_tcp_ready = False
-        self._bridge_game_pid = 0
-        self._camo_bridge_waiting = False
-        self._bridge_f10_seen = threading.Event()
-        self._bridge_hotkey_paint_done = threading.Event()
-        self._bridge_tcp_event = threading.Event()
-        self._camo_allow_f10_wake = True
         self._camo_abort = False
         self._init_trainer_state()
 
@@ -1768,6 +1761,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     #   comp + 0x01AC  ->  bAutoRecordStrokes   (bool)
     #   comp + 0x01AD  ->  bAutoFlushStrokes    (bool)  [was 0x0199 pre-patch]
     # -----------------------------------------------------------------------
+
+    PAWN_OFF_IS_PAINT_MODE = 0x0B79
+    PAWN_OFF_IS_BRUSHING = 0x0BF8
 
     def _find_local_pawn(self):
         """Resolve the local playable pawn (AcknowledgedPawn, then fallbacks)."""
@@ -3753,8 +3749,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 # Always small batches — 128-stamp injects fail with err=0x5 after probe.
                 batch = self.PAINT_UV_BATCH_SAFE
             elif log_prefix == "CAMO":
-                # Live camo must stay at safe batch size — 96-stamp injects destabilize UE.
-                batch = self.PAINT_UV_BATCH_SAFE
+                if already_frozen or freeze:
+                    # Frozen injects are stable at 64 stamps; live injects crash UE.
+                    batch = 64 if total > 4000 else self.PAINT_UV_BATCH_SIZE
+                else:
+                    batch = self.PAINT_UV_BATCH_SAFE
             elif freeze:
                 batch = self.PAINT_UV_BATCH_SIZE
                 if log_prefix == "CAMO" and total > 4000:
@@ -3829,207 +3828,6 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 return _run_batches()
         return _run_batches()
 
-    def _camo_grid_size_from_points(self, uv_points, brush_grid=None):
-        if brush_grid is not None:
-            return max(8, int(brush_grid))
-        return max(8, int(round(len(uv_points) ** 0.5)))
-
-    def _camo_dot_radius_px(self, atlas_res, grid):
-        """Brush radius in texture pixels for one dot per UV grid cell."""
-        cell = float(atlas_res) / max(1, int(grid))
-        return max(1.5, min(self.CAMO_MAX_BRUSH_PX, cell * self.CAMO_DOT_OVERLAP))
-
-    def _compose_camo_atlas_dot_grid(self, points, atlas_res=1024, grid=None):
-        """Rasterize UV samples as a hard dot grid (no soft overlap streaks)."""
-        g = grid or self._camo_grid_size_from_points(points)
-        dot_r = max(1, int(round(self._camo_dot_radius_px(atlas_res, g))))
-        r2 = dot_r * dot_r
-        out = bytearray(atlas_res * atlas_res * 4)
-        n_pts = 0
-        for u, v, rgb in points:
-            if not rgb or self._camo_aborted():
-                break
-            n_pts += 1
-            cx = int(max(0.0, min(1.0, u)) * (atlas_res - 1))
-            cy = int(max(0.0, min(1.0, v)) * (atlas_res - 1))
-            r, g_c, b = rgb
-            for dy in range(-dot_r, dot_r + 1):
-                for dx in range(-dot_r, dot_r + 1):
-                    if dx * dx + dy * dy > r2:
-                        continue
-                    px, py = cx + dx, cy + dy
-                    if 0 <= px < atlas_res and 0 <= py < atlas_res:
-                        idx = (py * atlas_res + px) * 4
-                        out[idx] = b
-                        out[idx + 1] = g_c
-                        out[idx + 2] = r
-                        out[idx + 3] = 255
-        print(
-            f"[CAMO] dot-grid atlas {atlas_res}² grid~{g} dot_r={dot_r}px points={n_pts}",
-            flush=True,
-        )
-        return bytes(out)
-
-    def _compose_camo_atlas_from_points(self, points, atlas_res=1024, brush_radius_uv=0.02):
-        """Legacy soft-circle compose — prefer _compose_camo_atlas_dot_grid for camo."""
-        grid = self._camo_grid_size_from_points(points)
-        return self._compose_camo_atlas_dot_grid(points, atlas_res=atlas_res, grid=grid)
-
-    @staticmethod
-    def _subsample_camo_points(points, max_n):
-        """Evenly subsample UV/colour points — preserves mosaic diversity better than [::stride]."""
-        if not points or len(points) <= max_n:
-            return list(points or [])
-        step = len(points) / float(max_n)
-        return [points[int(i * step)] for i in range(max_n)]
-
-    def set_camouflage_screenspace(
-        self, actor, uv_points, brush_opacity=1.0, brush_hardness=0.42,
-        fast_paint=False, brush_grid=None, brush_overlap=0.72,
-        wrap_mode=False, accumulate=False,
-    ):
-        """
-        Chameleon blend: compose a full atlas and import it live, or sparse UV stamps.
-
-        Import while frozen returns ok but leaves RT empty; live import + export verify
-        is tried first.  Material-sync nudge (auto_flush) is skipped — it can leave the
-        paint pipeline flushing and looks like solid-colour flicker with the bridge DLL.
-        """
-        if not uv_points:
-            print("[CAMO] no UV points — cannot apply camo")
-            return False
-        if self._camo_aborted():
-            print("[CAMO] apply aborted before start")
-            return False
-
-        self._paint_at_uv_worker_rva = None
-        if not self._resolve_paint_at_uv_worker():
-            print("[CAMO] PaintAtUV worker unresolved — cannot apply camo")
-            return False
-        self._resolve_channel_io_workers()
-
-        wrap_label = "ENABLED" if wrap_mode else "DISABLED"
-        print(f"[CAMO] wrap mode: {wrap_label} (wrap_mode={wrap_mode})", flush=True)
-        print(f"[CAMO] apply pawn=0x{actor:X} points={len(uv_points)}")
-
-        comp = self._get_runtime_paint_component(actor)
-        if not comp:
-            print("[CAMO] No RuntimePaintableComponent — cannot apply camo")
-            return False
-
-        if brush_grid is not None:
-            g = max(8, int(brush_grid))
-        else:
-            g = self._camo_grid_size_from_points(uv_points, brush_grid)
-
-        atlas_res = self.get_albedo_resolution(comp=comp)
-        stamp_cap = self.CAMO_WRAP_MAX_STAMPS if wrap_mode else self.CAMO_MAX_STAMPS
-        paint_pts = list(uv_points)
-        if len(paint_pts) > stamp_cap:
-            paint_pts = self._subsample_camo_points(uv_points, stamp_cap)
-
-        dot_radius = self._camo_dot_radius_px(atlas_res, g)
-        hardness = self.CAMO_DOT_HARDNESS
-        overlap = self.CAMO_DOT_OVERLAP
-        uniq = len({p[2] for p in paint_pts})
-
-        print(
-            f"[CAMO] plan dot-grid UV={len(paint_pts)}/{len(uv_points)} "
-            f"grid~{g} dot_r={dot_radius:.1f}px hard={hardness} "
-            f"unique_colors={uniq} atlas={atlas_res} wrap={wrap_mode}",
-            flush=True,
-        )
-
-        if self._camo_aborted():
-            return False
-
-        import time
-        ok = False
-        live = comp
-        with self._game_frozen("CAMO"):
-            if self._camo_aborted():
-                return False
-            live = self._get_runtime_paint_component(actor, quiet=True) or comp
-            if not self._validate_paint_ready(live, actor, label="CAMO"):
-                return False
-            self._prepare_paint_component(live, record_strokes=False, auto_flush=False)
-            if not accumulate:
-                if not self._call_clear_paint_channel(live):
-                    print("[CAMO] ClearChannel failed — aborting (avoid crash cascade)")
-                    return False
-                time.sleep(0.05)
-            if self._camo_aborted() or not self._game_process_alive():
-                return False
-
-        if self._camo_aborted():
-            return False
-
-        # Primary path: dense hard-dot UV grid (no soft stroke streaks).
-        if self._game_process_alive() and not self._camo_aborted():
-            live = self._get_runtime_paint_component(actor, quiet=True) or live
-            self._quiesce_paint_component(live)
-            self._write_brush_settings(live, dot_radius, hardness, brush_opacity)
-            print(
-                f"[CAMO] dot-grid UV apply {len(paint_pts)} stamps "
-                f"r={dot_radius:.1f}px",
-                flush=True,
-            )
-            ok = self._apply_uv_paint_points(
-                actor, paint_pts, log_prefix="CAMO", brush_grid=g,
-                brush_opacity=brush_opacity, brush_hardness=hardness,
-                freeze=False, comp=live,
-                record_strokes=False, auto_flush=False,
-                brush_overlap=overlap, fast_mode=bool(fast_paint),
-                subsampling_stride=1, replace=False,
-                brush_radius_px=dot_radius,
-            )
-            self._quiesce_paint_component(live)
-
-        # Fallback: import a dot-grid atlas if live UV stamping failed.
-        import_native = False
-        if not ok and not accumulate and self._game_process_alive() and not self._camo_aborted():
-            atlas_blob = self._compose_camo_atlas_dot_grid(
-                paint_pts, atlas_res=atlas_res, grid=g,
-            )
-            expected_bytes = atlas_res * atlas_res * 4
-            live = self._get_runtime_paint_component(actor, quiet=True) or live
-            self._quiesce_paint_component(live)
-            print(f"[CAMO] dot-grid ImportChannel fallback ({len(atlas_blob)} bytes)", flush=True)
-            import_native = bool(
-                self._call_import_channel_bytes(live, atlas_blob, self.EPaintChannel_Albedo)
-            )
-            if import_native:
-                ok = True
-                time.sleep(0.15)
-                self._call_end_stroke(live, label="CAMO")
-                self._nudge_paint_visibility(live, label="CAMO")
-            self._quiesce_paint_component(live)
-
-        if self._camo_aborted():
-            print("[CAMO] apply aborted during paint pass")
-            return False
-        if not self._game_process_alive():
-            print("[CAMO] game exited during apply")
-            return False
-
-        live = self._get_runtime_paint_component(actor, quiet=True) or live
-        self._quiesce_paint_component(live)
-
-        if ok:
-            ok = self._post_unfreeze_paint_finalize(live, label="CAMO")
-            self._quiesce_paint_component(live)
-            if ok:
-                print("[CAMO] apply complete")
-            else:
-                print("[CAMO] paint wrote RT but material did not update")
-        else:
-            print("[CAMO] FAILED — no paint applied")
-
-        ok = ok and self._game_process_alive()
-        if ok:
-            print("[CAMO] camo finished")
-        return ok
-
     # -----------------------------------------------------------------------
     # Custom paint — image import + save/load presets (Export/ImportChannel)
     # -----------------------------------------------------------------------
@@ -4054,6 +3852,32 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         except Exception:
             pass
         return 1024
+
+    def _silence_pawn_paint_tick(self, pawn):
+        """Stop blueprint PaintTick from repainting one averaged CurrentPaintColor."""
+        if not pawn:
+            return
+        try:
+            self.pm.write_bytes(pawn + self.PAWN_OFF_IS_PAINT_MODE, b"\x00", 1)
+            self.pm.write_bytes(pawn + self.PAWN_OFF_IS_BRUSHING, b"\x00", 1)
+            self.pm.write_bytes(pawn + 0x0BA8, struct.pack("<ffff", 0.0, 0.0, 0.0, 0.0), 16)
+        except Exception:
+            pass
+
+    def _force_quiesce_camo_paint(self, pawn=None, comp=None, label="CAMO", quiet=True):
+        """Stop native + network paint loops on pawn and RuntimePaintableComponent."""
+        pawn = pawn or self._get_local_pawn()
+        if pawn:
+            self._silence_pawn_paint_tick(pawn)
+        if comp and comp > 0x100000:
+            self._quiesce_paint_component(comp, label=label)
+        elif pawn:
+            comp = self._get_runtime_paint_component(pawn, quiet=True)
+            if comp:
+                self._quiesce_paint_component(comp, label=label)
+        if not quiet:
+            print(f"[{label}] force-quiesced paint flags on pawn/comp", flush=True)
+        return True
 
     def _prepare_paint_component(self, comp, record_strokes=True, auto_flush=False):
         try:
@@ -4161,7 +3985,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         except Exception:
             modules = []
 
-        fragments = ("meccha-xenos-bridge", "xenos-bridge", "meccha_camouflage")
+        fragments = (
+            "meccha-xenos-bridge", "xenos-bridge", "meccha_camouflage",
+            "meccha-camouflage", "camouflage", "xenos_bridge",
+        )
+        suspicious = ("bridge", "xenos", "camo", "inject")
         kernel32 = ctypes.windll.kernel32
         h_process = self.pm.process_handle
         free_lib = kernel32.GetProcAddress(
@@ -4194,6 +4022,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         else:
             for name, base in self._list_game_modules():
                 _try_unload(name, base)
+                low = (name or "").lower()
+                if any(s in low for s in suspicious):
+                    print(f"[CAMO] in-game module (not unloaded): {name} @ 0x{base:X}", flush=True)
 
         if unloaded:
             print(f"[CAMO] unloaded {len(unloaded)} bridge DLL(s): {', '.join(unloaded)}", flush=True)
@@ -4294,14 +4125,14 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         del comp, label, timeout_ms
         return False
 
-    def _nudge_paint_visibility(self, comp, label="PAINT"):
+    def _nudge_paint_visibility(self, comp, label="PAINT", auto_flush=False):
         """
-        A few live PaintAtUV stamps with auto_flush to wake the game's paint pipeline
-        after bulk UV apply or ImportChannel (RT may have pixels but DMI lags).
+        A few PaintAtUV stamps to wake the game's paint pipeline after import.
+        Keep auto_flush=False for CAMO — it leaves a continuous repaint loop.
         """
         if not comp or not self._game_process_alive():
             return False
-        self._prepare_paint_component(comp, record_strokes=False, auto_flush=True)
+        self._prepare_paint_component(comp, record_strokes=False, auto_flush=auto_flush)
         self._write_brush_settings(comp, radius=2.0, hardness=1.0, opacity=0.01)
         grey = (128, 128, 128)
         # Front + back hemisphere probes — material may only refresh one side otherwise.
@@ -4339,18 +4170,26 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         """
         Push albedo RT to the visible material while the game is still frozen.
 
-        Must run before unfreeze — post-unfreeze PaintAtUV injects crash UE (null+0x18).
+        CAMO: EndStroke only — grey UV nudges retrigger continuous repaint spam.
+        Post-unfreeze nudge crashes UE after large applies.
         """
         if not comp or not self._game_process_alive():
             return False
         import time
         end_ok = False
         if end_stroke:
-            self._prepare_paint_component(comp, record_strokes=False, auto_flush=True)
+            self._prepare_paint_component(comp, record_strokes=False, auto_flush=False)
             end_ok = self._call_end_stroke(comp, label=label)
             time.sleep(0.08)
+        if label == "CAMO":
+            self._reset_paint_component_flags(comp)
+            print(
+                f"[{label}] material sync (frozen) end={end_ok}",
+                flush=True,
+            )
+            return bool(end_ok)
         self._prepare_paint_component(comp, record_strokes=False, auto_flush=True)
-        nudge_ok = self._nudge_paint_visibility(comp, label=label)
+        nudge_ok = self._nudge_paint_visibility(comp, label=label, auto_flush=True)
         time.sleep(0.08)
         print(
             f"[{label}] material sync (frozen) end={end_ok} nudge={nudge_ok}",
@@ -4363,6 +4202,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         """
         Brief settle after paint.  Never call RequestFullTextureSync or scribble on
         comp memory — both crash the render pipeline on this build.
+
+        CAMO: sync already ran while frozen; never inject after unfreeze.
         """
         import time
         if not comp or not self._game_process_alive():
@@ -4371,14 +4212,14 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             time.sleep(0.35)
             alive = self._game_process_alive()
             if alive and comp:
-                self._nudge_paint_visibility(comp, label=label)
                 self._quiesce_paint_component(comp)
-                res = self.get_albedo_resolution(comp=comp)
-                self._verify_import_on_comp(comp, res * res * 4, label=label)
+                self._force_quiesce_camo_paint(
+                    self._get_local_pawn(), comp, label=label, quiet=True,
+                )
             print(f"[{label}] finalize settle ok={alive}", flush=True)
             return alive
         time.sleep(0.2)
-        nudged = self._nudge_paint_visibility(comp, label=label)
+        nudged = self._nudge_paint_visibility(comp, label=label, auto_flush=True)
         time.sleep(0.1)
         settled = self._wait_paint_settle(comp, label=label, settle_ms=200)
         if not self._game_process_alive():
