@@ -57,7 +57,7 @@ class Config:
     aimbot_show_fov: bool = True
     aimbot_visible_check: bool = False
 
-    # Trainer (ported from Desktop/trainer)
+    # Exploits / trainer toggles
     trainer_debug: bool = True
     trainer_no_gun_cooldown: bool = False
     trainer_no_recoil: bool = False

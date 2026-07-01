@@ -499,15 +499,27 @@ class CamoBridgeMixin:
     def _log_bridge_capabilities(self):
         resp = self._bridge_request("capabilities", {}, timeout=5)
         if not resp or not resp.get("success"):
+            self._bridge_commands = set()
             return
         cmds = (resp.get("metadata") or {}).get("commands") or []
+        self._bridge_commands = set(cmds)
         if cmds:
             print(f"[CAMO] bridge commands: {', '.join(cmds)}", flush=True)
+        if cmds and "rotate" not in cmds:
+            print(
+                "[CAMO] bridge DLL is outdated (no rotate) — "
+                "ProcessEvent fallback will be used; restart game after updating camo files",
+                flush=True,
+            )
 
     def _bridge_has_rotate(self):
+        cached = getattr(self, "_bridge_commands", None)
+        if cached is not None:
+            return "rotate" in cached
         resp = self._bridge_request("capabilities", {}, timeout=5)
         if resp and resp.get("success"):
             cmds = (resp.get("metadata") or {}).get("commands") or []
+            self._bridge_commands = set(cmds)
             return "rotate" in cmds
         probe = self._bridge_request("rotate", {"yaw": 0}, timeout=5)
         return bool(probe and probe.get("success"))
@@ -675,35 +687,22 @@ class CamoBridgeMixin:
         return yaw
 
     def _camo_save_view_rotation(self):
-        """Snapshot controller + pawn yaw for wrap restore."""
+        """Snapshot controller view for wrap restore (camera only — pawn stays fixed)."""
         state = {}
         if hasattr(self, "get_control_rotation"):
             rot = self.get_control_rotation()
             if rot:
                 state["control"] = rot
-        pawn = self._find_local_pawn() if hasattr(self, "_find_local_pawn") else 0
-        if pawn and hasattr(self, "get_actor_root_rotation"):
-            rot = self.get_actor_root_rotation(pawn)
-            if rot:
-                state["pawn"] = pawn
-                state["actor"] = rot
         return state
 
     def _camo_apply_view_yaw_delta(self, state, yaw_offset):
-        """Rotate camera + pawn to yaw_offset° from saved start (bridge uses ControlRotation)."""
+        """Rotate camera to yaw_offset° from saved start (ControlRotation only)."""
         if not state or yaw_offset is None:
             return False
-        ok = False
-        if "control" in state and hasattr(self, "set_control_yaw"):
-            pitch, yaw, roll = state["control"]
-            ok = self.set_control_yaw(self._normalize_yaw_deg(yaw + yaw_offset)) or ok
-        pawn = state.get("pawn")
-        if pawn and "actor" in state and hasattr(self, "set_actor_root_yaw"):
-            pitch, yaw, roll = state["actor"]
-            ok = self.set_actor_root_yaw(
-                pawn, self._normalize_yaw_deg(yaw + yaw_offset),
-            ) or ok
-        return ok
+        if "control" not in state or not hasattr(self, "set_control_yaw"):
+            return False
+        pitch, yaw, roll = state["control"]
+        return self.set_control_yaw(self._normalize_yaw_deg(yaw + yaw_offset))
 
     def _camo_restore_view_rotation(self, state):
         if not state:
@@ -711,10 +710,6 @@ class CamoBridgeMixin:
         if "control" in state and hasattr(self, "set_control_yaw"):
             _pitch, yaw, _roll = state["control"]
             self.set_control_yaw(yaw)
-        pawn = state.get("pawn")
-        if pawn and "actor" in state and hasattr(self, "set_actor_root_yaw"):
-            _pitch, yaw, _roll = state["actor"]
-            self.set_actor_root_yaw(pawn, yaw)
 
     # Full wrap: sides first, then front (180°), then back (0° — ends facing forward).
     CAMO_WRAP_YAW_PASSES = (
@@ -725,7 +720,7 @@ class CamoBridgeMixin:
     )
 
     def _camo_rotate_to_yaw(self, target_yaw, label):
-        """Rotate to yaw offset from session start — bridge uses delta, native uses absolute."""
+        """Rotate to yaw offset from session start — bridge delta, then ProcessEvent, then memory."""
         import time as _t
 
         current = getattr(self, "_camo_yaw_offset", 0)
@@ -733,20 +728,38 @@ class CamoBridgeMixin:
         if not delta:
             return True
 
-        print(
-            f"[CAMO] rotate {label} target={target_yaw}° delta={delta}° (bridge)...",
-            flush=True,
-        )
-        rot_resp = self._bridge_request("rotate", {"yaw": delta}, timeout=10)
-        print(f"[CAMO] rotate response={rot_resp}", flush=True)
-        if rot_resp and rot_resp.get("success"):
-            _t.sleep(1.5)
-            self._camo_yaw_offset = target_yaw
-            return True
+        bridge_cmds = getattr(self, "_bridge_commands", None)
+        if bridge_cmds is None or "rotate" in bridge_cmds:
+            print(
+                f"[CAMO] rotate {label} target={target_yaw}° delta={delta}° (bridge)...",
+                flush=True,
+            )
+            rot_resp = self._bridge_request("rotate", {"yaw": delta}, timeout=10)
+            print(f"[CAMO] rotate response={rot_resp}", flush=True)
+            if rot_resp and rot_resp.get("success"):
+                _t.sleep(1.5)
+                self._camo_yaw_offset = target_yaw
+                return True
+
+        if hasattr(self, "native_rotate_yaw_delta"):
+            print(
+                f"[CAMO] rotate {label} delta={delta}° (camera ProcessEvent)...",
+                flush=True,
+            )
+            if self.native_rotate_yaw_delta(delta):
+                verify = ""
+                if hasattr(self, "get_control_rotation"):
+                    rot = self.get_control_rotation()
+                    if rot:
+                        verify = f" control_yaw={rot[1]:.1f}°"
+                print(f"[CAMO] native rotate ok{verify}", flush=True)
+                _t.sleep(1.5)
+                self._camo_yaw_offset = target_yaw
+                return True
 
         state = getattr(self, "_camo_view_state", None)
         if state:
-            print("[CAMO] bridge rotate failed — native camera fallback...", flush=True)
+            print("[CAMO] ProcessEvent rotate failed — memory fallback...", flush=True)
             if self._camo_apply_view_yaw_delta(state, target_yaw):
                 _t.sleep(1.5)
                 self._camo_yaw_offset = target_yaw

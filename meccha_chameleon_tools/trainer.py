@@ -1,4 +1,4 @@
-"""Trainer features ported from Desktop/trainer with debug logging."""
+"""In-game exploit toggles and ProcessEvent helpers with debug logging."""
 import struct
 import time
 import traceback
@@ -491,6 +491,23 @@ class TrainerMixin:
     def _process_event_call(self, caller_obj, ufunc, params_bytes, timeout_ms=8000):
         """Invoke UObject::ProcessEvent(caller, ufunc, params) in the game process."""
         return self._process_event_call_out(caller_obj, ufunc, params_bytes, timeout_ms) is not None
+
+    def native_rotate_yaw_delta(self, yaw_delta_deg):
+        """Rotate controller view yaw only (scene capture reads ControlRotation, not pawn)."""
+        delta = float(yaw_delta_deg)
+        if abs(delta) < 0.01:
+            return True
+        world = self._get_world() if hasattr(self, "_get_world") else 0
+        pc = self._get_local_controller(world) if world and hasattr(self, "_get_local_controller") else 0
+        fn_cr = self._find_ue_function("Controller", "SetControlRotation")
+        if not pc or not fn_cr or not hasattr(self, "get_control_rotation"):
+            return False
+        rot = self.get_control_rotation()
+        if not rot:
+            return False
+        pitch, yaw, roll = rot
+        cr_params = struct.pack("<ddd", pitch, yaw + delta, roll)
+        return self._process_event_call(pc, fn_cr, cr_params)
 
     def _kick_player_controller(self, target_pc, config=None):
         """Host-only Redpoint KickPlayerController."""

@@ -90,14 +90,14 @@ Enable **Debug Logging** to emit `[TRAINER:TAG]` lines to `latest.log`.
 
 Every **Paint Now** / **F10** runs **full 360° wrap** (four scene-capture passes). There is no front-only mode.
 
-| Pass | Label | Yaw |
+| Pass | Label | Camera yaw offset |
 |---|---|---|
 | 1 | Left side | 90° |
 | 2 | Right side | 270° |
 | 3 | Front | 180° |
-| 4 | Back | 0° (restores forward view) |
+| 4 | Back | 0° (restores starting view) |
 
-Each pass rotates the pawn/camera, scene-captures the environment, and paints visible mesh UVs. Expect ~30–40 seconds per pass (~2–3 minutes total).
+Each pass **orbits the camera** (controller `ControlRotation` only — your character does not spin), scene-captures the environment, and paints visible mesh UVs. Expect ~30–40 seconds per pass (~2–3 minutes total).
 
 **Flow:**
 1. Peterhack injects **`meccha-xenos-bridge.dll`** via **`meccha-xenos-injector.exe`** (or reuses an existing bridge if TCP on port **47654** responds).
@@ -109,15 +109,20 @@ Each pass rotates the pawn/camera, scene-captures the environment, and paints vi
 | Command | Description |
 |---|---|
 | `paint_full_route` | Scene-capture basecolor → UV stroke paint |
-| `rotate` | Rotate local pawn by yaw delta |
+| `rotate` | Rotate **camera view** by yaw delta (not pawn body) |
 | `cancel_paint` | Cancel active paint and drain the queue |
 | `ping` / `capabilities` | Health check and command list |
 
 **Stop:** **F9** or **Stop Camo** → `cancel_paint` over TCP.
 
-Bundled binaries (extracted to `C:\peterhack\camo\` on first use):
-- **`meccha-xenos-bridge.dll`** — in-game TCP bridge
-- **`meccha-xenos-injector.exe`** — loads the bridge DLL
+**Bridge binaries** (copied to `C:\peterhack\camo\` on first use):
+
+| File | Role |
+|---|---|
+| `meccha-xenos-bridge.dll` | In-game TCP bridge (scene capture + server paint batch) |
+| `meccha-xenos-injector.exe` | Loads the bridge DLL into the game process |
+
+Peterhack ships prebuilt bridge binaries in `meccha_chameleon_tools/`. To rebuild locally, compile `runtime/src/bridge.cpp` with Visual Studio (see `runtime/scripts/build.ps1`) and copy the output to `meccha-xenos-bridge.dll`.
 
 ### Custom Character Paint — Apply Image
 
@@ -194,6 +199,8 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 | `failed to communicate with bridge DLL` | Run as Administrator; be in a match; check `C:\peterhack\logs\latest.log` |
 | `could not unload` bridge DLL | **Restart the game**, then Paint Now again |
 | Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |
+| `bridge DLL is outdated (no rotate)` | Restart game so Peterhack can copy the latest bridge from the bundle |
+| Camo only paints one side / body spins | Update to latest build — rotate should move **camera only** |
 | Camo takes ~2–3 minutes | Normal for full 360° wrap (four passes) |
 | Steam ID shows `—` in PLAYERS tab | Wait a few seconds for replication; select row and Copy again |
 | ESP feels laggy | Disable **Show Steam ID** if you do not need it; keep PLAYERS tab closed when not in use |
