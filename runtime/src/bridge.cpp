@@ -680,7 +680,7 @@ namespace
             }
             const auto rel = safe_read<std::int32_t>(gu_ref + 3);
             guobject_array = gu_ref + 7 + rel;
-            const auto delta_candidate = guobject_array - 0xE3B40;
+            const auto delta_candidate = guobject_array - 0x11C658;  // GObjects − GNames (dump 5.6.1-44394996)
             names.pool = delta_candidate;
             names.detect();
             if (names.resolve(0) == "None")

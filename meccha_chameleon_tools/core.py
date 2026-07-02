@@ -2298,11 +2298,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
 
     # Camouflage — offsets from Dumper-7 dump
-    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-07-01 game update)
+    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-07-02 dump)
     #
     # Globals (OffsetsInfo.json / Basic.hpp):
     #   GObjects 0x09F3C6D0  GNames 0x09E20078  GWorld 0x09C85620  ProcessEvent 0x015D0AD0
-    #   FNAMEPOOL_DELTA 0x11C658  AppendString 0x013B3110  ProcessEventIdx 0x4C
+    #   FNAMEPOOL_DELTA 0x11C658  AppendString 0x013B3290  ProcessEventIdx 0x4C
     #
     # ABP_FirstPersonCharacter_cLeon_Character_C:
     #   pawn + 0x0B68  ->  RuntimePaintable     (URuntimePaintableComponent*)
