@@ -839,7 +839,7 @@ class TrainerMixin:
     # ------------------------------------------------------------------
     # Autokick / blocklist (Redpoint KickPlayerController when host)
     # ------------------------------------------------------------------
-    RVA_PROCESS_EVENT = 0x15D0AD0
+    RVA_PROCESS_EVENT = 0x15D0BC0
     AUTOKICK_COOLDOWN_SEC = 12.0
     AUTOKICK_LEAVE_COOLDOWN_SEC = 45.0
 

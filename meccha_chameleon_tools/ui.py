@@ -2387,6 +2387,10 @@ class Menu(QWidget):
         txt.setPlainText(
             "=== Peterhack Changelog ===\n"
             "\n"
+            "[Offsets — latest Dumper-7 sync]\n"
+            "  + Dump 5.6.1-44394996: GWorld, ProcessEvent, paint exec RVAs.\n"
+            "  + Run scripts/extract_dump_offsets.py --apply after future dumps.\n"
+            "\n"
             "--- Latest ---\n"
             "\n"
             "[ESP alignment + skeleton]\n"

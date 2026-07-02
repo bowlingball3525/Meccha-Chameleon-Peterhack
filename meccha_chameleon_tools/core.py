@@ -543,7 +543,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
     PROCESS_NAME = "PenguinHotel-Win64-Shipping.exe"
     MODULE_NAME = "PenguinHotel-Win64-Shipping.exe"
-    GWORLD_RVA = 0x9C85620
+    GWORLD_RVA = 0x9C87620
 
     # APlayerState (Engine 5.6 dump)
     OFF_PLAYER_UNIQUE_ID = 0x02B8          # FUniqueNetIdRepl UniqueID
@@ -2972,30 +2972,30 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     # FunctionsInfo / exec thunks directly.  Re-verify prologues at runtime because
     # game patches shift these by small deltas (calling a stale RVA lands mid-function
     # and corrupts the heap — "ClearChannel ok=True" then crash / inject failure).
-    RVA_PAINT_AT_UV_DUMP          = 0x50E5300   # FunctionsInfo PaintAtUV exec
-    RVA_PAINT_AT_UV_LEGACY        = 0x5101000   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
-    RVA_EXEC_PAINT_AT_UV          = 0x50E5300   # exec anchor for scan / self-test
-    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F6C60   # deep ClearChannel native (RCX=comp, DL=channel)
-    RVA_EXPORT_CHANNEL_LEGACY     = 0x50F94C0   # deep ExportChannelToBytes worker
-    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FCE50   # Import dispatch wrapper
-    RVA_EXEC_IMPORT_CHANNEL       = 0x50E3D90   # exec ImportChannelFromBytes (scan anchor)
-    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E35E0   # FunctionsInfo ClearChannel exec
-    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E36A0   # FunctionsInfo ExportChannelToBytes exec
-    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E3D90   # FunctionsInfo ImportChannelFromBytes exec
-    RVA_BEGIN_STROKE_NATIVE       = 0x50E35A0   # FunctionsInfo BeginStroke exec
-    RVA_END_STROKE_NATIVE         = 0x50E3680   # FunctionsInfo EndStroke exec
-    RVA_BEGIN_STROKE_LEGACY       = 0x50F24E0   # deep BeginStroke worker
-    RVA_END_STROKE_LEGACY         = 0x50F8DF0   # deep EndStroke worker
-    RVA_IMPORT_RT_NATIVE          = 0x5106890   # copies TArray bytes into AlbedoRenderTarget
-    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D19C0   # FunctionsInfo RequestFullTextureSync (do NOT call)
-    RVA_APPLY_PAINT_TO_MATERIAL   = 0x5105AD0   # internal RT→material worker (do NOT call directly)
+    RVA_PAINT_AT_UV_DUMP          = 0x50E6180   # FunctionsInfo PaintAtUV exec
+    RVA_PAINT_AT_UV_LEGACY        = 0x5101E80   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
+    RVA_EXEC_PAINT_AT_UV          = 0x50E6180   # exec anchor for scan / self-test
+    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F7AE0   # deep ClearChannel native (RCX=comp, DL=channel)
+    RVA_EXPORT_CHANNEL_LEGACY     = 0x50FA340   # deep ExportChannelToBytes worker
+    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FDCD0   # Import dispatch wrapper
+    RVA_EXEC_IMPORT_CHANNEL       = 0x50E4C10   # exec ImportChannelFromBytes (scan anchor)
+    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E4460   # FunctionsInfo ClearChannel exec
+    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E4520   # FunctionsInfo ExportChannelToBytes exec
+    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E4C10   # FunctionsInfo ImportChannelFromBytes exec
+    RVA_BEGIN_STROKE_NATIVE       = 0x50E4420   # FunctionsInfo BeginStroke exec
+    RVA_END_STROKE_NATIVE         = 0x50E4500   # FunctionsInfo EndStroke exec
+    RVA_BEGIN_STROKE_LEGACY       = 0x50F3360   # deep BeginStroke worker
+    RVA_END_STROKE_LEGACY         = 0x50F9C70   # deep EndStroke worker
+    RVA_IMPORT_RT_NATIVE          = 0x5107710   # copies TArray bytes into AlbedoRenderTarget
+    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D2850   # FunctionsInfo RequestFullTextureSync (do NOT call)
+    RVA_APPLY_PAINT_TO_MATERIAL   = 0x5106950   # internal RT→material worker (do NOT call directly)
     OFF_PAINT_CHANNELS_DIRTY      = 0x016B      # DISABLED — overlaps DynamicMaterialInstance @ +0x0168
-    RVA_REQUEST_TEXTURE_SYNC        = 0x50FF610   # DO NOT call from Peterhack — delayed AV crash
-    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E50C0   # PaintAtScreenPosition exec (FunctionsInfo)
-    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E3BD0   # HitTestAtScreenPosition exec (FunctionsInfo)
-    RVA_GET_PAINT_MESH_NATIVE     = 0x50E3950   # GetInitializedPaintMesh exec (FunctionsInfo)
-    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E50C0   # PaintAtScreenPosition scan anchor
-    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E3BD0   # HitTestAtScreenPosition scan anchor
+    RVA_REQUEST_TEXTURE_SYNC        = 0x5100490   # DO NOT call from Peterhack — delayed AV crash
+    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E5F40   # PaintAtScreenPosition exec (FunctionsInfo)
+    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E4A50   # HitTestAtScreenPosition exec (FunctionsInfo)
+    RVA_GET_PAINT_MESH_NATIVE     = 0x50E47D0   # GetInitializedPaintMesh exec (FunctionsInfo)
+    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E5F40   # PaintAtScreenPosition scan anchor
+    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E4A50   # HitTestAtScreenPosition scan anchor
     EPaintChannel_Albedo = 0
     EPaintChannel_All = 4
 
