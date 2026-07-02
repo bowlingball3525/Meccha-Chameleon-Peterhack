@@ -199,6 +199,10 @@ def main():
         save_config(config)
         if _esp_holder:
             try:
+                _esp_holder[0].stop_trainer_loop()
+            except Exception:
+                pass
+            try:
                 _esp_holder[0].camo_cleanup()
             except Exception:
                 pass

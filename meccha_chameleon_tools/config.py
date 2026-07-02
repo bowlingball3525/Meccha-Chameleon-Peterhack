@@ -44,6 +44,7 @@ class Config:
     dot_radius: int = 8
     box_height_world: float = 100.0
     box_y_offset: int = 0
+    esp_screen_y_offset: int = 28  # extra pixels down on screen (positive = lower)
 
     # Distance scaling
     distance_scaling: bool = True
@@ -110,14 +111,14 @@ class Config:
     image_wrap_mode: str = "projector"
     # UV diagnostic overlay mode: quadrants | islands | grid | slices | full
     uv_diag_mode: str = "full"
-    # Common UE5 mannequin bone indices
+    # Chameleon character skeleton (see chameleonEsp skeleton.hpp)
     bone_indices: dict = field(default_factory=lambda: {
-        "head": 66, "neck_01": 65, "spine_03": 52,
-        "spine_02": 36, "spine_01": 5, "pelvis": 1,
-        "clavicle_l": 13, "upperarm_l": 14, "lowerarm_l": 15, "hand_l": 16,
-        "clavicle_r": 30, "upperarm_r": 31, "lowerarm_r": 32, "hand_r": 33,
-        "thigh_l": 59, "calf_l": 60, "foot_l": 61,
-        "thigh_r": 72, "calf_r": 73, "foot_r": 74,
+        "head": 6, "neck_01": 5, "spine_03": 4,
+        "spine_02": 3, "spine_01": 2, "pelvis": 1,
+        "clavicle_l": 8, "upperarm_l": 9, "lowerarm_l": 10, "hand_l": 11,
+        "clavicle_r": 13, "upperarm_r": 14, "lowerarm_r": 15, "hand_r": 16,
+        "thigh_l": 18, "calf_l": 19, "foot_l": 21,
+        "thigh_r": 23, "calf_r": 24, "foot_r": 26,
     })
 
 

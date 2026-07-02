@@ -65,7 +65,7 @@ Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord**.
 
 | Feature | How it works |
 |---|---|
-| **Dot / Box / Corner Box / Skeleton** | Reads bone positions from the skeletal mesh component, projects world → screen, draws on the overlay each frame. |
+| **Dot / Box / Corner Box / Skeleton** | Reads bone positions from the skeletal mesh component, projects world → screen, draws on the overlay each frame. Dot ESP anchors at **neck**; skeleton uses Chameleon bone indices. |
 | **Snap lines** | Line from screen bottom-center to each player’s projected position. |
 | **OOF arrows** | Off-screen players get an arrow at the screen edge (or configurable radius) pointing toward them; optional name, distance, health. |
 | **Names / Steam64 / Distance** | Name from replicated player state; Steam ID from `FUniqueNetIdRepl` when replicated; distance from local pawn. |
@@ -74,6 +74,7 @@ Bottom bar: **Save Config**, **ESP on/off**, **Close**, **Discord**.
 | **Blocklist highlight** | Blocklisted Steam IDs shown in orange with `[BLOCKED]` tag. |
 | **Enemy Only + Visible colors** | When enabled, only enemies render; optional green/purple for visible vs occluded targets. |
 | **Distance scaling** | Dot radius scales with distance for readability. |
+| **Screen alignment** | Uses aspect-correct FOV projection; optional `esp_screen_y_offset` in `esp_config.json` (default 28px down). Stale camera POV detection reduces ESP parallax drift. |
 | **Debounced cache** | Player list cached briefly to reduce ESP flicker when actors churn. |
 
 ### Players Tab
@@ -113,8 +114,9 @@ Memory writes applied when toggled on (~20 Hz trainer tick):
 | **No Decoy Cooldown** | Sets decoy cooldown slots to ready (30.0) each tick — survivor. |
 | **Anti Detection (Survivor)** | Clears `OverlapCheckCapsules` so buried survivors are not revealed as “Too Buried”. |
 | **Infinite Bullets (Hunter)** | Sets `InfinityBullet` flag each tick. |
-| **Magnet (Hunter)** | Toggle with **G** (custom key via **Record Key**). Pulls all survivors into a line along your view direction. Shows **MAGNET ACTIVE** on overlay. |
+| **Magnet (Hunter)** | Toggle with **G** (custom key via **Record Key**). Works while the **game has focus** via global hotkey + fallback polling. Pulls survivors into a line along your view. Shows **MAGNET ACTIVE** on overlay. |
 | **Kill All Survivors** | One-click button — `KillPlayer` on every survivor in session (staggered). |
+| **Return to Main Lobby** | One-click — calls `ClientReturnToMainMenuWithTextReason`; temporarily disables anti-kick so the RPC is not blocked. |
 | **Set Decoy Num** | Writes max decoy spawn count. |
 | **Anti-Clipping (noclip)** | Sets collision disabled on local body mesh + capsule. |
 | **Anti-Kick** | Bridge vtable hooks block kick/disconnect RPCs (see below). |
@@ -134,7 +136,7 @@ Anti-kick runs **inside the injected bridge DLL**, not from Python memory writes
 | **Hook method** | **Vtable ProcessEvent hooks** on your local `PlayerController`, `PlayerState`, and `NetConnection` — does **not** patch the global ProcessEvent function (UE4SS-safe). |
 | **Blocked RPCs** | Explicit: `ClientWasKicked`, `ClientReturnToMainMenu`, `ClientReturnToMainMenuWithTextReason`, `PlayerState.Kick`, `NetConnection.Close`, etc. |
 | **Auto-scan** | Scans class hierarchies for kick/ban/disconnect/leave/redpoint/eos-like function names and adds them to the block list. |
-| **Kick logger** | Each block logged to `anti_kick.log` with seq, function name, owner class. Trainer polls `get_anti_kick_log` over TCP. |
+| **Kick logger** | Each block logged to `anti_kick.log` with seq, function name, owner class, and **host username** when available. Trainer polls `get_anti_kick_log` over TCP. |
 | **Auto-refresh** | Re-syncs hooks when your controller or player state pointer changes (e.g. lobby → match spawn). |
 | **Limitation** | Pure **EOS/Redpoint platform kicks** may still drop the socket at the network layer even when UE RPCs are blocked. Check logs for `NetConnection lost while world active`. |
 
@@ -228,7 +230,7 @@ Separate from environment camo. Paint any PNG/JPG onto your character atlas:
 | **F9** | Stop / cancel camouflage paint |
 | **MB5** (default) | Aimbot hold |
 | **Enter** (in Rename field) | Queue manual rename |
-| **G** (default) | Toggle survivor magnet (hunter) — rebind in EXPLOITS tab |
+| **G** (default) | Toggle survivor magnet (hunter) — rebind in EXPLOITS tab; works while game is focused |
 
 Drag the menu title bar to reposition. Menu hotkeys use `RegisterHotKey`; F9/F10 are polled each frame.
 
@@ -306,7 +308,7 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 | Anti-kick crashes game on enable | Update to latest build (vtable hooks, not inline ProcessEvent). Fully quit game before replacing DLL. |
 | Rename UI freezes when spamming | Update — renames use a background queue; UI stays responsive. |
 | Rename stuck / reverts in lobby | Use **Rename** button; enable Debug Logging; ensure bridge connected. |
-| Magnet does nothing | You must be **Hunter**; press **G** (or your bound key) to toggle ON. |
+| Magnet does nothing | You must be **Hunter**; press **G** (or your bound key) to toggle ON. Key works while tabbed into the game — run Peterhack as Admin if hotkey fails. |
 | Kill Selected / Kill All fails | Hunter only; host/session rules apply — check `[TRAINER:KILL]` in log. |
 | `could not unload` / DLL stuck | **Quit the game completely** and relaunch. Run Peterhack as Administrator. |
 | `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` |

@@ -17,7 +17,9 @@ from meccha_chameleon_tools.log_util import PETERHACK_ROOT
 
 CREATE_NO_WINDOW = 0x08000000
 BRIDGE_PING_TIMEOUT = 2.5
+BRIDGE_QUICK_PING_TIMEOUT = 0.6
 BRIDGE_PING_RETRIES = 3
+BRIDGE_PORT_TRUST_SEC = 20.0
 BRIDGE_FIXED_PORT = 47654
 
 
@@ -242,33 +244,51 @@ class CamoBridgeMixin:
         resp = self._bridge_request_on_port(port, "ping", timeout=timeout, quiet=quiet)
         return self._bridge_response_ok(resp)
 
-    def _resolve_bridge_port(self):
+    def _resolve_bridge_port(self, fast=False):
         """Find the live bridge TCP port (controller uses dynamic ports)."""
         import time as _t
 
+        now = _t.time()
         cached = getattr(self, "_bridge_port", None)
+        trust_until = getattr(self, "_bridge_port_trust_until", 0.0)
+        if cached and now < trust_until:
+            return cached
+
         if cached:
-            for attempt in range(BRIDGE_PING_RETRIES):
-                if self._ping_port(cached, quiet=attempt > 0):
-                    return cached
-                if attempt + 1 < BRIDGE_PING_RETRIES:
-                    _t.sleep(0.25)
+            if self._ping_port(cached, timeout=BRIDGE_QUICK_PING_TIMEOUT, quiet=True):
+                self._bridge_port_trust_until = now + BRIDGE_PORT_TRUST_SEC
+                self._bridge_last_ok_ts = now
+                return cached
+            self._bridge_port = None
+            if fast:
+                return None
+
         for port in self._discover_bridge_ports():
-            if cached and port == cached:
-                continue
-            if self._ping_port(port):
+            if self._ping_port(port, timeout=BRIDGE_QUICK_PING_TIMEOUT, quiet=True):
                 if getattr(self, "_bridge_port", None) != port:
                     print(f"[CAMO] bridge TCP on 127.0.0.1:{port}", flush=True)
                 self._bridge_port = port
+                self._bridge_port_trust_until = now + BRIDGE_PORT_TRUST_SEC
+                self._bridge_last_ok_ts = now
                 return port
         self._bridge_port = None
+        self._bridge_port_trust_until = 0.0
         return None
 
     def _bridge_request(self, command, payload=None, timeout=30):
-        port = self._resolve_bridge_port()
+        port = self._resolve_bridge_port(fast=True)
+        if not port:
+            port = self._resolve_bridge_port(fast=False)
         if not port:
             return {"success": False}
-        return self._bridge_request_on_port(port, command, payload, timeout=timeout)
+        resp = self._bridge_request_on_port(port, command, payload, timeout=timeout)
+        if resp and self._bridge_response_ok(resp):
+            import time as _t
+            self._bridge_port_trust_until = _t.time() + BRIDGE_PORT_TRUST_SEC
+            self._bridge_last_ok_ts = _t.time()
+        elif port == getattr(self, "_bridge_port", None):
+            self._bridge_port_trust_until = 0.0
+        return resp
 
     def _bridge_ping(self, timeout=BRIDGE_PING_TIMEOUT):
         return self._bridge_request("ping", timeout=timeout)
@@ -436,8 +456,21 @@ class CamoBridgeMixin:
         has_runtime = any(any(m in n for m in self.RUNTIME_BRIDGE_MARKERS) for n in names)
         return True, names, has_xenos, has_runtime
 
+    @staticmethod
+    def _bridge_stuck_message(module_names):
+        mods = ", ".join(module_names) if module_names else "meccha-xenos-bridge.dll"
+        return (
+            f"Bridge loaded but TCP not responding ({mods}). "
+            "ESP and memory trainer features work without the bridge. "
+            "Paint and Anti-Kick need the bridge — fully quit the game once to clear "
+            "a stuck DLL (after a bridge crash or DLL update only; not required for "
+            "Python-only Peterhack changes)."
+        )
+
     def _unload_game_bridge_modules(self, *name_markers):
         """FreeLibrary selected bridge DLLs in the game process."""
+        import time as _t
+
         unloaded = []
         if not getattr(self, "pm", None):
             return unloaded
@@ -453,51 +486,52 @@ class CamoBridgeMixin:
         if not free_lib:
             return unloaded
 
-        seen_bases = set()
-
-        def _try_unload(name, base):
-            base = int(base or 0)
-            low = (name or "").lower()
-            if base <= 0x10000 or base in seen_bases:
-                return
-            if not any(m in low for m in markers):
-                return
-            seen_bases.add(base)
-            print(f"[CAMO] unloading {name} @ 0x{base:X}", flush=True)
-            h_thread = kernel32.CreateRemoteThread(
-                h_process, None, 0, free_lib, base, 0, None,
-            )
-            if h_thread:
-                kernel32.WaitForSingleObject(h_thread, 8000)
-                kernel32.CloseHandle(h_thread)
-                unloaded.append(name)
-
         list_modules = getattr(self, "_list_game_modules", None)
-        if callable(list_modules):
-            for name, base in list_modules():
-                _try_unload(name, base)
+        if not callable(list_modules):
+            return unloaded
+
+        for round_num in range(8):
+            round_unloaded = []
+            for name, base in list(list_modules()):
+                base = int(base or 0)
+                low = (name or "").lower()
+                if base <= 0x10000 or not any(m in low for m in markers):
+                    continue
+                if round_num == 0:
+                    print(f"[CAMO] unloading {name} @ 0x{base:X}", flush=True)
+                h_thread = kernel32.CreateRemoteThread(
+                    h_process, None, 0, free_lib, base, 0, None,
+                )
+                if h_thread:
+                    kernel32.WaitForSingleObject(h_thread, 8000)
+                    kernel32.CloseHandle(h_thread)
+                    round_unloaded.append(name)
+            if round_unloaded:
+                unloaded.extend(round_unloaded)
+            still_loaded, _, _, _ = self._bridge_dll_state()
+            if not still_loaded:
+                break
+            _t.sleep(0.15)
+
         if unloaded:
             print(
-                f"[CAMO] unloaded {len(unloaded)} module(s): {', '.join(unloaded)}",
+                f"[CAMO] unloaded {len(unloaded)} module unload(s): {', '.join(unloaded)}",
                 flush=True,
             )
         return unloaded
 
-    def _bridge_shutdown(self):
-        """Ask the in-game TCP bridge to stop (best-effort before unload)."""
-        try:
-            port = getattr(self, "_bridge_port", None)
-            if port:
-                self._bridge_request("shutdown", {}, timeout=3)
-            else:
-                for port in self._discover_bridge_ports()[:3]:
-                    self._bridge_request_on_port(port, "shutdown", {}, timeout=3)
-        except Exception:
-            pass
+    def _bridge_shutdown(self, quiet=True):
+        """Ask the in-game TCP bridge to stop (only when TCP is actually up)."""
+        port = self._resolve_bridge_port()
+        if not port:
+            return False
+        resp = self._bridge_request_on_port(port, "shutdown", {}, timeout=3, quiet=quiet)
+        return self._bridge_response_ok(resp)
 
     def _unload_all_bridge_modules(self):
         """FreeLibrary every camouflage bridge DLL in the game process."""
-        self._bridge_shutdown()
+        if self._resolve_bridge_port():
+            self._bridge_shutdown(quiet=True)
         return self._unload_game_bridge_modules(*self.BRIDGE_DLL_MARKERS)
 
     def _replace_runtime_bridge_with_xenos(self):
@@ -569,11 +603,10 @@ class CamoBridgeMixin:
                 _t.sleep(0.4)
                 loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
                 if loaded:
-                    print(
-                        "[CAMO] bridge DLL(s) still loaded after unload — "
-                        "restart the game and retry Paint Now.",
-                        flush=True,
-                    )
+                    msg = self._bridge_stuck_message(mod_names)
+                    self._camo_last_error = msg
+                    self._bridge_recover_give_up = True
+                    print(f"[CAMO] {msg}", flush=True)
                     return False
             else:
                 print(
@@ -617,6 +650,12 @@ class CamoBridgeMixin:
 
     def start_bridge_preload(self):
         """Inject bridge DLL in the background when Peterhack attaches to the game."""
+        pid = getattr(getattr(self, "pm", None), "process_id", 0) or 0
+        if pid != getattr(self, "_bridge_session_pid", 0):
+            self._bridge_session_pid = pid
+            self._bridge_recover_give_up = False
+            self._bridge_preload_started = False
+            self._bridge_preload_ok = None
         if getattr(self, "_bridge_preload_started", False):
             return
         self._bridge_preload_started = True
@@ -637,23 +676,36 @@ class CamoBridgeMixin:
         )
         self._bridge_preload_thread.start()
 
-    def _ensure_bridge(self):
+    def _ensure_bridge(self, force=False):
         """Ensure meccha-xenos-bridge.dll is loaded — the only in-game bridge we use."""
         lock = getattr(self, "_bridge_ensure_lock", None)
         if lock is None:
             lock = threading.Lock()
             self._bridge_ensure_lock = lock
+        if not force:
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                return bool(self._resolve_bridge_port(fast=True))
+            try:
+                return self._ensure_bridge_impl(force=False)
+            finally:
+                lock.release()
         with lock:
-            return self._ensure_bridge_impl()
+            return self._ensure_bridge_impl(force=True)
 
-    def _ensure_bridge_impl(self):
+    def _ensure_bridge_impl(self, force=False):
         import time as _t
 
         if not getattr(self, "pm", None) or not self.pm.process_id:
             print("[CAMO] no game pid", flush=True)
             return False
 
+        if getattr(self, "_bridge_recover_give_up", False) and not force:
+            return False
+
         self._stop_legacy_camo_controller()
+        if force:
+            self._bridge_recover_give_up = False
         self._camo_last_error = None
 
         loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
@@ -693,6 +745,12 @@ class CamoBridgeMixin:
                 self._bridge_last_ok_ts = _t.time()
                 self._log_bridge_capabilities()
                 return True
+        if has_xenos and not tcp_ok:
+            print("[CAMO] bridge DLL in process — waiting for TCP listener...", flush=True)
+            if self._wait_for_bridge_tcp("bridge listener", attempts=24, sleep_s=0.25):
+                self._bridge_last_ok_ts = _t.time()
+                self._log_bridge_capabilities()
+                return True
         print(
             f"[CAMO] bridge reset ({', '.join(reasons) or 'not loaded'}) — "
             f"injecting {self.DLL_NAME}...",
@@ -717,12 +775,9 @@ class CamoBridgeMixin:
                     _t.sleep(0.5)
             still_loaded, still_names, _, _ = self._bridge_dll_state()
             if still_loaded:
-                msg = (
-                    f"Stale bridge stuck in game ({', '.join(still_names)}). "
-                    "Fully quit the game (not just menu), relaunch, join a match, "
-                    "then Paint Now. Do not run meccha-camouflage.exe separately."
-                )
+                msg = self._bridge_stuck_message(still_names)
                 self._camo_last_error = msg
+                self._bridge_recover_give_up = True
                 print(f"[CAMO] {msg}", flush=True)
                 return False
 
@@ -751,7 +806,7 @@ class CamoBridgeMixin:
             return False
 
         print("[CAMO] waiting for meccha-xenos-bridge TCP...", flush=True)
-        if self._wait_for_bridge_tcp("xenos bridge", attempts=80):
+        if self._wait_for_bridge_tcp("xenos bridge", attempts=40, sleep_s=0.25):
             self._bridge_last_ok_ts = _t.time()
             self._log_bridge_capabilities()
             return True
@@ -1117,20 +1172,20 @@ class CamoBridgeMixin:
         )
 
     # Pass order: front → sides → back → detail (head/shoulders, inner legs).
-    # Yaw orbit is in the body forward/right plane. Bridge scene capture places the
-    # camera at body - look*pullback facing look, so +forward views the spine/back
-    # and -forward views the chest/front (not the raw axis label).
+    # Yaw orbit is in the body forward/right plane. Scene capture sits at
+    # body - look*pullback facing look, so +forward (180°) sees spine/back and
+    # -forward (0°) sees chest/front — labels match the body side painted.
     CAMO_WRAP_YAW_PASSES = (
-        (180, "front"),
+        (180, "back"),
         (90, "left"),
         (270, "right"),
-        (0, "back"),
+        (0, "front"),
     )
     CAMO_DETAIL_PASSES = (
         "head_shoulders",
         "inner_legs",
     )
-    CAMO_PAWN_BACK_YAW = 0
+    CAMO_PAWN_BACK_YAW = 180
     CAMO_CAMERA_SETTLE_MS = 2000
     CAMO_DEFAULT_SETTLE_SEC = 0.5
 
@@ -1293,7 +1348,7 @@ class CamoBridgeMixin:
             if not pid:
                 return False
 
-            if not self._ensure_bridge():
+            if not self._ensure_bridge(force=True):
                 return False
 
             import time as _t

@@ -75,11 +75,14 @@ def w2s(world_pos, camera, screen_w, screen_h):
         view_y = -view_y
         view_z = -view_z
 
-    aspect   = screen_w / screen_h if screen_h > 0 else 16.0 / 9.0
+    aspect = camera.get("aspect")
+    if aspect is None or not (0.1 < aspect < 5.0):
+        aspect = screen_w / screen_h if screen_h > 0 else 16.0 / 9.0
     safe_fov = max(5.0, min(fov, 170.0))
     tan_hfov = math.tan(math.radians(safe_fov) / 2.0) or 1e-6
+    tan_vfov = tan_hfov / max(0.01, aspect)
     ndc_x = view_y / (view_x * tan_hfov)
-    ndc_y = view_z / (view_x * tan_hfov / aspect)
+    ndc_y = view_z / (view_x * tan_vfov)
     if not math.isfinite(ndc_x):
         ndc_x = 0.0
     if not math.isfinite(ndc_y):
@@ -109,15 +112,23 @@ def clamp_screen(x, y, w, h, margin=10):
     return max(margin, min(x, w - margin)), max(margin, min(y, h - margin))
 
 
-def oof_indicator_pos(sx, sy, screen_w, screen_h, radius_px=0):
+def oof_indicator_pos(sx, sy, screen_w, screen_h, radius_px=0, bearing_rad=None):
     """Place an off-screen indicator on a ring around screen center.
 
     radius_px = 0 sticks to the screen edge (uses sx/sy from w2s as-is).
     radius_px > 0 places the marker on a circle that many pixels from center.
+    bearing_rad = horizontal world bearing relative to camera (fallback when w2s is degenerate).
     """
     cx, cy = screen_w / 2.0, screen_h / 2.0
     dx, dy = sx - cx, sy - cy
-    length = math.sqrt(dx * dx + dy * dy) or 1.0
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1.0 and bearing_rad is not None:
+        dx = math.sin(bearing_rad)
+        dy = -math.cos(bearing_rad)
+        length = 1.0
+    elif length < 1.0:
+        dx, dy = 0.0, -1.0
+        length = 1.0
     ux, uy = dx / length, dy / length
     if radius_px <= 0:
         return int(sx), int(sy), ux, uy
@@ -163,12 +174,39 @@ def name_from_vk(vk):
     return KEY_NAMES.get(vk, f"VK_{vk:02X}")
 
 
+def is_game_foreground(game_hwnd=0, *, exclude_hwnds=()):
+    """True when the game (not Peterhack menu) owns keyboard focus."""
+    try:
+        user32 = ctypes.windll.user32
+        fg = user32.GetForegroundWindow()
+        if not fg:
+            return False
+        for ex in exclude_hwnds:
+            if ex and int(ex) == int(fg):
+                return False
+        hwnd = int(game_hwnd) if game_hwnd else 0
+        if not hwnd:
+            hwnd = MecchaESP._find_game_window_hwnd()
+        if not hwnd:
+            return False
+        if int(fg) == int(hwnd):
+            return True
+        pid_fg = ctypes.c_ulong()
+        pid_game = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(int(fg), ctypes.byref(pid_fg))
+        user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid_game))
+        return pid_fg.value != 0 and pid_fg.value == pid_game.value
+    except Exception:
+        return False
+
+
 WM_HOTKEY = 0x0312
 MOD_NOREPEAT = 0x4000
 HK_MENU_INSERT = 1
 HK_MENU_F1 = 2
 HK_CAMO_F10 = 3
 HK_CAMO_F9 = 4
+HK_MAGNET = 5
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +355,8 @@ def draw_corner_box(painter, pos, camera, screen_w, screen_h,
 
 def draw_skeleton(painter, bone_positions, camera, screen_w, screen_h, color):
     """Draw skeleton lines connecting bones."""
+    from meccha_chameleon_tools.core import MecchaESP
+
     bone_screen = {}
     for name, pos in bone_positions.items():
         sx, sy, on_screen = w2s(pos, camera, screen_w, screen_h)
@@ -324,17 +364,7 @@ def draw_skeleton(painter, bone_positions, camera, screen_w, screen_h, color):
             continue
         cx, cy = clamp_screen(sx, sy, screen_w, screen_h)
         bone_screen[name] = (cx, cy)
-    connections = [
-        ("pelvis", "spine_01"), ("spine_01", "spine_02"),
-        ("spine_02", "spine_03"), ("spine_03", "neck_01"),
-        ("neck_01", "head"),
-        ("clavicle_l", "upperarm_l"), ("upperarm_l", "lowerarm_l"),
-        ("lowerarm_l", "hand_l"),
-        ("clavicle_r", "upperarm_r"), ("upperarm_r", "lowerarm_r"),
-        ("lowerarm_r", "hand_r"),
-        ("pelvis", "thigh_l"), ("thigh_l", "calf_l"), ("calf_l", "foot_l"),
-        ("pelvis", "thigh_r"), ("thigh_r", "calf_r"), ("calf_r", "foot_r"),
-    ]
+    connections = MecchaESP.BONE_CONNECTIONS
     painter.save()
     painter.setPen(QPen(QColor(*color), 2))
     painter.setBrush(Qt.NoBrush)
@@ -536,12 +566,15 @@ class Menu(QWidget):
         self._overlay = None
         self._hotkeys_registered = False
         self._hotkeys_native = False
+        self._magnet_hotkey_registered = False
+        self._magnet_hotkey_vk = 0
         self._camo_thread = None
         self._camo_busy = False
         self._bridge_exploit_thread = None
         self._bridge_exploit_busy = False
         self._stop_thread = None
         self._player_rows = []
+        self._players_steam_resolve_pending = False
         self._blocklist_entries = load_blocklist()
         self.esp.refresh_blocklist_cache(force=True)
         if hasattr(self.esp, "set_rename_notify"):
@@ -581,6 +614,10 @@ class Menu(QWidget):
         if hasattr(self, "lbl_camo_status"):
             if ok:
                 self.lbl_camo_status.setText("Bridge ready — click Paint Now")
+            elif getattr(self.esp, "_bridge_recover_give_up", False):
+                self.lbl_camo_status.setText(
+                    "Bridge stuck (ESP still works) — quit game once for Paint/Anti-Kick"
+                )
             else:
                 err = getattr(self.esp, "_camo_last_error", None) or "inject failed"
                 short = err if len(err) <= 100 else err[:97] + "..."
@@ -588,17 +625,22 @@ class Menu(QWidget):
         if hasattr(self, "lbl_bridge_exploit_status"):
             if ok:
                 self.lbl_bridge_exploit_status.setText("Bridge ready.")
+            elif getattr(self.esp, "_bridge_recover_give_up", False):
+                self.lbl_bridge_exploit_status.setText(
+                    "Bridge stuck — quit game once to reload DLL (ESP still works)"
+                )
             else:
                 err = getattr(self.esp, "_camo_last_error", None) or "inject failed"
                 short = err if len(err) <= 100 else err[:97] + "..."
                 self.lbl_bridge_exploit_status.setText(f"Bridge failed — {short}")
         if ok and getattr(self.config, "trainer_anti_kick", False):
             self.esp._anti_kick_bridge_state = None
-            if hasattr(self.esp, "_sync_anti_kick_bridge"):
-                self.esp._sync_anti_kick_bridge(True, self.config)
+            if hasattr(self.esp, "_schedule_anti_kick_bridge_sync"):
+                self.esp._schedule_anti_kick_bridge_sync(True, self.config)
 
     def attach_overlay(self, overlay):
         self._overlay = overlay
+        self._register_magnet_hotkey()
 
     def _camo_set_overlay_feedback(self, text, frames=60):
         if self._overlay:
@@ -694,6 +736,40 @@ class Menu(QWidget):
             self.lbl_trainer_rename_status.setText(f"Queued '{name}'...")
         else:
             self.lbl_trainer_rename_status.setText("Rename unavailable — restart Peterhack.")
+
+    def _run_return_to_lobby(self):
+        if getattr(self, "_return_lobby_busy", False):
+            return
+        self._return_lobby_busy = True
+        self.btn_return_lobby.setEnabled(False)
+        self.lbl_return_lobby_status.setText("Leaving lobby/match...")
+        threading.Thread(
+            target=self._return_to_lobby_worker,
+            daemon=True,
+            name="return-to-lobby",
+        ).start()
+
+    def _return_to_lobby_worker(self):
+        ok = False
+        msg = "unknown error"
+        try:
+            if hasattr(self.esp, "return_to_main_lobby"):
+                ok, msg = self.esp.return_to_main_lobby(self.config)
+            else:
+                msg = "return_to_main_lobby unavailable — restart Peterhack"
+        except Exception as exc:
+            msg = str(exc)
+        QTimer.singleShot(0, lambda: self._return_to_lobby_done(ok, msg))
+
+    def _return_to_lobby_done(self, ok, msg):
+        self._return_lobby_busy = False
+        short = msg if len(msg) <= 120 else msg[:117] + "..."
+        self.lbl_return_lobby_status.setText(("OK — " if ok else "Failed — ") + short)
+        if ok:
+            self.btn_return_lobby.setEnabled(False)
+            self.btn_return_lobby.setText("Sent — returning to menu")
+        else:
+            self.btn_return_lobby.setEnabled(True)
 
     def _trainer_rename_done(self, ok, msg):
         short = msg if len(msg) <= 140 else msg[:137] + "..."
@@ -807,8 +883,43 @@ class Menu(QWidget):
         )
         if not ok_insert:
             print(f"[UI] RegisterHotKey Insert err={ctypes.windll.kernel32.GetLastError()}", flush=True)
+        self._register_magnet_hotkey()
+
+    def _register_magnet_hotkey(self):
+        """Register magnet toggle globally so it fires while the game has focus."""
+        hwnd = int(self.winId()) if self.winId() else 0
+        if not hwnd:
+            return
+        vk = vk_from_name(getattr(self.config, "trainer_magnet_key", "G"))
+        if self._magnet_hotkey_registered and self._magnet_hotkey_vk == vk:
+            return
+        self._unregister_magnet_hotkey()
+        user32 = ctypes.windll.user32
+        ok = bool(user32.RegisterHotKey(hwnd, HK_MAGNET, MOD_NOREPEAT, vk))
+        self._magnet_hotkey_registered = ok
+        self._magnet_hotkey_vk = vk if ok else 0
+        if hasattr(self, "esp") and self.esp is not None:
+            self.esp._magnet_hotkey_native = ok
+        print(
+            f"[UI] magnet hotkey {getattr(self.config, 'trainer_magnet_key', 'G')} "
+            f"registered={ok} hwnd=0x{hwnd:X}",
+            flush=True,
+        )
+        if not ok:
+            err = ctypes.windll.kernel32.GetLastError()
+            print(f"[UI] RegisterHotKey magnet err={err}", flush=True)
+
+    def _unregister_magnet_hotkey(self):
+        hwnd = int(self.winId()) if self.winId() else 0
+        if hwnd and self._magnet_hotkey_registered:
+            ctypes.windll.user32.UnregisterHotKey(hwnd, HK_MAGNET)
+        self._magnet_hotkey_registered = False
+        self._magnet_hotkey_vk = 0
+        if hasattr(self, "esp") and self.esp is not None:
+            self.esp._magnet_hotkey_native = False
 
     def _unregister_global_hotkeys(self):
+        self._unregister_magnet_hotkey()
         if not self._hotkeys_registered:
             return
         hwnd = int(self.winId())
@@ -818,6 +929,22 @@ class Menu(QWidget):
                 user32.UnregisterHotKey(hwnd, hid)
         self._hotkeys_registered = False
         self._hotkeys_native = False
+
+    def _game_hwnd_for_input(self):
+        overlay = getattr(self, "_overlay", None)
+        if overlay and getattr(overlay, "game_hwnd", 0):
+            return overlay.game_hwnd
+        return MecchaESP._find_game_window_hwnd()
+
+    def _on_magnet_hotkey(self):
+        if not is_game_foreground(
+            self._game_hwnd_for_input(),
+            exclude_hwnds=(int(self.winId()) if self.winId() else 0,),
+        ):
+            return
+        if hasattr(self.esp, "toggle_magnet"):
+            self.esp.toggle_magnet(self.config)
+        self._update_magnet_status_label()
 
     def _toggle_menu_visibility(self):
         self.setVisible(not self.isVisible())
@@ -868,6 +995,9 @@ class Menu(QWidget):
             if msg.message == WM_HOTKEY:
                 if msg.wParam in (HK_MENU_INSERT, HK_MENU_F1):
                     self._toggle_menu_visibility()
+                    return True, 0
+                if msg.wParam == HK_MAGNET:
+                    self._on_magnet_hotkey()
                     return True, 0
         return super().nativeEvent(eventType, message)
 
@@ -948,6 +1078,7 @@ class Menu(QWidget):
         self.lbl_magnet_key.setText(f"Magnet toggle key: {name}")
         self.btn_record_magnet_key.setEnabled(True)
         self.btn_record_magnet_key.setText("Record Key")
+        self._register_magnet_hotkey()
 
     def _build_ui(self):
         import os as _os
@@ -1307,6 +1438,8 @@ class Menu(QWidget):
             or getattr(self.config, "autokick_enabled", False)
         )
         self.esp.set_steam_features_active(active)
+        if on_players_tab:
+            self._schedule_players_steam_resolve()
 
     def _on_players_table_selection(self):
         rows = self.tbl_players.selectionModel().selectedRows()
@@ -1338,6 +1471,8 @@ class Menu(QWidget):
     def _resolve_player_steam_id(self, pdata, force=False):
         ps = pdata.get("player_state", 0) if pdata else 0
         sid = ""
+        if ps and force:
+            self.esp._steam_id_cache.pop(ps, None)
         if ps:
             sid = self.esp.get_player_steam_id(ps, force=force)
         if not sid and pdata:
@@ -1431,6 +1566,39 @@ class Menu(QWidget):
         finally:
             self.tbl_players.blockSignals(False)
             self.tbl_players.setUpdatesEnabled(True)
+        self._schedule_players_steam_resolve()
+
+    def _schedule_players_steam_resolve(self):
+        """Resolve one Steam ID per tick so the menu/overlay stay responsive."""
+        if getattr(self, "_players_steam_resolve_pending", False):
+            return
+        if self._pages.get("PLAYERS") is not self.stack.currentWidget():
+            return
+        self._players_steam_resolve_pending = True
+        QTimer.singleShot(150, self._resolve_next_player_steam_id)
+
+    def _resolve_next_player_steam_id(self):
+        self._players_steam_resolve_pending = False
+        if self._pages.get("PLAYERS") is not self.stack.currentWidget():
+            return
+        rows = getattr(self, "_player_rows", [])
+        for row, pdata in enumerate(rows):
+            if (pdata.get("steam_id") or "").strip():
+                continue
+            ps = pdata.get("player_state", 0)
+            if not ps:
+                continue
+            sid = self.esp._bridge_resolve_steam_id(ps, timeout=4)
+            if not sid:
+                sid = self.esp.get_player_steam_id(ps, force=False)
+            if sid:
+                pdata["steam_id"] = sid
+                item = self.tbl_players.item(row, 2)
+                if item:
+                    item.setText(sid)
+                self._players_tab_sig = None
+            self._schedule_players_steam_resolve()
+            return
 
     def _kill_selected_survivor(self):
         pdata = self._selected_player_row()
@@ -1617,7 +1785,7 @@ class Menu(QWidget):
         self.lbl_magnet_key = QLabel("Magnet toggle key: " + getattr(self.config, "trainer_magnet_key", "G"))
         self.btn_record_magnet_key = QPushButton("Record Key")
         self.btn_record_magnet_key.setToolTip(
-            "Press the key to toggle survivor magnet (default G). Pulls survivors in a line along your view."
+            "Press the key to toggle survivor magnet (default G). Works while the game has focus."
         )
         self.btn_record_magnet_key.clicked.connect(self._start_magnet_key_record)
         magnet_row.addWidget(self.lbl_magnet_key)
@@ -1633,11 +1801,28 @@ class Menu(QWidget):
             "Blocks host kick RPCs via bridge (ClientWasKicked, return-to-menu, Kick, etc.).\n"
             "Auto-scans PlayerController/PlayerState for kick/ban/disconnect RPCs.\n"
             "Blocked kicks are logged to C:\\peterhack\\logs\\anti_kick.log and latest.log.\n"
+            "Each entry includes the host's username when available.\n"
             "Requires bridge injected. Chains with UE4SS when detected.\n"
             "If enable crashes the game, toggle off, fully quit/relaunch, then retry.\n"
             "EOS/platform-level kicks may still disconnect you."
         )
         lo.addWidget(cb_anti_kick)
+
+        lobby_row = QHBoxLayout()
+        self.btn_return_lobby = QPushButton("Return to Main Lobby")
+        self.btn_return_lobby.setToolTip(
+            "One click: calls ClientReturnToMainMenu on your PlayerController.\n"
+            "Leaves the current lobby/match and sends you back to the main menu.\n"
+            "If Anti-Kick is on, it is turned off first (anti-kick blocks this RPC)."
+        )
+        self.btn_return_lobby.clicked.connect(self._run_return_to_lobby)
+        lobby_row.addWidget(self.btn_return_lobby)
+        lo.addLayout(lobby_row)
+        self.lbl_return_lobby_status = QLabel("")
+        self.lbl_return_lobby_status.setWordWrap(True)
+        self.lbl_return_lobby_status.setStyleSheet("color: #6a8a5a; font-size: 10px;")
+        lo.addWidget(self.lbl_return_lobby_status)
+
         lo.addWidget(self._chk("Auto-Rename", "trainer_auto_rename"))
 
         rr = QHBoxLayout()
@@ -2202,7 +2387,26 @@ class Menu(QWidget):
         txt.setPlainText(
             "=== Peterhack Changelog ===\n"
             "\n"
-            "--- Jul 1, 2026 (latest) ---\n"
+            "--- Latest ---\n"
+            "\n"
+            "[ESP alignment + skeleton]\n"
+            "  + Dot ESP anchored at neck; skeleton uses Chameleon bone map.\n"
+            "  + Camera POV stale detection + aspect-correct world_to_screen.\n"
+            "  + esp_screen_y_offset in esp_config.json (default 28px down).\n"
+            "\n"
+            "[Stability]\n"
+            "  + Trainer loop off UI thread; async anti-kick bridge sync.\n"
+            "  + Bridge status text no longer implies game restart for Python-only fixes.\n"
+            "\n"
+            "[EXPLOITS / UX]\n"
+            "  + Return to Main Lobby one-click (disables anti-kick first).\n"
+            "  + Magnet hotkey works while game has focus (RegisterHotKey).\n"
+            "  + Anti-kick logs include host username on blocked kicks.\n"
+            "\n"
+            "[Camo]\n"
+            "  + Back pass only / skip front pass yaw labels corrected.\n"
+            "\n"
+            "--- Jul 1, 2026 ---\n"
             "\n"
             "[chameleonEsp feature port + player list fixes]\n"
             "  + Anti Detection (Survivor) — clears OverlapCheckCapsules (Too Buried).\n"
@@ -2816,6 +3020,7 @@ class Menu(QWidget):
         self._key_recorder.start()
 
     def _start_magnet_key_record(self):
+        self._unregister_magnet_hotkey()
         self.btn_record_magnet_key.setEnabled(False)
         self.btn_record_magnet_key.setText("Press key...")
         self._magnet_key_recorder.start()
@@ -2939,6 +3144,7 @@ class Overlay(QWidget):
 
         # Game FPS tracker — 500 Hz background thread counts camera ticks/sec
         self._game_fps_info = self.esp.start_fps_tracker()
+        self.esp.start_trainer_loop(lambda: self.config)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_overlay)
@@ -3155,24 +3361,27 @@ class Overlay(QWidget):
                 pass
 
     def _poll_keys(self):
-        """Fallback key poll when RegisterHotKey is unavailable (non-admin runs)."""
+        """Poll gameplay keys; menu Insert/F1 only when RegisterHotKey is unavailable."""
         menu = self.menu
-        if menu and getattr(menu, "_hotkeys_native", False):
-            return
+        poll_menu_keys = not (menu and getattr(menu, "_hotkeys_native", False))
 
-        VK_INSERT = 0x2D
-        VK_F1 = 0x70
-        for vk, name in [(VK_INSERT, "insert"), (VK_F1, "f1")]:
-            state = ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
-            if state and not self._key_states.get(name):
-                if menu:
-                    menu._toggle_menu_visibility()
-                else:
-                    for w in QApplication.topLevelWidgets():
-                        if isinstance(w, Menu):
-                            w._toggle_menu_visibility()
-                            break
-            self._key_states[name] = bool(state)
+        if poll_menu_keys:
+            VK_INSERT = 0x2D
+            VK_F1 = 0x70
+            for vk, name in [(VK_INSERT, "insert"), (VK_F1, "f1")]:
+                state = ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                if state and not self._key_states.get(name):
+                    if menu:
+                        menu._toggle_menu_visibility()
+                    else:
+                        for w in QApplication.topLevelWidgets():
+                            if isinstance(w, Menu):
+                                w._toggle_menu_visibility()
+                                break
+                self._key_states[name] = bool(state)
+
+        if not self.game_hwnd:
+            self.game_hwnd = self._find_game_window()
 
         if menu:
             now_ms = int(time.time() * 1000)
@@ -3938,8 +4147,16 @@ class Overlay(QWidget):
     def paintEvent(self, event):
         try:
             self._paint_esp(event)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[ESP] paint error: {exc}", flush=True)
+
+    def _overlay_steam_features_active(self) -> bool:
+        """Steam ID memory reads on the overlay path — keep off the PLAYERS tab UI thread."""
+        return (
+            getattr(self.config, "show_steam_id", False)
+            or bool(getattr(self.esp, "_blocklist_cache_ids", set()))
+            or getattr(self.config, "autokick_enabled", False)
+        )
 
     def _paint_esp(self, event):
         painter = QPainter(self)
@@ -3980,19 +4197,13 @@ class Overlay(QWidget):
             painter.drawText(10, 20, "NO CAMERA")
             return
 
-        try:
-            self.esp.tick_trainer(self.config)
-        except Exception as exc:
-            print(f"[TRAINER:TICK] overlay error: {exc}", flush=True)
-
-        steam_active = (
-            getattr(self.config, "show_steam_id", False)
-            or bool(getattr(self.esp, "_blocklist_cache_ids", set()))
-            or getattr(self.config, "autokick_enabled", False)
-        )
+        steam_active = self._overlay_steam_features_active()
         self.esp.set_steam_features_active(steam_active)
         if steam_active:
-            self.esp.refresh_steam_ids_lazy()
+            try:
+                self.esp.refresh_steam_ids_lazy()
+            except Exception as exc:
+                print(f"[ESP] steam lazy error: {exc}", flush=True)
 
         if not self.config.enabled:
             _draw_label(painter, 10, 20, "ESP OFF", QColor(200, 200, 200))
@@ -4057,8 +4268,17 @@ class Overlay(QWidget):
 
                 # --- Off-screen indicator: triangle arrow pointing toward player ---
                 if not on_screen:
+                    bearing = None
+                    if cam:
+                        cam_loc = cam["loc"]
+                        dxw = pos[0] - cam_loc[0]
+                        dyw = pos[1] - cam_loc[1]
+                        if abs(dxw) + abs(dyw) > 1.0:
+                            _, _, cam_yaw_rad = [math.radians(v) for v in cam["rot"]]
+                            target = math.atan2(dyw, dxw)
+                            bearing = target - cam_yaw_rad
                     ex, ey, ux, uy = oof_indicator_pos(
-                        sx, sy, w, h, self.config.oof_arrow_radius)
+                        sx, sy, w, h, self.config.oof_arrow_radius, bearing)
                     # Perpendicular to arrow direction
                     px, py = -uy, ux
                     # Triangle: tip at edge, two base points behind
@@ -4105,7 +4325,8 @@ class Overlay(QWidget):
 
                 # Clamped coords for on-screen elements (dots, bars, labels)
                 # Snap lines use raw sx/sy so they reach screen edges
-                dsx, dsy = clamp_screen(sx, sy - self.config.box_y_offset, w, h)
+                y_down = int(getattr(self.config, "esp_screen_y_offset", 0) or 0)
+                dsx, dsy = clamp_screen(sx, sy - self.config.box_y_offset + y_down, w, h)
                 dsy += self.config.box_y_offset
 
                 # Dot ESP
@@ -4126,10 +4347,10 @@ class Overlay(QWidget):
                 # Skeleton ESP — isolated so bone-read failures never affect dot/box/labels
                 if self.config.skeleton_esp and actor and not is_local:
                     try:
-                        bones = self.esp.get_skeleton_positions_by_indices(
-                            actor, self.config.bone_indices)
+                        bones = self.esp.get_skeleton_positions(actor)
                         if not bones:
-                            bones = self.esp.get_skeleton_positions(actor)
+                            bones = self.esp.get_skeleton_positions_by_indices(
+                                actor, self.config.bone_indices)
                         if bones:
                             draw_skeleton(
                                 painter, bones, cam, w, h, self.config.skeleton_color)
@@ -4177,11 +4398,14 @@ class Overlay(QWidget):
                     dm = int(d / 100)
                     label_parts.append(f"{dm}m")
                 if label_parts:
-                    painter.setPen(QPen(QColor(*color)))
                     text = " | ".join(label_parts)
-                    label_x = int(dsx + self.config.dot_radius * scale + 4)
-                    label_y = int(dsy)
-                    painter.drawText(label_x, label_y, text)
+                    fm = painter.fontMetrics()
+                    tw = fm.horizontalAdvance(text)
+                    th = fm.height()
+                    label_x = int(dsx - tw / 2)
+                    # Sit just above the anchor (nameplate height), not stacked above the dot
+                    label_y = int(dsy - th - 4)
+                    _draw_label(painter, label_x, label_y, text, QColor(*color))
 
               except Exception:
                 pass  # never let one bad player crash the whole frame

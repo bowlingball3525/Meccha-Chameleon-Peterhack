@@ -139,6 +139,7 @@ class TrainerMixin:
         self._anti_kick_refresh_last = 0.0
         self._magnet_active = False
         self._magnet_key_was_down = False
+        self._magnet_hotkey_native = False
         self._rename_lock = threading.Lock()
         self._rename_pending = None
         self._rename_worker_alive = False
@@ -147,6 +148,53 @@ class TrainerMixin:
         self._rename_min_interval = 0.45
         self._trainer_auto_rename_queued_for = None
         self._trainer_rename_bridge_timeout = 10
+        self._trainer_loop_started = False
+        self._trainer_loop_stop = None
+        self._anti_kick_sync_thread = None
+        self._anti_kick_sync_pending = None
+
+    def start_trainer_loop(self, config_getter):
+        """Run trainer tick on a background thread so overlay paint never blocks."""
+        if getattr(self, "_trainer_loop_started", False):
+            return
+        self._trainer_loop_started = True
+        self._trainer_loop_stop = threading.Event()
+
+        def _loop():
+            while not self._trainer_loop_stop.is_set():
+                try:
+                    cfg = config_getter() if callable(config_getter) else config_getter
+                    if cfg:
+                        self.tick_trainer(cfg)
+                except Exception as exc:
+                    print(f"[TRAINER:LOOP] {exc}", flush=True)
+                self._trainer_loop_stop.wait(0.05)
+
+        threading.Thread(target=_loop, daemon=True, name="trainer-loop").start()
+
+    def stop_trainer_loop(self):
+        stop = getattr(self, "_trainer_loop_stop", None)
+        if stop:
+            stop.set()
+
+    def _schedule_anti_kick_bridge_sync(self, enabled, config):
+        """Bridge RPCs can take seconds — never run them on the Qt UI thread."""
+        key = (bool(enabled),)
+        thread = getattr(self, "_anti_kick_sync_thread", None)
+        if thread and thread.is_alive() and getattr(self, "_anti_kick_sync_pending", None) == key:
+            return
+        self._anti_kick_sync_pending = key
+
+        def _worker():
+            try:
+                self._sync_anti_kick_bridge(enabled, config)
+            finally:
+                self._anti_kick_sync_pending = None
+
+        self._anti_kick_sync_thread = threading.Thread(
+            target=_worker, daemon=True, name="anti-kick-sync",
+        )
+        self._anti_kick_sync_thread.start()
 
     def set_rename_notify(self, callback):
         """Optional callable(ok, msg) after a queued rename finishes (may run on worker thread)."""
@@ -417,20 +465,36 @@ class TrainerMixin:
             buf[0x120] = 1
         return self._process_event_call(pawn, fn, bytes(buf))
 
+    def _game_hwnd_for_magnet(self):
+        from meccha_chameleon_tools.core import MecchaESP
+        return MecchaESP._find_game_window_hwnd()
+
+    def toggle_magnet(self, config):
+        self._magnet_active = not self._magnet_active
+        self._trainer_log(
+            "MAGNET",
+            f"{'ON' if self._magnet_active else 'OFF'} (key {getattr(config, 'trainer_magnet_key', 'G')})",
+            config=config,
+            force=True,
+        )
+
     def _trainer_magnet_key_toggle(self, config):
         try:
-            from meccha_chameleon_tools.ui import vk_from_name
+            if getattr(self, "_magnet_hotkey_native", False):
+                return
+            from meccha_chameleon_tools.ui import is_game_foreground, vk_from_name
             import ctypes
+            game_hwnd = self._game_hwnd_for_magnet()
+            if not is_game_foreground(game_hwnd):
+                vk = vk_from_name(getattr(config, "trainer_magnet_key", "G"))
+                self._magnet_key_was_down = bool(
+                    ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                )
+                return
             vk = vk_from_name(getattr(config, "trainer_magnet_key", "G"))
             down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
             if down and not self._magnet_key_was_down:
-                self._magnet_active = not self._magnet_active
-                self._trainer_log(
-                    "MAGNET",
-                    f"{'ON' if self._magnet_active else 'OFF'} (key {config.trainer_magnet_key})",
-                    config=config,
-                    force=True,
-                )
+                self.toggle_magnet(config)
             self._magnet_key_was_down = down
         except Exception as exc:
             self._trainer_error("MAGNET", exc, config)
@@ -617,14 +681,14 @@ class TrainerMixin:
         if getattr(self, "_anti_kick_bridge_state", None) != want:
             if now - getattr(self, "_anti_kick_bridge_last_attempt", 0.0) >= 2.0:
                 self._anti_kick_bridge_last_attempt = now
-                self._sync_anti_kick_bridge(want, config)
+                self._schedule_anti_kick_bridge_sync(want, config)
         elif want and getattr(self, "_anti_kick_bridge_state", False) and pc:
             prev_pc = getattr(self, "_anti_kick_watch_pc", 0)
             prev_ps = getattr(self, "_anti_kick_watch_ps", 0)
             if (pc != prev_pc or ps != prev_ps) and now - getattr(self, "_anti_kick_refresh_last", 0.0) >= 3.0:
                 self._anti_kick_refresh_last = now
                 self._anti_kick_bridge_last_attempt = now
-                self._sync_anti_kick_bridge(True, config)
+                self._schedule_anti_kick_bridge_sync(True, config)
 
         prev = self._trainer_watch
         conn = 0
@@ -641,9 +705,18 @@ class TrainerMixin:
                 force=True,
             )
         if prev["conn"] and not conn and world:
+            blocks = int(getattr(self, "_anti_kick_log_seq", 0) or 0)
             self._trainer_log(
                 "ANTI-KICK",
-                "NetConnection lost while world active",
+                "NetConnection lost while world active — "
+                + (
+                    "no kick RPC was blocked this session; likely EOS/lobby disconnect or transport drop "
+                    "(anti-kick only blocks ProcessEvent RPCs, not platform session kicks)"
+                    if blocks <= 0
+                    else
+                    f"last blocked kick seq={blocks}; disconnect may have bypassed ClientWasKicked "
+                    "(EOS/session drop or stale hook — restart game to reload bridge)"
+                ),
                 config=config,
                 level="error",
                 force=True,
@@ -668,7 +741,7 @@ class TrainerMixin:
             resp = self._bridge_request(
                 "get_anti_kick_log",
                 {"since_seq": int(getattr(self, "_anti_kick_log_seq", 0))},
-                timeout=10,
+                timeout=3,
             )
         except Exception:
             return
@@ -680,7 +753,10 @@ class TrainerMixin:
             func = entry.get("function") or "?"
             owner = entry.get("owner") or "local"
             detail = (entry.get("detail") or "").strip()
-            msg = f"blocked kick RPC {owner}.{func}"
+            kicker = (entry.get("kicker") or entry.get("host") or "").strip()
+            if not kicker and hasattr(self, "get_session_host_name"):
+                kicker = (self.get_session_host_name() or "").strip()
+            msg = f"blocked kick from {kicker or 'unknown host'} — {owner}.{func}"
             if detail:
                 msg += f" — reason: {detail}"
             self._trainer_log("ANTI-KICK", msg, config=config, force=True)
@@ -698,12 +774,26 @@ class TrainerMixin:
                 force=True,
             )
             return False
-        if enabled and not self._ensure_bridge():
+        if enabled:
+            self._anti_kick_bridge_give_up = False
+        if enabled and getattr(self, "_bridge_recover_give_up", False):
+            if not self._ensure_bridge(force=True):
+                err = getattr(self, "_camo_last_error", None) or "bridge not responding"
+                if not getattr(self, "_anti_kick_bridge_give_up", False):
+                    self._trainer_log(
+                        "ANTI-KICK",
+                        f"bridge unavailable — {err}",
+                        config=config,
+                        level="debug",
+                    )
+                    self._anti_kick_bridge_give_up = True
+                return False
+        elif enabled and not self._ensure_bridge():
             err = getattr(self, "_camo_last_error", None) or "bridge not ready"
             self._trainer_log("ANTI-KICK", f"waiting for bridge — {err}", config=config, level="debug")
             return False
         try:
-            resp = self._bridge_request("set_anti_kick", {"enabled": bool(enabled)}, timeout=20)
+            resp = self._bridge_request("set_anti_kick", {"enabled": bool(enabled)}, timeout=8)
         except Exception as exc:
             self._trainer_log("ANTI-KICK", f"bridge request failed: {exc}", config=config, level="error", force=True)
             return False
@@ -726,7 +816,7 @@ class TrainerMixin:
                 msg += f" — watching: {preview}"
                 msg += " — log: C:\\peterhack\\logs\\anti_kick.log"
             self._trainer_log("ANTI-KICK", msg, config=config, force=True)
-            if enabled:
+            if enabled and not getattr(self, "_anti_kick_bridge_state", False):
                 self._anti_kick_log_seq = 0
         else:
             err = (resp or {}).get("message") or (resp or {}).get("stage") or "unknown error"
@@ -963,28 +1053,54 @@ class TrainerMixin:
 
     def _leave_match(self, config=None):
         """Leave lobby/match when a blocked player is present (non-host fallback)."""
+        ok, _msg = self.return_to_main_lobby(config=config, respect_cooldown=True)
+        return ok
+
+    def return_to_main_lobby(self, config=None, *, respect_cooldown=False):
+        """Leave the current lobby/match and return to the main menu."""
         now = time.monotonic()
-        if now < self._autokick_leave_until:
-            return False
+        if respect_cooldown and now < self._autokick_leave_until:
+            return False, "leave on cooldown"
         world = self._get_world()
         if not world:
-            return False
+            return False, "not in game — join a lobby or match first"
         pc = self._get_local_controller(world)
         if not pc:
-            return False
-        ufunc = self._find_ue_function("PlayerController", "ClientReturnToMainMenuWithTextReason")
-        if not ufunc:
-            self._trainer_log(
-                "AUTOKICK", "ClientReturnToMainMenuWithTextReason not found",
-                config=config, level="error", force=True,
-            )
-            return False
-        params = b"\x00" * 16
-        ok = self._process_event_call(pc, ufunc, params)
-        if ok:
-            self._autokick_leave_until = now + self.AUTOKICK_LEAVE_COOLDOWN_SEC
-            self._trainer_log("AUTOKICK", "leaving lobby (blocked player)", config=config, force=True)
-        return ok
+            return False, "no PlayerController"
+
+        # Anti-kick hooks block ClientReturnToMainMenu* on the local controller.
+        if getattr(self, "_anti_kick_bridge_state", False) and hasattr(self, "_bridge_request"):
+            try:
+                resp = self._bridge_request("set_anti_kick", {"enabled": False}, timeout=5)
+                if resp and resp.get("success"):
+                    self._anti_kick_bridge_state = False
+                    self._trainer_log(
+                        "LOBBY", "disabled anti-kick so return-to-menu can run",
+                        config=config, level="debug",
+                    )
+            except Exception:
+                pass
+
+        for func_name in (
+            "ClientReturnToMainMenuWithTextReason",
+            "ClientReturnToMainMenu",
+        ):
+            ufunc = self._find_ue_function("PlayerController", func_name)
+            if not ufunc:
+                continue
+            params = b"\x00" * 0x10
+            if self._process_event_call(pc, ufunc, params):
+                if respect_cooldown:
+                    self._autokick_leave_until = now + self.AUTOKICK_LEAVE_COOLDOWN_SEC
+                self._trainer_log(
+                    "LOBBY",
+                    f"return to main menu via {func_name}",
+                    config=config,
+                    force=True,
+                )
+                return True, "Returning to main menu..."
+
+        return False, "ClientReturnToMainMenu not found or call failed"
 
     def _trainer_autokick(self, config):
         now = time.monotonic()
@@ -999,6 +1115,10 @@ class TrainerMixin:
             if pdata.get("is_local"):
                 continue
             sid = (pdata.get("steam_id") or "").strip()
+            if not sid:
+                ps = pdata.get("player_state", 0)
+                if ps:
+                    sid = self.get_player_steam_id(ps, force=True)
             if not sid or sid not in blocked:
                 continue
             last = self._autokick_last_attempt.get(sid, 0.0)
@@ -1142,6 +1262,17 @@ class TrainerMixin:
         """Apply enabled trainer features (throttled — not every overlay frame)."""
         camo_noclip_hold = getattr(self, "_camo_noclip_hold", False)
 
+        if config:
+            try:
+                if self._game_process_alive():
+                    self._trainer_magnet_key_toggle(config)
+                    if self._magnet_active:
+                        pawn = self._find_local_pawn()
+                        if pawn:
+                            self._trainer_magnet(pawn, config)
+            except Exception as exc:
+                self._trainer_error("MAGNET", exc, config)
+
         if not config or not self._trainer_any_active(config):
             if self._trainer_anticlip_saved is not None and not camo_noclip_hold:
                 self._trainer_anti_clipping(0, config, False)
@@ -1149,11 +1280,6 @@ class TrainerMixin:
                 pawn = self._find_local_pawn()
                 if pawn and self._trainer_anticlip_saved is None:
                     self._trainer_anti_clipping(pawn, config, True)
-            if config and self._game_process_alive():
-                self._trainer_magnet_key_toggle(config)
-                pawn = self._find_local_pawn()
-                if self._magnet_active and pawn:
-                    self._trainer_magnet(pawn, config)
             return
 
         now = time.monotonic()
@@ -1169,8 +1295,6 @@ class TrainerMixin:
         except Exception as exc:
             self._trainer_error("TICK", exc, config)
             return
-
-        self._trainer_magnet_key_toggle(config)
 
         pawn = self._find_local_pawn()
         if camo_noclip_hold:
@@ -1203,8 +1327,6 @@ class TrainerMixin:
                 self._trainer_anti_detection(pawn, config)
             if config.trainer_infinite_bullets:
                 self._trainer_infinite_bullets(pawn, config)
-            if self._magnet_active:
-                self._trainer_magnet(pawn, config)
             if config.trainer_set_decoy_num:
                 self._trainer_set_decoy_num(pawn, config)
             elif self._trainer_last_decoy_num is not None:

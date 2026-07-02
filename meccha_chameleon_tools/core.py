@@ -52,11 +52,14 @@ def world_to_screen(world_pos, camera, screen_w, screen_h):
         view_y = -view_y
         view_z = -view_z
 
-    aspect = screen_w / screen_h if screen_h > 0 else 16.0 / 9.0
+    aspect = camera.get("aspect")
+    if aspect is None or not (0.1 < aspect < 5.0):
+        aspect = screen_w / screen_h if screen_h > 0 else 16.0 / 9.0
     safe_fov = max(5.0, min(fov, 170.0))
     tan_hfov = math.tan(math.radians(safe_fov) / 2.0) or 1e-6
+    tan_vfov = tan_hfov / max(0.01, aspect)
     ndc_x = view_y / (view_x * tan_hfov)
-    ndc_y = view_z / (view_x * tan_hfov / aspect)
+    ndc_y = view_z / (view_x * tan_vfov)
     if not math.isfinite(ndc_x):
         ndc_x = 0.0
     if not math.isfinite(ndc_y):
@@ -754,6 +757,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._bridge_preload_started = False
         self._bridge_preload_ok = None
         self._bridge_preload_thread = None
+        self._bridge_recover_give_up = False
+        self._bridge_session_pid = 0
         self._camo_abort = False
         self._init_trainer_state()
 
@@ -857,6 +862,15 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return 0
         return rp(self.pm, local_player + self.offsets["UPlayer::PlayerController"])
 
+    @staticmethod
+    def _rot_delta_deg(a, b):
+        """Smallest angular difference between two rotator triples (pitch,yaw,roll)."""
+        out = []
+        for av, bv in zip(a, b):
+            d = (float(av) - float(bv) + 180.0) % 360.0 - 180.0
+            out.append(abs(d))
+        return out
+
     def get_camera(self):
         world = self._get_world()
         if not world:
@@ -873,47 +887,116 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         rot_off = self.offsets["FMinimalViewInfo::Rotation"]
         fov_off = self.offsets["FMinimalViewInfo::FOV"]
         cc_off = self.offsets["APlayerCameraManager::CameraCachePrivate"]
+        cr_off = self.offsets.get("AController::ControlRotation", 0x320)
+
+        aspect_off = self.offsets.get("FMinimalViewInfo::AspectRatio", 0x5C)
 
         def _read_pov(pov_addr):
             loc = rvec3(self.pm, pov_addr + loc_off)
             rot = rvec3(self.pm, pov_addr + rot_off)
             fov = rfloat(self.pm, pov_addr + fov_off)
+            aspect = rfloat(self.pm, pov_addr + aspect_off)
             if not all(math.isfinite(v) for v in loc + rot):
                 return None
             if not (5.0 < fov < 170.0):
                 fov = 90.0
+            if not (0.1 < aspect < 5.0):
+                aspect = None
             if not self._is_valid_world_loc(loc):
                 return None
-            return {"loc": loc, "rot": rot, "fov": fov}
+            return {"loc": loc, "rot": rot, "fov": fov, "aspect": aspect}
 
-        # Try several POV sources — ViewTarget first (best for spectator / free-cam).
+        pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"])
+        ctrl_rot = rvec3(self.pm, pc + cr_off)
+        if not all(math.isfinite(v) for v in ctrl_rot):
+            ctrl_rot = None
+        local_is_hunter = self._read_is_hunter(pawn) if pawn else None
+
+        # Prefer the rendered camera cache — ViewTarget POV is often stale in hunter FP.
         sources = (
-            cam_mgr + 0x0340 + pov_off,              # ViewTarget.POV
-            cam_mgr + cc_off + pov_off,              # CameraCachePrivate
+            cam_mgr + cc_off + pov_off,              # CameraCachePrivate (last rendered frame)
             cam_mgr + 0x1E00 + pov_off,              # LastFrameCameraCachePrivate
+            cam_mgr + 0x0340 + pov_off,              # ViewTarget.POV (spectator / blends)
         )
-        for pov_addr in sources:
+        cam = None
+        cam_source = None
+        for idx, pov_addr in enumerate(sources):
             cam = _read_pov(pov_addr)
             if cam:
-                self._last_camera = cam
-                return cam
+                cam_source = idx
+                break
+
+        if cam and ctrl_rot:
+            pitch_d, yaw_d, _roll_d = self._rot_delta_deg(cam["rot"], ctrl_rot)
+            pov_stale = yaw_d > 15.0 or pitch_d > 15.0
+            hunter_fp = (
+                local_is_hunter is True
+                and self._is_hunter_first_person_view(pawn)
+            )
+            # If the primary cache POV rotation is stale, try last-frame cache before
+            # mixing location with ControlRotation.
+            if pov_stale and cam_source == 0:
+                alt = _read_pov(sources[1])
+                if alt:
+                    ap, ay, _ar = self._rot_delta_deg(alt["rot"], ctrl_rot)
+                    if ay <= 15.0 and ap <= 15.0:
+                        cam = alt
+                        pov_stale = False
+            # Only override rotation when the rendered POV is clearly stale.
+            # Mixing CameraCache location with ControlRotation when POV is current
+            # causes horizontal parallax (labels drift off the player model).
+            use_ctrl = pov_stale and (
+                hunter_fp or local_is_hunter is not True
+            )
+            if use_ctrl:
+                cam = {
+                    "loc": cam["loc"],
+                    "rot": ctrl_rot,
+                    "fov": cam["fov"],
+                    "aspect": cam.get("aspect"),
+                }
+
+        if cam:
+            self._last_camera = cam
+            return cam
 
         last_cam = getattr(self, "_last_camera", None)
         if last_cam:
             return last_cam
 
         # Last resort: controller rotation + acknowledged pawn/root position.
-        cr_off = self.offsets.get("AController::ControlRotation", 0x320)
-        rot = rvec3(self.pm, pc + cr_off)
-        if not all(math.isfinite(v) for v in rot):
-            return None
-        pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"])
+        if not ctrl_rot:
+            return last_cam if last_cam else None
         loc = self.get_actor_root_pos(pawn) if pawn else None
         if loc and self._is_valid_world_loc(loc):
-            cam = {"loc": loc, "rot": rot, "fov": 90.0}
+            cam = {"loc": loc, "rot": ctrl_rot, "fov": 90.0}
             self._last_camera = cam
             return cam
         return last_cam if last_cam else None
+
+    def get_esp_world_pos(self, actor):
+        """World point for ESP — neck height (dot/name anchor)."""
+        if not actor:
+            return None
+        neck = None
+        try:
+            neck_map = self.get_skeleton_positions_by_indices(
+                actor, {"neck_01": self._CHAMELEON_BONE_INDICES["neck_01"]},
+            )
+            if neck_map:
+                neck = neck_map.get("neck_01")
+            if not neck:
+                bones = self.get_skeleton_positions(actor)
+                if bones:
+                    neck = bones.get("neck_01") or bones.get("head")
+        except Exception:
+            pass
+        if neck and self._is_valid_world_loc(neck):
+            return neck
+        root = self.get_actor_root_pos(actor)
+        if not root:
+            return None
+        return (root[0], root[1], root[2] + 85.0)
 
     def get_viewport_size(self):
         """Return game client width/height in pixels."""
@@ -1127,15 +1210,16 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     # Bone / skeletal mesh reading
     # -----------------------------------------------------------------------
     BONE_CONNECTIONS = [
-        ("root", "pelvis"),
         ("pelvis", "spine_01"),
         ("spine_01", "spine_02"),
         ("spine_02", "spine_03"),
         ("spine_03", "neck_01"),
         ("neck_01", "head"),
+        ("spine_03", "clavicle_l"),
         ("clavicle_l", "upperarm_l"),
         ("upperarm_l", "lowerarm_l"),
         ("lowerarm_l", "hand_l"),
+        ("spine_03", "clavicle_r"),
         ("clavicle_r", "upperarm_r"),
         ("upperarm_r", "lowerarm_r"),
         ("lowerarm_r", "hand_r"),
@@ -1148,7 +1232,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     ]
 
     COMMON_BONE_NAMES = [
-        "root", "pelvis",
+        "pelvis",
         "spine_01", "spine_02", "spine_03",
         "neck_01", "head",
         "clavicle_l", "upperarm_l", "lowerarm_l", "hand_l",
@@ -1157,8 +1241,56 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         "thigh_r", "calf_r", "foot_r",
     ]
 
-    # Fallback: standard UE5 Manny/Quinn mannequin bone indices.
-    # Used when name-based resolution fails (game uses same base skeleton).
+    # Chameleon / BP_FirstPersonCharacter_Main skeleton (chameleonEsp skeleton.hpp).
+    _CHAMELEON_BONE_INDICES = {
+        "pelvis": 1,
+        "spine_01": 2,
+        "spine_02": 3,
+        "spine_03": 4,
+        "neck_01": 5,
+        "head": 6,
+        "clavicle_l": 8,
+        "upperarm_l": 9,
+        "lowerarm_l": 10,
+        "hand_l": 11,
+        "clavicle_r": 13,
+        "upperarm_r": 14,
+        "lowerarm_r": 15,
+        "hand_r": 16,
+        "thigh_l": 18,
+        "calf_l": 19,
+        "foot_l": 21,
+        "thigh_r": 23,
+        "calf_r": 24,
+        "foot_r": 26,
+    }
+
+    _GAME_BONE_ALIASES = {
+        "loot": "pelvis",
+        "hips": "pelvis",
+        "spine1": "spine_01",
+        "spine2": "spine_02",
+        "spine3": "spine_03",
+        "neck": "neck_01",
+        "shoulder_l": "clavicle_l",
+        "shoulder_r": "clavicle_r",
+        "upper_arm_l": "upperarm_l",
+        "upper_arm_r": "upperarm_r",
+        "lower_arm_l": "lowerarm_l",
+        "lower_arm_r": "lowerarm_r",
+        "hand_l": "hand_l",
+        "hand_r": "hand_r",
+        "hip_l": "thigh_l",
+        "hip_r": "thigh_r",
+        "upper_leg_l": "calf_l",
+        "upper_leg_r": "calf_r",
+        "lower_leg_l": "foot_l",
+        "lower_leg_r": "foot_r",
+        "foot_l": "foot_l",
+        "foot_r": "foot_r",
+    }
+
+    # Legacy UE mannequin fallback (other assets only).
     _UE5_FALLBACK_BONES = {
         "pelvis":     1,
         "spine_01":   2,
@@ -1270,6 +1402,24 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     return pos, quat
         return best if best else (None, None)
 
+    def _normalize_bone_name_map(self, name_map):
+        """Map game-specific bone names onto COMMON_BONE_NAMES keys."""
+        if not name_map:
+            return {}
+        out = {}
+        for raw, idx in name_map.items():
+            key = (raw or "").lower()
+            if not key:
+                continue
+            canon = self._GAME_BONE_ALIASES.get(key, key)
+            if canon in self.COMMON_BONE_NAMES or canon.replace("_", "") in {
+                n.replace("_", "") for n in self.COMMON_BONE_NAMES
+            }:
+                out[canon] = idx
+            elif key in {n.lower() for n in self.COMMON_BONE_NAMES}:
+                out[key] = idx
+        return out
+
     def _resolve_bone_indices(self, mesh_comp):
         """Map bone names -> indices by scanning the FReferenceSkeleton in the asset.
 
@@ -1304,8 +1454,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                             if bone_name:
                                 name_to_idx[bone_name.lower()] = i
                         if len(name_to_idx) >= 5:
-                            self._bone_cache[mesh_asset] = name_to_idx
-                            return name_to_idx
+                            normalized = self._normalize_bone_name_map(name_to_idx)
+                            self._bone_cache[mesh_asset] = normalized
+                            return normalized
             except Exception:
                 continue
         self._bone_cache[mesh_asset] = {}
@@ -1359,20 +1510,6 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 bones.append(None)
         return bones
 
-    def _get_mesh_world_transform(self, actor, mesh_comp):
-        """Return (world_pos, world_quat) for the skeletal mesh component."""
-        root = rp(self.pm, actor + self.offsets["AActor::RootComponent"])
-        ref_pos = rvec3(self.pm, root + 0x140) if root else None
-        pos, quat = self._get_component_to_world(mesh_comp, ref_pos)
-        if pos is not None:
-            return pos, quat
-        if ref_pos is not None:
-            root_pos2, root_quat = self._get_component_to_world(root)
-            if root_quat is not None:
-                return ref_pos, root_quat
-            return ref_pos, self._euler_to_quat(*rvec3(self.pm, root + 0x158))
-        return None, None
-
     def _bones_array_info(self, mesh_comp):
         """Return (data_ptr, count) for CachedComponentSpaceTransforms."""
         if not mesh_comp:
@@ -1383,7 +1520,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         return data, count
 
     def _bone_local_position(self, bone_data, count, idx):
-        """Read translation from one FTransform3d in the bone array."""
+        """Read translation from one FTransform in the bone array."""
         if idx < 0 or idx >= count:
             return None
         try:
@@ -1403,6 +1540,37 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             mesh_world_pos[2] + rotated[2],
         )
 
+    def _get_mesh_world_transform(self, actor, mesh_comp):
+        """Return (world_pos, world_quat) for the skeletal mesh component."""
+        ref_pos = self.get_actor_root_pos(actor)
+        pos, quat = self._get_component_to_world(mesh_comp, ref_pos)
+        if pos is not None and quat is not None:
+            return pos, quat
+        root = rp(self.pm, actor + self.offsets["AActor::RootComponent"])
+        if root:
+            root_pos, root_quat = self._get_component_to_world(root, ref_pos)
+            if root_quat is not None:
+                anchor = ref_pos or root_pos
+                if anchor and self._is_valid_world_loc(anchor):
+                    return anchor, root_quat
+            rot = self.get_actor_root_rotation(actor)
+            if ref_pos and rot:
+                return ref_pos, self._euler_to_quat(*rot)
+        return None, None
+
+    def _bones_indices_to_world(self, index_map, bone_data, count, mesh_world_pos, mesh_world_quat):
+        result = {}
+        for name, idx in index_map.items():
+            if idx is None or idx < 0 or idx >= count:
+                continue
+            local_pos = self._bone_local_position(bone_data, count, idx)
+            if local_pos is None:
+                continue
+            world = self._bone_to_world(mesh_world_pos, mesh_world_quat, local_pos)
+            if self._is_valid_world_loc(world):
+                result[name] = world
+        return result if result else None
+
     def get_skeleton_positions(self, actor):
         """Return dict of bone_name -> world_position for the actor."""
         mesh_comp = self.get_skeletal_mesh(actor)
@@ -1412,21 +1580,17 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if mesh_world_pos is None:
             return None
         bone_data, count = self._bones_array_info(mesh_comp)
-        if not bone_data:
+        if not bone_data or count < 7:
             return None
         name_map = self._resolve_bone_indices(mesh_comp)
-        if not name_map:
-            name_map = self._UE5_FALLBACK_BONES
-        result = {}
+        index_map = dict(self._CHAMELEON_BONE_INDICES)
         for bname in self.COMMON_BONE_NAMES:
-            idx = name_map.get(bname.lower())
-            if idx is None:
-                continue
-            local_pos = self._bone_local_position(bone_data, count, idx)
-            if local_pos is None:
-                continue
-            result[bname] = self._bone_to_world(mesh_world_pos, mesh_world_quat, local_pos)
-        return result if result else None
+            idx = name_map.get(bname)
+            if idx is not None:
+                index_map[bname] = idx
+        return self._bones_indices_to_world(
+            index_map, bone_data, count, mesh_world_pos, mesh_world_quat,
+        )
 
     def get_skeleton_positions_by_indices(self, actor, bone_indices):
         """Get bone positions by direct index map {name: index}. Applies world transform."""
@@ -1439,13 +1603,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         bone_data, count = self._bones_array_info(mesh_comp)
         if not bone_data:
             return None
-        result = {}
-        for name, idx in bone_indices.items():
-            local_pos = self._bone_local_position(bone_data, count, idx)
-            if local_pos is None:
-                continue
-            result[name] = self._bone_to_world(mesh_world_pos, mesh_world_quat, local_pos)
-        return result if result else None
+        return self._bones_indices_to_world(
+            bone_indices, bone_data, count, mesh_world_pos, mesh_world_quat,
+        )
 
     # -----------------------------------------------------------------------
     # Player iteration (enhanced)
@@ -1503,6 +1663,15 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return bool(raw[0])
         except Exception:
             return None
+
+    def _is_hunter_first_person_view(self, pawn: int) -> bool:
+        """True when hunter is in default FP (not right-click third-person aim)."""
+        if not pawn:
+            return False
+        try:
+            return bool(self.pm.read_bytes(pawn + 0x0BE0, 1)[0])
+        except Exception:
+            return True
 
     @staticmethod
     def _is_player_enemy(local_is_hunter, target_is_hunter):
@@ -1685,12 +1854,133 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._session_players_cache_ts = now
         return list(players)
 
+    def get_session_host_player_state(self):
+        """Return PlayerState* for the session host, or 0 if unknown."""
+        import time as _time
+
+        now = _time.monotonic()
+        cached = getattr(self, "_session_host_ps_cache", 0)
+        cached_ts = getattr(self, "_session_host_ps_cache_ts", 0.0)
+        if cached and (now - cached_ts) < 2.0:
+            return cached
+
+        world = self._get_world()
+        if not world:
+            self._session_host_ps_cache = 0
+            self._session_host_ps_cache_ts = now
+            return 0
+
+        gamestate = rp(self.pm, world + self.offsets["UWorld::GameState"])
+        if not gamestate:
+            self._session_host_ps_cache = 0
+            self._session_host_ps_cache_ts = now
+            return 0
+
+        for cls_name, prop in (
+            ("GameState", "HostPlayerState"),
+            ("GameStateBase", "HostPlayerState"),
+            ("GameState", "SessionOwnerPlayerState"),
+            ("GameState", "HostingPlayerState"),
+            ("GameState", "OwnerPlayerState"),
+        ):
+            off = self.resolver.resolve(cls_name, prop)
+            if off:
+                ps = rp(self.pm, gamestate + off)
+                if ps:
+                    self._session_host_ps_cache = ps
+                    self._session_host_ps_cache_ts = now
+                    return ps
+
+        pa_data, pa_count, _ = read_array(
+            self.pm, gamestate + self.offsets["AGameStateBase::PlayerArray"]
+        )
+        if not pa_data or pa_count <= 0:
+            self._session_host_ps_cache = 0
+            self._session_host_ps_cache_ts = now
+            return 0
+
+        host_prop_names = (
+            "bIsSessionHost",
+            "bIsHost",
+            "bIsHosting",
+            "IsSessionHost",
+            "bIsSessionOwner",
+            "bIsLobbyHost",
+            "bIsHostPlayer",
+            "bIsListenHost",
+        )
+        host_off = getattr(self, "_session_host_flag_off", None)
+        if host_off is None:
+            host_off = 0
+            for i in range(min(pa_count, self.MAX_ESP_PLAYERS)):
+                ps = rp(self.pm, pa_data + i * 8)
+                if not ps:
+                    continue
+                _, off = self.resolver.search_properties(
+                    self.objects.class_ptr(ps), host_prop_names
+                )
+                if off:
+                    host_off = off
+                    break
+            self._session_host_flag_off = host_off
+
+        if host_off:
+            for i in range(min(pa_count, self.MAX_ESP_PLAYERS)):
+                ps = rp(self.pm, pa_data + i * 8)
+                if not ps:
+                    continue
+                try:
+                    if self.pm.read_bytes(ps + host_off, 1)[0] != 0:
+                        self._session_host_ps_cache = ps
+                        self._session_host_ps_cache_ts = now
+                        return ps
+                except Exception:
+                    pass
+
+        pc = self._get_local_controller(world)
+        if pc:
+            for cls_name, prop in (
+                ("PlayerController", "bIsHosting"),
+                ("PlayerController", "bIsHost"),
+                ("PlayerController", "bIsSessionHost"),
+            ):
+                off = self.resolver.resolve(cls_name, prop)
+                if not off:
+                    continue
+                try:
+                    if self.pm.read_bytes(pc + off, 1)[0] != 0:
+                        local_ps = rp(self.pm, pc + self.offsets["AController::PlayerState"])
+                        if local_ps:
+                            self._session_host_ps_cache = local_ps
+                            self._session_host_ps_cache_ts = now
+                            return local_ps
+                except Exception:
+                    pass
+
+        self._session_host_ps_cache = 0
+        self._session_host_ps_cache_ts = now
+        return 0
+
+    def get_session_host_name(self):
+        """Best-effort in-game username for the session host."""
+        ps = self.get_session_host_player_state()
+        if not ps:
+            return ""
+        name = self.get_player_name(ps) or self.get_player_steam_name(ps)
+        return (name or "").strip()
+
     @classmethod
     def _extract_steam64(cls, text):
         if not text:
             return ""
         match = cls._STEAM64_RE.search(str(text))
-        return match.group(0) if match else ""
+        if match:
+            return match.group(0)
+        lowered = str(text).lower()
+        for token in re.split(r"[^0-9]+", lowered):
+            if cls._STEAM64_RE.fullmatch(token):
+                return token
+        return ""
 
     def _read_unique_net_id_bytes(self, repl_base: int) -> bytes:
         """Read FUniqueNetIdRepl.ReplicationBytes at repl_base."""
@@ -1722,49 +2012,108 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return b""
 
     def _scan_steam64_near_player_state(self, ps: int) -> str:
-        """Scan UniqueID + SavedNetworkAddress region for an embedded Steam64."""
+        """Scan UniqueID through PlayerNamePrivate for an embedded Steam64."""
         if not ps:
             return ""
+        span = max(0x90, (self.OFF_PLAYER_NAME_PRIVATE + 0x10) - self.OFF_PLAYER_UNIQUE_ID)
         try:
-            blob = self.pm.read_bytes(ps + self.OFF_PLAYER_UNIQUE_ID, 0x60)
+            blob = self.pm.read_bytes(ps + self.OFF_PLAYER_UNIQUE_ID, span)
         except Exception:
             return ""
         return self._parse_steam64_from_bytes(blob)
 
-    def _ue_steam_id_for_player_state(self, ps: int) -> str:
-        """Last resort: ask the game to decode FUniqueNetIdRepl (Redpoint EOS)."""
-        if not ps:
-            return ""
-        caller = self._find_class_default_object("OnlineHelpers")
-        if not caller:
-            return ""
-        fn_get = self._find_ue_function("OnlineHelpers", "GetPlayerStateUniqueNetId")
-        fn_conv = self._find_ue_function("OnlineHelpers", "Conv_FUniqueNetIdReplToString")
-        if not fn_get or not fn_conv:
-            return ""
-
-        get_params = struct.pack("<Q", int(ps)) + (b"\x00" * 0x30)
-        get_out = self._process_event_call_out(caller, fn_get, get_params)
-        if not get_out:
-            return ""
-        net_id = get_out[8:8 + 0x30]
-        if not any(net_id):
-            return ""
-
-        conv_params = net_id + (b"\x00" * 0x10)
-        conv_out = self._process_event_call_out(caller, fn_conv, conv_params)
-        if not conv_out:
+    def _read_fstring_param(self, param_bytes: bytes, offset: int = 0) -> str:
+        """Decode a UE FString embedded in a ProcessEvent params struct."""
+        if not param_bytes or len(param_bytes) < offset + 0x10:
             return ""
         try:
-            data_ptr = struct.unpack("<Q", conv_out[0x30:0x38])[0]
-            arr_num = struct.unpack("<I", conv_out[0x38:0x3C])[0]
+            data_ptr = struct.unpack("<Q", param_bytes[offset:offset + 8])[0]
+            arr_num = struct.unpack("<I", param_bytes[offset + 8:offset + 12])[0]
             if not data_ptr or arr_num <= 0 or arr_num > 256:
                 return ""
             raw = self.pm.read_bytes(data_ptr, arr_num * 2)
-            text = raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
+            return raw.decode("utf-16-le", errors="ignore").rstrip("\x00").strip()
         except Exception:
             return ""
+
+    def _conv_net_id_repl_to_string(self, net_id_bytes: bytes) -> str:
+        """Call OnlineHelpers.Conv_FUniqueNetIdReplToString and extract Steam64."""
+        if not net_id_bytes or not any(net_id_bytes[:0x30]):
+            return ""
+        caller = self._find_class_default_object("OnlineHelpers")
+        fn_conv = self._find_ue_function("OnlineHelpers", "Conv_FUniqueNetIdReplToString")
+        if not caller or not fn_conv:
+            return ""
+        conv_params = net_id_bytes[:0x30].ljust(0x30, b"\x00") + (b"\x00" * 0x10)
+        conv_out = self._process_event_call_out(caller, fn_conv, conv_params)
+        if not conv_out:
+            return ""
+        text = self._read_fstring_param(conv_out, 0x30)
         return self._extract_steam64(text)
+
+    def _bridge_resolve_steam_id(self, ps: int, timeout: float = 12) -> str:
+        """Resolve Steam64 via bridge ProcessEvent on the game thread (preferred)."""
+        if not ps or not hasattr(self, "_bridge_request"):
+            return ""
+        ensure = getattr(self, "_ensure_bridge", None)
+        if callable(ensure):
+            try:
+                if not self._resolve_bridge_port(fast=True):
+                    return ""
+            except Exception:
+                return ""
+        try:
+            resp = self._bridge_request(
+                "get_player_steam_id",
+                {"player_state": hex(int(ps))},
+                timeout=timeout,
+            )
+        except Exception:
+            return ""
+        if not resp or not resp.get("success"):
+            return ""
+        meta = resp.get("metadata") or {}
+        sid = (meta.get("steam_id") or resp.get("message") or "").strip()
+        return self._extract_steam64(sid)
+
+    def _resolve_steam_id_via_process_event(self, ps: int) -> str:
+        """Decode FUniqueNetIdRepl via bridge or in-process ProcessEvent fallbacks."""
+        if not ps:
+            return ""
+
+        sid = self._bridge_resolve_steam_id(ps)
+        if sid:
+            return sid
+
+        caller = self._find_class_default_object("OnlineHelpers")
+        fn_get_ps = self._find_ue_function("OnlineHelpers", "GetPlayerStateUniqueNetId")
+        if caller and fn_get_ps:
+            get_params = struct.pack("<Q", int(ps)) + (b"\x00" * 0x30)
+            get_out = self._process_event_call_out(caller, fn_get_ps, get_params)
+            if get_out and any(get_out[8:8 + 0x30]):
+                sid = self._conv_net_id_repl_to_string(get_out[8:8 + 0x30])
+                if sid:
+                    return sid
+
+        fn_bp = self._find_ue_function("PlayerState", "BP_GetUniqueId")
+        if fn_bp:
+            bp_out = self._process_event_call_out(ps, fn_bp, b"\x00" * 0x30)
+            if bp_out and any(bp_out[:0x30]):
+                sid = self._conv_net_id_repl_to_string(bp_out[:0x30])
+                if sid:
+                    return sid
+
+        pc = self._get_player_controller(ps)
+        fn_get_pc = self._find_ue_function("OnlineHelpers", "GetControllerUniqueNetId")
+        if caller and fn_get_pc and pc:
+            pc_params = struct.pack("<Q", int(pc)) + (b"\x00" * 0x30)
+            pc_out = self._process_event_call_out(caller, fn_get_pc, pc_params)
+            if pc_out and any(pc_out[8:8 + 0x30]):
+                sid = self._conv_net_id_repl_to_string(pc_out[8:8 + 0x30])
+                if sid:
+                    return sid
+
+        return ""
 
     def _parse_steam64_from_bytes(self, raw: bytes) -> str:
         if not raw:
@@ -1818,7 +2167,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 return found
 
         if use_ue_fallback:
-            found = self._ue_steam_id_for_player_state(ps)
+            found = self._resolve_steam_id_via_process_event(ps)
             if found:
                 return found
 
@@ -2102,7 +2451,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             ps = p.get("player_state", 0)
             if not self._pawn_alive_for_esp(actor, ps):
                 continue
-            pos = self.get_actor_root_pos(actor)
+            pos = self.get_esp_world_pos(actor)
             entry = dict(p)
             if pos:
                 entry["pos"] = pos
@@ -2168,7 +2517,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
         total = 0
         if include_local and local_pawn:
-            pos = self.get_actor_root_pos(local_pawn)
+            pos = self.get_esp_world_pos(local_pawn)
             if pos:
                 total += 1
                 yield {
@@ -2213,7 +2562,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     target_is_hunter = self._read_is_hunter(pawn)
                     if enemy_only and not self._is_player_enemy(local_is_hunter, target_is_hunter):
                         continue
-                    pos = self.get_actor_root_pos(pawn)
+                    pos = self.get_esp_world_pos(pawn)
                     if not pos:
                         continue
                     seen_pawns.add(pawn)
@@ -2276,7 +2625,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     target_is_hunter = self._read_is_hunter(actor)
                     if enemy_only and not self._is_player_enemy(local_is_hunter, target_is_hunter):
                         continue
-                    pos = self.get_actor_root_pos(actor)
+                    pos = self.get_esp_world_pos(actor)
                     if not pos:
                         continue
                     seen_pawns.add(actor)

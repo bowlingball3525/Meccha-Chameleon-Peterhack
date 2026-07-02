@@ -69,6 +69,7 @@ namespace
     thread_local bool g_inside_process_event_hook = false;
 
     constexpr std::uintptr_t OffPlayerControllerPlayerState = 0x2B0;
+    constexpr std::uintptr_t OffPlayerControllerIsLocal = 0x6C4;
     constexpr std::uintptr_t OffPawnPlayerState = 0x2C8;
     constexpr std::size_t ProcessEventInlinePatchSize = 14;
     constexpr std::size_t AntiKickMaxBlockedFunctions = 32;
@@ -99,6 +100,7 @@ namespace
     bool g_anti_kick_vtable_hook_installed{false};
     std::atomic<bool> g_anti_kick_enabled{false};
     std::atomic<std::uintptr_t> g_anti_kick_local_controller{0};
+    std::atomic<std::uintptr_t> g_anti_kick_local_player{0};
     std::atomic<std::uintptr_t> g_anti_kick_local_player_state{0};
     std::atomic<std::uintptr_t> g_anti_kick_local_net_connection{0};
     std::atomic<std::uintptr_t> g_anti_kick_blocked_functions[AntiKickMaxBlockedFunctions]{};
@@ -118,8 +120,23 @@ namespace
         std::uint64_t timestamp_ms{0};
         char function_name[64]{};
         char object_owner[24]{};
+        char kicker[64]{};
         char detail[128]{};
     };
+
+    struct AntiKickSessionCache
+    {
+        std::uintptr_t world{0};
+        int gamestate_off{0};
+        int playerarray_off{0};
+        int host_ps_direct_off{0};
+        int host_flag_off{0};
+    };
+
+    AntiKickSessionCache g_anti_kick_session{};
+    std::mutex g_anti_kick_host_name_mutex;
+    char g_anti_kick_host_name[64]{};
+    std::uint64_t g_anti_kick_host_name_ms{0};
 
     std::mutex g_anti_kick_meta_mutex;
     AntiKickFuncMeta g_anti_kick_func_meta[AntiKickMaxBlockedFunctions]{};
@@ -171,6 +188,7 @@ namespace
     auto handle_game_set_anti_kick(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
     auto handle_get_anti_kick_log(const std::string& payload) -> std::string;
     auto handle_game_set_player_name(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_get_player_steam_id(const std::string& payload, Reflection& ref) -> std::string;
     auto resolve_process_event_address(std::uintptr_t sample_object) -> std::uintptr_t;
     auto install_process_event_inline_hook(std::uintptr_t sample_object, std::string& failure) -> bool;
     auto uninstall_process_event_inline_hook() -> void;
@@ -181,6 +199,9 @@ namespace
     auto anti_kick_is_local_object(std::uintptr_t object) -> bool;
     auto uninstall_anti_kick_vtable_hooks() -> void;
     auto anti_kick_should_block(void* object, void* function, void* params) -> bool;
+    auto read_fstring_param(const std::uint8_t* base) -> std::string;
+    auto trim_player_name(std::string name) -> std::string;
+    auto cached_session_host_name(Reflection& ref) -> const char*;
     auto json_extract_string(const std::string& json, const std::string& key) -> std::string;
     auto json_extract_double(const std::string& json, const std::string& key) -> double;
     auto json_extract_bool(const std::string& json, const std::string& key) -> bool;
@@ -870,8 +891,29 @@ namespace
         }
     };
 
+    auto is_kick_protect_excluded_name(const std::string& lower_name) -> bool
+    {
+        static const char* excluded[] = {
+            "clientcapbandwidth",
+            "capbandwidth",
+            "bandwidth",
+        };
+        for (const char* name : excluded)
+        {
+            if (lower_name == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     auto is_kick_like_function_name(const std::string& lower_name) -> bool
     {
+        if (is_kick_protect_excluded_name(lower_name))
+        {
+            return false;
+        }
         static const char* needles[] = {
             "kick",
             "kicked",
@@ -1028,6 +1070,14 @@ namespace
         char detail[128]{};
         try_read_fstring_param_preview(params, detail, sizeof(detail));
 
+        Reflection ref{};
+        std::string ref_failure{};
+        const char* kicker = "unknown host";
+        if (ref.init(ref_failure))
+        {
+            kicker = cached_session_host_name(ref);
+        }
+
         const auto now_ms = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
@@ -1041,12 +1091,14 @@ namespace
             entry.timestamp_ms = now_ms;
             std::snprintf(entry.function_name, sizeof(entry.function_name), "%s", func_name);
             std::snprintf(entry.object_owner, sizeof(entry.object_owner), "%s", owner);
+            std::snprintf(entry.kicker, sizeof(entry.kicker), "%s", kicker ? kicker : "unknown host");
             std::snprintf(entry.detail, sizeof(entry.detail), "%s", detail);
             g_anti_kick_log_head = (g_anti_kick_log_head + 1) % AntiKickLogCapacity;
         }
 
         std::string line = "[anti-kick] seq=" + std::to_string(seq) +
-                           " BLOCKED " + func_name + " on " + owner;
+                           " BLOCKED kick from " + std::string(kicker ? kicker : "unknown host") +
+                           " — " + func_name + " on " + owner;
         if (detail[0] != '\0')
         {
             line += " reason=\"";
@@ -2900,9 +2952,47 @@ namespace
         return true;
     }
 
-    auto anti_kick_is_local_object(const std::uintptr_t obj) -> bool
+    auto anti_kick_resolve_local_player_state() -> std::uintptr_t
     {
-        if (!obj)
+        const auto cached = g_anti_kick_local_player_state.load();
+        if (live_uobject(cached))
+        {
+            return cached;
+        }
+        const auto controller = g_anti_kick_local_controller.load();
+        if (live_uobject(controller))
+        {
+            const auto ps = safe_read<std::uintptr_t>(controller + OffPlayerControllerPlayerState);
+            if (live_uobject(ps))
+            {
+                return ps;
+            }
+        }
+        return 0;
+    }
+
+    auto anti_kick_resolve_local_net_connection() -> std::uintptr_t
+    {
+        const auto cached = g_anti_kick_local_net_connection.load();
+        if (live_uobject(cached))
+        {
+            return cached;
+        }
+        const auto local_player = g_anti_kick_local_player.load();
+        if (live_uobject(local_player))
+        {
+            const auto conn = safe_read<std::uintptr_t>(local_player + OffUPlayerConnection);
+            if (live_uobject(conn))
+            {
+                return conn;
+            }
+        }
+        return 0;
+    }
+
+    auto anti_kick_is_local_player_controller(const std::uintptr_t obj) -> bool
+    {
+        if (!live_uobject(obj))
         {
             return false;
         }
@@ -2910,15 +3000,68 @@ namespace
         {
             return true;
         }
-        if (obj == g_anti_kick_local_player_state.load())
+        if (safe_read<std::uint8_t>(obj + OffPlayerControllerIsLocal) != 0)
         {
             return true;
         }
-        if (obj == g_anti_kick_local_net_connection.load())
+        const auto local_player = g_anti_kick_local_player.load();
+        if (live_uobject(local_player))
         {
-            return true;
+            const auto controller = safe_read<std::uintptr_t>(local_player + 0x30);
+            return controller == obj;
         }
         return false;
+    }
+
+    auto anti_kick_is_local_player_state(const std::uintptr_t obj) -> bool
+    {
+        if (!live_uobject(obj))
+        {
+            return false;
+        }
+        return obj == anti_kick_resolve_local_player_state();
+    }
+
+    auto anti_kick_is_local_net_connection(const std::uintptr_t obj) -> bool
+    {
+        if (!live_uobject(obj))
+        {
+            return false;
+        }
+        return obj == anti_kick_resolve_local_net_connection();
+    }
+
+    auto anti_kick_is_local_object(const std::uintptr_t obj) -> bool
+    {
+        return anti_kick_is_local_player_controller(obj)
+            || anti_kick_is_local_player_state(obj)
+            || anti_kick_is_local_net_connection(obj);
+    }
+
+    auto anti_kick_function_targets_local_player(const char* func_name,
+                                                 const std::uintptr_t obj) -> bool
+    {
+        if (!func_name || !live_uobject(obj))
+        {
+            return false;
+        }
+        const std::string lower = lower_copy(func_name);
+        if (lower.find("netconnection") != std::string::npos
+            || lower == "close"
+            || lower == "conditionalclose"
+            || lower == "cleanup")
+        {
+            return anti_kick_is_local_net_connection(obj);
+        }
+        if (lower == "kick" || lower.find("playerstate") != std::string::npos)
+        {
+            return anti_kick_is_local_player_state(obj);
+        }
+        if (lower.rfind("client", 0) == 0)
+        {
+            return anti_kick_is_local_player_controller(obj);
+        }
+        return anti_kick_is_local_object(obj);
     }
 
     auto anti_kick_should_block(void* object, void* function, void* params) -> bool
@@ -2929,19 +3072,23 @@ namespace
         }
         const auto obj = reinterpret_cast<std::uintptr_t>(object);
         const auto func = reinterpret_cast<std::uintptr_t>(function);
-        if (!anti_kick_is_local_object(obj))
-        {
-            return false;
-        }
         const auto count = g_anti_kick_blocked_function_count.load();
         for (std::size_t i = 0; i < count && i < AntiKickMaxBlockedFunctions; ++i)
         {
-            if (g_anti_kick_blocked_functions[i].load() == func)
+            if (g_anti_kick_blocked_functions[i].load() != func)
             {
-                g_anti_kick_block_count.fetch_add(1);
-                anti_kick_record_block(func, params);
-                return true;
+                continue;
             }
+            const char* func_name = "unknown";
+            const char* owner = "local";
+            anti_kick_lookup_meta(func, &func_name, &owner);
+            if (!anti_kick_function_targets_local_player(func_name, obj))
+            {
+                return false;
+            }
+            g_anti_kick_block_count.fetch_add(1);
+            anti_kick_record_block(func, params);
+            return true;
         }
         return false;
     }
@@ -8236,12 +8383,19 @@ namespace
         {
             g_anti_kick_enabled.store(false);
             g_anti_kick_local_controller.store(0);
+            g_anti_kick_local_player.store(0);
             g_anti_kick_local_player_state.store(0);
             g_anti_kick_local_net_connection.store(0);
             g_anti_kick_blocked_function_count.store(0);
             for (std::size_t i = 0; i < AntiKickMaxBlockedFunctions; ++i)
             {
                 g_anti_kick_blocked_functions[i].store(0);
+            }
+            g_anti_kick_session = {};
+            {
+                std::lock_guard<std::mutex> lock(g_anti_kick_host_name_mutex);
+                g_anti_kick_host_name[0] = '\0';
+                g_anti_kick_host_name_ms = 0;
             }
             {
                 std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
@@ -8256,6 +8410,35 @@ namespace
         if (!live_uobject(ctx.controller))
         {
             return response_json(false, "controller_unavailable", 0, 1, "local PlayerController not available");
+        }
+
+        g_anti_kick_session.world = ctx.world;
+        g_anti_kick_session.gamestate_off = ref.resolve_property_offset("World", "GameState");
+        g_anti_kick_session.playerarray_off = ref.resolve_property_offset("GameStateBase", "PlayerArray");
+        for (const char* prop_name :
+             {"HostPlayerState", "SessionOwnerPlayerState", "HostingPlayerState", "OwnerPlayerState"})
+        {
+            const int off = ref.resolve_property_offset("GameState", prop_name);
+            if (off > 0)
+            {
+                g_anti_kick_session.host_ps_direct_off = off;
+                break;
+            }
+        }
+        for (const char* prop_name :
+             {"bIsSessionHost", "bIsHost", "bIsHosting", "bIsSessionOwner", "bIsLobbyHost", "bIsHostPlayer"})
+        {
+            const int off = ref.resolve_property_offset("PlayerState", prop_name);
+            if (off > 0)
+            {
+                g_anti_kick_session.host_flag_off = off;
+                break;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_host_name_mutex);
+            g_anti_kick_host_name[0] = '\0';
+            g_anti_kick_host_name_ms = 0;
         }
 
         std::uintptr_t blocked[AntiKickMaxBlockedFunctions]{};
@@ -8309,12 +8492,20 @@ namespace
         {
             player_state = safe_read<std::uintptr_t>(ctx.pawn + OffPawnPlayerState);
         }
+        if (!live_uobject(player_state))
+        {
+            player_state = g_anti_kick_local_player_state.load();
+        }
         add_named(player_state, "PlayerState", "Kick");
 
         std::uintptr_t net_connection = 0;
         if (live_uobject(ctx.local_player))
         {
             net_connection = safe_read<std::uintptr_t>(ctx.local_player + OffUPlayerConnection);
+        }
+        if (!live_uobject(net_connection))
+        {
+            net_connection = g_anti_kick_local_net_connection.load();
         }
         add_named(net_connection, "NetConnection", "Close");
         add_named(net_connection, "NetConnection", "ConditionalClose");
@@ -8338,9 +8529,15 @@ namespace
         }
 
         std::string hook_failure{};
-        if (!install_anti_kick_vtable_hooks(ctx.controller, player_state, net_connection, hook_failure))
+        const bool hooks_already_installed = g_anti_kick_vtable_hook_installed;
+        if (!hooks_already_installed
+            && !install_anti_kick_vtable_hooks(ctx.controller, player_state, net_connection, hook_failure))
         {
             return response_json(false, "anti_kick_hook_failed", 0, 1, hook_failure);
+        }
+        if (hooks_already_installed && !g_anti_kick_vtable_hook_installed)
+        {
+            return response_json(false, "anti_kick_hook_failed", 0, 1, "anti_kick_vtable_hook_lost");
         }
         if (!g_original_process_event.load() || !is_executable_code(g_original_process_event.load()))
         {
@@ -8349,6 +8546,7 @@ namespace
         }
 
         g_anti_kick_local_controller.store(ctx.controller);
+        g_anti_kick_local_player.store(ctx.local_player);
         g_anti_kick_local_player_state.store(player_state);
         g_anti_kick_local_net_connection.store(net_connection);
         g_anti_kick_blocked_function_count.store(blocked_count);
@@ -8423,6 +8621,7 @@ namespace
                            ",\"timestamp_ms\":" + std::to_string(entry.timestamp_ms) +
                            ",\"function\":\"" + json_escape(entry.function_name) + "\"" +
                            ",\"owner\":\"" + json_escape(entry.object_owner) + "\"" +
+                           ",\"kicker\":\"" + json_escape(entry.kicker) + "\"" +
                            ",\"detail\":\"" + json_escape(entry.detail) + "\"}";
             }
         }
@@ -8463,6 +8662,270 @@ namespace
             name.resize(32);
         }
         return name;
+    }
+
+    auto parse_hex_u64(const std::string& text) -> std::uintptr_t
+    {
+        if (text.empty())
+        {
+            return 0;
+        }
+        const char* start = text.c_str();
+        if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0)
+        {
+            start += 2;
+        }
+        char* end = nullptr;
+        const auto value = std::strtoull(start, &end, 16);
+        return end && end > start ? static_cast<std::uintptr_t>(value) : 0;
+    }
+
+    auto extract_steam64_text(const std::string& text) -> std::string
+    {
+        for (std::size_t i = 0; i + 17 <= text.size(); ++i)
+        {
+            if (text.compare(i, 7, "7656119") != 0)
+            {
+                continue;
+            }
+            bool ok = true;
+            for (int j = 7; j < 17; ++j)
+            {
+                const char ch = text[i + static_cast<std::size_t>(j)];
+                if (ch < '0' || ch > '9')
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok)
+            {
+                return text.substr(i, 17);
+            }
+        }
+        return {};
+    }
+
+    auto read_fstring_param(const std::uint8_t* base) -> std::string
+    {
+        if (!base)
+        {
+            return {};
+        }
+        const auto data = safe_read<const wchar_t*>(reinterpret_cast<std::uintptr_t>(base));
+        const auto num = safe_read<int>(reinterpret_cast<std::uintptr_t>(base + 8));
+        if (!data || num <= 1 || num > 256)
+        {
+            return {};
+        }
+        std::string out{};
+        out.reserve(static_cast<std::size_t>(num));
+        for (int i = 0; i < num - 1; ++i)
+        {
+            const wchar_t ch = safe_read<wchar_t>(
+                reinterpret_cast<std::uintptr_t>(data + static_cast<std::size_t>(i) * sizeof(wchar_t)));
+            if (!ch)
+            {
+                break;
+            }
+            out.push_back(ch >= 0 && ch < 128 ? static_cast<char>(ch) : '?');
+        }
+        return out;
+    }
+
+    auto read_player_state_display_name(std::uintptr_t player_state) -> std::string
+    {
+        if (!live_uobject(player_state))
+        {
+            return {};
+        }
+        static const int name_offsets[] = {0x388, 0x3F0, 0x340};
+        for (const int off : name_offsets)
+        {
+            const auto name = read_fstring_param(reinterpret_cast<const std::uint8_t*>(player_state + off));
+            if (!name.empty())
+            {
+                return trim_player_name(name);
+            }
+        }
+        return {};
+    }
+
+    auto resolve_session_host_player_state(Reflection& ref) -> std::uintptr_t
+    {
+        (void)ref;
+        const auto& sess = g_anti_kick_session;
+        if (!sess.world || sess.gamestate_off <= 0)
+        {
+            return 0;
+        }
+        const auto gamestate = safe_read<std::uintptr_t>(sess.world + static_cast<std::uintptr_t>(sess.gamestate_off));
+        if (!live_uobject(gamestate))
+        {
+            return 0;
+        }
+        if (sess.host_ps_direct_off > 0)
+        {
+            const auto host_ps = safe_read<std::uintptr_t>(
+                gamestate + static_cast<std::uintptr_t>(sess.host_ps_direct_off));
+            if (live_uobject(host_ps))
+            {
+                return host_ps;
+            }
+        }
+        if (sess.playerarray_off <= 0 || sess.host_flag_off <= 0)
+        {
+            return 0;
+        }
+        const auto player_array = safe_read<sdk::TArray<std::uintptr_t>>(
+            gamestate + static_cast<std::uintptr_t>(sess.playerarray_off));
+        if (!player_array.Data || player_array.Num <= 0)
+        {
+            return 0;
+        }
+        const int limit = std::min(player_array.Num, 32);
+        for (int i = 0; i < limit; ++i)
+        {
+            const auto ps = safe_read<std::uintptr_t>(
+                reinterpret_cast<std::uintptr_t>(player_array.Data) + static_cast<std::uintptr_t>(i) * 8);
+            if (!live_uobject(ps))
+            {
+                continue;
+            }
+            if (safe_read<std::uint8_t>(ps + static_cast<std::uintptr_t>(sess.host_flag_off)) != 0)
+            {
+                return ps;
+            }
+        }
+        return 0;
+    }
+
+    auto cached_session_host_name(Reflection& ref) -> const char*
+    {
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        if (g_anti_kick_host_name[0] != '\0' && (now_ms - g_anti_kick_host_name_ms) < 2000)
+        {
+            return g_anti_kick_host_name;
+        }
+
+        std::lock_guard<std::mutex> lock(g_anti_kick_host_name_mutex);
+        if (g_anti_kick_host_name[0] != '\0' && (now_ms - g_anti_kick_host_name_ms) < 2000)
+        {
+            return g_anti_kick_host_name;
+        }
+
+        std::string host_name{};
+        const auto host_ps = resolve_session_host_player_state(ref);
+        if (host_ps)
+        {
+            host_name = read_player_state_display_name(host_ps);
+        }
+        if (host_name.empty())
+        {
+            host_name = "unknown host";
+        }
+        std::snprintf(g_anti_kick_host_name, sizeof(g_anti_kick_host_name), "%s", host_name.c_str());
+        g_anti_kick_host_name_ms = now_ms;
+        return g_anti_kick_host_name;
+    }
+
+    auto conv_net_id_repl_to_steam64(Reflection& ref, const std::uint8_t* net_id, std::string& failure) -> std::string
+    {
+        if (!net_id)
+        {
+            return {};
+        }
+        bool any = false;
+        for (int i = 0; i < 0x30; ++i)
+        {
+            if (net_id[i] != 0)
+            {
+                any = true;
+                break;
+            }
+        }
+        if (!any)
+        {
+            return {};
+        }
+
+        const auto helpers = sdk_find_object_named(ref, "Default__OnlineHelpers");
+        const auto fn_conv = helpers ? ref.find_function(helpers, "Conv_FUniqueNetIdReplToString") : 0;
+        if (!helpers || !fn_conv)
+        {
+            failure = "conv_function_unavailable";
+            return extract_steam64_text(std::string(reinterpret_cast<const char*>(net_id), 0x30));
+        }
+
+        alignas(16) std::uint8_t conv_params[0x40]{};
+        std::memcpy(conv_params, net_id, 0x30);
+        if (!process_event(helpers, fn_conv, conv_params, failure))
+        {
+            return {};
+        }
+        return extract_steam64_text(read_fstring_param(conv_params + 0x30));
+    }
+
+    auto handle_game_get_player_steam_id(const std::string& payload, Reflection& ref) -> std::string
+    {
+        const auto ps_text = json_extract_string(payload, "player_state");
+        const auto player_state = parse_hex_u64(ps_text);
+        if (!live_uobject(player_state))
+        {
+            return response_json(false, "player_state_unavailable", 0, 1, "invalid PlayerState pointer");
+        }
+
+        std::string failure{};
+        std::string steam_id{};
+
+        const auto helpers = sdk_find_object_named(ref, "Default__OnlineHelpers");
+        const auto fn_get_ps = helpers ? ref.find_function(helpers, "GetPlayerStateUniqueNetId") : 0;
+        if (helpers && fn_get_ps)
+        {
+            alignas(16) std::uint8_t get_params[0x38]{};
+            *reinterpret_cast<std::uintptr_t*>(get_params) = player_state;
+            if (process_event(helpers, fn_get_ps, get_params, failure))
+            {
+                steam_id = conv_net_id_repl_to_steam64(ref, get_params + 8, failure);
+            }
+        }
+
+        if (steam_id.empty())
+        {
+            const auto fn_bp = ref.find_function(player_state, "BP_GetUniqueId");
+            if (fn_bp)
+            {
+                alignas(16) std::uint8_t bp_params[0x30]{};
+                if (process_event(player_state, fn_bp, bp_params, failure))
+                {
+                    steam_id = conv_net_id_repl_to_steam64(ref, bp_params, failure);
+                }
+            }
+        }
+
+        if (steam_id.empty())
+        {
+            const auto unique_off = ref.resolve_property_offset("PlayerState", "UniqueID");
+            if (unique_off >= 0)
+            {
+                steam_id = conv_net_id_repl_to_steam64(
+                    ref,
+                    reinterpret_cast<const std::uint8_t*>(player_state + static_cast<std::uintptr_t>(unique_off)),
+                    failure);
+            }
+        }
+
+        if (steam_id.empty())
+        {
+            const auto msg = failure.empty() ? "Steam ID not replicated yet" : failure;
+            return response_json(false, "steam_id_unavailable", 0, 1, msg);
+        }
+
+        const std::string meta = "\"steam_id\":\"" + json_escape(steam_id) + "\"";
+        return response_json(true, "get_player_steam_id", 0, 0, steam_id, meta);
     }
 
     auto handle_game_set_player_name(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
@@ -8587,6 +9050,10 @@ namespace
         {
             return handle_game_set_player_name(payload, ref, ctx);
         }
+        if (request.find("\"type\":\"get_player_steam_id\"") != std::string::npos)
+        {
+            return handle_game_get_player_steam_id(payload, ref);
+        }
         if (request.find("\"type\":\"rotate\"") != std::string::npos)
         {
             const std::string payload = json_extract_payload(request);
@@ -8668,7 +9135,7 @@ namespace
         {
             return "{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,"
                    "\"message\":\"ok\",\"timing_ms\":{},"
-                   "\"metadata\":{\"commands\":[\"ping\",\"capabilities\",\"sdk_probe\",\"sdk_deep_probe\",\"paint_full_route\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"rotate\",\"set_anti_kick\",\"get_anti_kick_log\",\"set_player_name\"],"
+                   "\"metadata\":{\"commands\":[\"ping\",\"capabilities\",\"sdk_probe\",\"sdk_deep_probe\",\"paint_full_route\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"rotate\",\"set_anti_kick\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\"],"
                    "\"sdk\":\"runtime_dynamic_reflection_min\","
                    "\"paint_full_route\":\"template_brush_paint\","
                    "\"paint_full_route_fields\":[\"camera_yaw_offset\",\"camera_rotation_absolute\",\"camera_settle_ms\"],"
@@ -8716,6 +9183,10 @@ namespace
             return execute_game_command_on_game_thread(line);
         }
         if (line.find("\"type\":\"set_player_name\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"get_player_steam_id\"") != std::string::npos)
         {
             return execute_game_command_on_game_thread(line);
         }
