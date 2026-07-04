@@ -106,6 +106,10 @@ namespace
     std::atomic<std::uintptr_t> g_anti_kick_blocked_functions[AntiKickMaxBlockedFunctions]{};
     std::atomic<std::size_t> g_anti_kick_blocked_function_count{0};
     std::atomic<std::uint64_t> g_anti_kick_block_count{0};
+    std::size_t g_anti_kick_last_logged_blocked_count{static_cast<std::size_t>(-1)};
+    std::uintptr_t g_anti_kick_last_logged_net_connection{0};
+    bool g_anti_kick_last_logged_no_player_state{false};
+    bool g_anti_kick_last_logged_no_net_connection{false};
 
     struct AntiKickFuncMeta
     {
@@ -2906,7 +2910,8 @@ namespace
             {
                 return false;
             }
-            if (!is_executable_code(reinterpret_cast<std::uintptr_t>(original)))
+            if (!is_executable_code(reinterpret_cast<std::uintptr_t>(original))
+                || reinterpret_cast<std::uintptr_t>(original) == static_cast<std::uintptr_t>(-1))
             {
                 void** entry = &vtable_slots[ProcessEventVtableIndex];
                 DWORD old_protect = 0;
@@ -2931,14 +2936,10 @@ namespace
         };
 
         bool hooked = hook_object_vtable(controller);
-        if (live_uobject(player_state))
-        {
-            hooked = hook_object_vtable(player_state) || hooked;
-        }
-        if (live_uobject(net_connection))
-        {
-            hooked = hook_object_vtable(net_connection) || hooked;
-        }
+        // Do not hook PlayerState/NetConnection vtables — those objects are recreated on
+        // lobby/match transitions; a stale class vtable hook caused AV 0xFFFFFFFFFFFFFFFF.
+        (void)player_state;
+        (void)net_connection;
         if (!hooked || g_anti_kick_vtable_restore_count == 0)
         {
             failure = "anti_kick_vtable_hook_failed";
@@ -8079,7 +8080,7 @@ namespace
             return;
         }
         const auto original = g_original_process_event.load();
-        if (original)
+        if (original && is_executable_code(original))
         {
             reinterpret_cast<ProcessEventFn>(original)(object, function, params);
         }
@@ -8387,6 +8388,10 @@ namespace
             g_anti_kick_local_player_state.store(0);
             g_anti_kick_local_net_connection.store(0);
             g_anti_kick_blocked_function_count.store(0);
+            g_anti_kick_last_logged_blocked_count = static_cast<std::size_t>(-1);
+            g_anti_kick_last_logged_net_connection = 0;
+            g_anti_kick_last_logged_no_player_state = false;
+            g_anti_kick_last_logged_no_net_connection = false;
             for (std::size_t i = 0; i < AntiKickMaxBlockedFunctions; ++i)
             {
                 g_anti_kick_blocked_functions[i].store(0);
@@ -8410,6 +8415,11 @@ namespace
         if (!live_uobject(ctx.controller))
         {
             return response_json(false, "controller_unavailable", 0, 1, "local PlayerController not available");
+        }
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1,
+                                "wait until spawned in before enabling anti-kick (hook installs on match load)");
         }
 
         g_anti_kick_session.world = ctx.world;
@@ -8496,7 +8506,6 @@ namespace
         {
             player_state = g_anti_kick_local_player_state.load();
         }
-        add_named(player_state, "PlayerState", "Kick");
 
         std::uintptr_t net_connection = 0;
         if (live_uobject(ctx.local_player))
@@ -8507,20 +8516,11 @@ namespace
         {
             net_connection = g_anti_kick_local_net_connection.load();
         }
-        add_named(net_connection, "NetConnection", "Close");
-        add_named(net_connection, "NetConnection", "ConditionalClose");
-        add_named(net_connection, "NetConnection", "CleanUp");
 
+        // Controller RPCs only — PlayerState/NetConnection ProcessEvent never passes through
+        // the local controller vtable hook; listing them caused false coverage and refresh crashes.
         const std::function<void(std::uintptr_t, const char*, const char*)> remember_fn = remember_blocked;
         scan_kick_functions_on_object(ref, ctx.controller, "PlayerController", remember_fn);
-        if (live_uobject(player_state))
-        {
-            scan_kick_functions_on_object(ref, player_state, "PlayerState", remember_fn);
-        }
-        if (live_uobject(net_connection))
-        {
-            scan_kick_functions_on_object(ref, net_connection, "NetConnection", remember_fn);
-        }
 
         if (blocked_count == 0)
         {
@@ -8528,20 +8528,25 @@ namespace
                                 "could not resolve kick RPC functions on local controller/player state");
         }
 
-        std::string hook_failure{};
-        const bool hooks_already_installed = g_anti_kick_vtable_hook_installed;
-        if (!hooks_already_installed
-            && !install_anti_kick_vtable_hooks(ctx.controller, player_state, net_connection, hook_failure))
+        if (!live_uobject(ctx.controller))
         {
-            return response_json(false, "anti_kick_hook_failed", 0, 1, hook_failure);
+            return response_json(false, "controller_unavailable", 0, 1, "local PlayerController not available");
         }
-        if (hooks_already_installed && !g_anti_kick_vtable_hook_installed)
+
+        std::string hook_failure{};
+        if (!g_anti_kick_vtable_hook_installed)
         {
-            return response_json(false, "anti_kick_hook_failed", 0, 1, "anti_kick_vtable_hook_lost");
+            if (!install_anti_kick_vtable_hooks(ctx.controller, player_state, net_connection, hook_failure))
+            {
+                return response_json(false, "anti_kick_hook_failed", 0, 1, hook_failure);
+            }
+        }
+        if (!g_anti_kick_vtable_hook_installed)
+        {
+            return response_json(false, "anti_kick_hook_failed", 0, 1, "anti_kick_vtable_hook_missing");
         }
         if (!g_original_process_event.load() || !is_executable_code(g_original_process_event.load()))
         {
-            uninstall_anti_kick_vtable_hooks();
             return response_json(false, "anti_kick_hook_failed", 0, 1, "process_event_original_unavailable");
         }
 
@@ -8585,9 +8590,17 @@ namespace
             }
         }
         summary += "\n";
-        append_anti_kick_log_file(summary);
+        if (blocked_count != g_anti_kick_last_logged_blocked_count
+            || net_connection != g_anti_kick_last_logged_net_connection)
+        {
+            g_anti_kick_last_logged_blocked_count = blocked_count;
+            g_anti_kick_last_logged_net_connection = net_connection;
+            append_anti_kick_log_file(summary);
+        }
 
-        std::string meta = "\"enabled\":true,\"hook_mode\":\"vtable\",\"blocked_functions\":" + std::to_string(blocked_count) +
+        std::string meta = "\"enabled\":true,\"hook_mode\":\"vtable\",\"hooks_locked\":"
+                           + std::string(g_anti_kick_vtable_hook_installed ? "true" : "false") +
+                           ",\"blocked_functions\":" + std::to_string(blocked_count) +
                            ",\"controller\":\"" + hex_address(ctx.controller) + "\"" +
                            ",\"player_state\":\"" + hex_address(player_state) + "\"" +
                            ",\"net_connection\":\"" + hex_address(net_connection) + "\"" +

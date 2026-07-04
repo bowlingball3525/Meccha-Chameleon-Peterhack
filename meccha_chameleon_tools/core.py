@@ -583,7 +583,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         (bytes([0x48, 0x8D, 0x3D, 0x00, 0x00, 0x00, 0x00]),
          bytes([1, 1, 1, 0, 0, 0, 0])),
     )
-    FNAMEPOOL_DELTA = 0x11C658   # GObjects − GNames (dump 5.6.1-44394996)
+    FNAMEPOOL_DELTA = 0x11C658   # GObjects − GNames (dump 5.6.1-44394996, 2026-07-04)
 
     OFFSET_MAP = {
         "UWorld::GameState": ("World", "GameState"),
@@ -760,6 +760,12 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._bridge_recover_give_up = False
         self._bridge_session_pid = 0
         self._camo_abort = False
+        self._esp_snapshot_lock = threading.Lock()
+        self._esp_paint_snapshot = None
+        self._esp_snapshot_stop = None
+        self._esp_snapshot_started = False
+        self._menu_ui_active = False
+        self._overlay_screen_geom = (1920, 1080)
         self._init_trainer_state()
 
     def _scan_guobject_array(self):
@@ -975,28 +981,39 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         return last_cam if last_cam else None
 
     def get_esp_world_pos(self, actor):
-        """World point for ESP — neck height (dot/name anchor)."""
+        """World point for ESP — chest height (dot/name anchor)."""
         if not actor:
             return None
-        neck = None
+        chest = None
         try:
-            neck_map = self.get_skeleton_positions_by_indices(
-                actor, {"neck_01": self._CHAMELEON_BONE_INDICES["neck_01"]},
+            bi = self._CHAMELEON_BONE_INDICES
+            chest_map = self.get_skeleton_positions_by_indices(
+                actor,
+                {"spine_02": bi["spine_02"], "spine_03": bi["spine_03"]},
             )
-            if neck_map:
-                neck = neck_map.get("neck_01")
-            if not neck:
+            if chest_map:
+                if "spine_02" in chest_map and "spine_03" in chest_map:
+                    a, b = chest_map["spine_02"], chest_map["spine_03"]
+                    chest = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2)
+                elif "spine_02" in chest_map:
+                    chest = chest_map["spine_02"]
+                elif "spine_03" in chest_map:
+                    chest = chest_map["spine_03"]
+            if not chest:
                 bones = self.get_skeleton_positions(actor)
                 if bones:
-                    neck = bones.get("neck_01") or bones.get("head")
+                    for key in ("spine_02", "spine_03", "neck_01"):
+                        if key in bones:
+                            chest = bones[key]
+                            break
         except Exception:
             pass
-        if neck and self._is_valid_world_loc(neck):
-            return neck
+        if chest and self._is_valid_world_loc(chest):
+            return chest
         root = self.get_actor_root_pos(actor)
         if not root:
             return None
-        return (root[0], root[1], root[2] + 85.0)
+        return (root[0], root[1], root[2] + 60.0)
 
     def get_viewport_size(self):
         """Return game client width/height in pixels."""
@@ -1709,6 +1726,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if not cls_name:
             return False
         if "Spectator" in cls_name or "Spectate" in cls_name:
+            return False
+        if "SpectatorPawn" in cls_name or "SpectatePawn" in cls_name:
+            return False
+        if "Decoy" in cls_name and "Character" in cls_name:
             return False
         if "BP_FirstPersonCharacter" in cls_name:
             return True
@@ -2647,11 +2668,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
 
     # Camouflage — offsets from Dumper-7 dump
-    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-07-02 dump)
+    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-07-04 dump)
     #
     # Globals (OffsetsInfo.json / Basic.hpp):
-    #   GObjects 0x09F3C6D0  GNames 0x09E20078  GWorld 0x09C85620  ProcessEvent 0x015D0AD0
-    #   FNAMEPOOL_DELTA 0x11C658  AppendString 0x013B3290  ProcessEventIdx 0x4C
+    #   GObjects 0x09F3E750  GNames 0x09E220F8  GWorld 0x09C87620  ProcessEvent 0x015D0B80
+    #   FNAMEPOOL_DELTA 0x11C658  AppendString 0x013B3340  ProcessEventIdx 0x4C
     #
     # ABP_FirstPersonCharacter_cLeon_Character_C:
     #   pawn + 0x0B68  ->  RuntimePaintable     (URuntimePaintableComponent*)
@@ -2709,11 +2730,13 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 if p.get("is_local"):
                     actor = p.get("actor", 0)
                     if actor:
-                        return actor
+                        cls = self.objects.class_name(actor)
+                        if self._is_player_class(cls):
+                            return actor
         except Exception:
             pass
 
-        return ack if ack and ack > 0x100000 else 0
+        return 0
 
     def _get_local_pawn(self):
         return self._find_local_pawn()
@@ -2972,30 +2995,30 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     # FunctionsInfo / exec thunks directly.  Re-verify prologues at runtime because
     # game patches shift these by small deltas (calling a stale RVA lands mid-function
     # and corrupts the heap — "ClearChannel ok=True" then crash / inject failure).
-    RVA_PAINT_AT_UV_DUMP          = 0x50E6180   # FunctionsInfo PaintAtUV exec
-    RVA_PAINT_AT_UV_LEGACY        = 0x5101E80   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
-    RVA_EXEC_PAINT_AT_UV          = 0x50E6180   # exec anchor for scan / self-test
-    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F7AE0   # deep ClearChannel native (RCX=comp, DL=channel)
-    RVA_EXPORT_CHANNEL_LEGACY     = 0x50FA340   # deep ExportChannelToBytes worker
-    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FDCD0   # Import dispatch wrapper
-    RVA_EXEC_IMPORT_CHANNEL       = 0x50E4C10   # exec ImportChannelFromBytes (scan anchor)
-    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E4460   # FunctionsInfo ClearChannel exec
-    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E4520   # FunctionsInfo ExportChannelToBytes exec
-    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E4C10   # FunctionsInfo ImportChannelFromBytes exec
-    RVA_BEGIN_STROKE_NATIVE       = 0x50E4420   # FunctionsInfo BeginStroke exec
-    RVA_END_STROKE_NATIVE         = 0x50E4500   # FunctionsInfo EndStroke exec
-    RVA_BEGIN_STROKE_LEGACY       = 0x50F3360   # deep BeginStroke worker
-    RVA_END_STROKE_LEGACY         = 0x50F9C70   # deep EndStroke worker
-    RVA_IMPORT_RT_NATIVE          = 0x5107710   # copies TArray bytes into AlbedoRenderTarget
-    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D2850   # FunctionsInfo RequestFullTextureSync (do NOT call)
-    RVA_APPLY_PAINT_TO_MATERIAL   = 0x5106950   # internal RT→material worker (do NOT call directly)
+    RVA_PAINT_AT_UV_DUMP          = 0x50E5880   # FunctionsInfo PaintAtUV exec
+    RVA_PAINT_AT_UV_LEGACY        = 0x5101580   # deep PaintAtUV worker (RCX=comp RDX=&UV R8=&ChannelData R9=channel)
+    RVA_EXEC_PAINT_AT_UV          = 0x50E5880   # exec anchor for scan / self-test
+    RVA_CLEAR_CHANNEL_LEGACY      = 0x50F71E0   # deep ClearChannel native (RCX=comp, DL=channel)
+    RVA_EXPORT_CHANNEL_LEGACY     = 0x50F9A40   # deep ExportChannelToBytes worker
+    RVA_IMPORT_CHANNEL_LEGACY     = 0x50FD3D0   # Import dispatch wrapper
+    RVA_EXEC_IMPORT_CHANNEL       = 0x50E4310   # exec ImportChannelFromBytes (scan anchor)
+    RVA_CLEAR_CHANNEL_NATIVE      = 0x50E3B60   # FunctionsInfo ClearChannel exec
+    RVA_EXPORT_CHANNEL_NATIVE     = 0x50E3C20   # FunctionsInfo ExportChannelToBytes exec
+    RVA_IMPORT_CHANNEL_NATIVE     = 0x50E4310   # FunctionsInfo ImportChannelFromBytes exec
+    RVA_BEGIN_STROKE_NATIVE       = 0x50E3B20   # FunctionsInfo BeginStroke exec
+    RVA_END_STROKE_NATIVE         = 0x50E3C00   # FunctionsInfo EndStroke exec
+    RVA_BEGIN_STROKE_LEGACY       = 0x50F2A60   # deep BeginStroke worker
+    RVA_END_STROKE_LEGACY         = 0x50F9370   # deep EndStroke worker
+    RVA_IMPORT_RT_NATIVE          = 0x5106E10   # copies TArray bytes into AlbedoRenderTarget
+    RVA_EXEC_REQUEST_TEXTURE_SYNC = 0x50D1F50   # FunctionsInfo RequestFullTextureSync (do NOT call)
+    RVA_APPLY_PAINT_TO_MATERIAL   = 0x5106050   # internal RT→material worker (do NOT call directly)
     OFF_PAINT_CHANNELS_DIRTY      = 0x016B      # DISABLED — overlaps DynamicMaterialInstance @ +0x0168
-    RVA_REQUEST_TEXTURE_SYNC        = 0x5100490   # DO NOT call from Peterhack — delayed AV crash
-    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E5F40   # PaintAtScreenPosition exec (FunctionsInfo)
-    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E4A50   # HitTestAtScreenPosition exec (FunctionsInfo)
-    RVA_GET_PAINT_MESH_NATIVE     = 0x50E47D0   # GetInitializedPaintMesh exec (FunctionsInfo)
-    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E5F40   # PaintAtScreenPosition scan anchor
-    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E4A50   # HitTestAtScreenPosition scan anchor
+    RVA_REQUEST_TEXTURE_SYNC        = 0x50FFB90   # DO NOT call from Peterhack — delayed AV crash
+    RVA_PAINT_AT_SCREEN_NATIVE    = 0x50E5640   # PaintAtScreenPosition exec (FunctionsInfo)
+    RVA_HITTEST_AT_SCREEN_NATIVE  = 0x50E4150   # HitTestAtScreenPosition exec (FunctionsInfo)
+    RVA_GET_PAINT_MESH_NATIVE     = 0x50E3ED0   # GetInitializedPaintMesh exec (FunctionsInfo)
+    RVA_EXEC_PAINT_AT_SCREEN      = 0x50E5640   # PaintAtScreenPosition scan anchor
+    RVA_EXEC_HITTEST_AT_SCREEN    = 0x50E4150   # HitTestAtScreenPosition scan anchor
     EPaintChannel_Albedo = 0
     EPaintChannel_All = 4
 
@@ -3385,6 +3408,202 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
 
         _threading.Thread(target=_tracker, daemon=True).start()
         return fps_info
+
+    def start_esp_snapshot_loop(self, config_getter):
+        """Background ESP reads so Qt paint/menu never block on game memory."""
+        if getattr(self, "_esp_snapshot_started", False):
+            return
+        self._esp_snapshot_started = True
+        self._esp_snapshot_stop = threading.Event()
+
+        def _loop():
+            import time as _time
+
+            while not self._esp_snapshot_stop.is_set():
+                menu_open = bool(getattr(self, "_menu_ui_active", False))
+                # Menu open: do not hammer pymem — reuse the last snapshot for overlay paint.
+                interval = 0.35 if menu_open else 0.10
+                try:
+                    if menu_open:
+                        self._esp_snapshot_stop.wait(interval)
+                        continue
+                    cfg = config_getter()
+                    if cfg is None:
+                        self._esp_snapshot_stop.wait(interval)
+                        continue
+                    need_players = bool(
+                        getattr(cfg, "enabled", False)
+                        or getattr(cfg, "aimbot_enabled", False)
+                    )
+                    if need_players:
+                        snap = self._build_esp_paint_snapshot(cfg)
+                    else:
+                        snap = {
+                            "cam": self.get_camera(),
+                            "players": [],
+                            "local_pos": None,
+                            "aim_target": None,
+                        }
+                    with self._esp_snapshot_lock:
+                        self._esp_paint_snapshot = snap
+                except Exception as exc:
+                    now = _time.monotonic()
+                    last = getattr(self, "_esp_snapshot_exc_ts", 0.0)
+                    if now - last >= 5.0:
+                        self._esp_snapshot_exc_ts = now
+                        print(f"[ESP] snapshot error: {exc}", flush=True)
+                self._esp_snapshot_stop.wait(interval)
+
+        threading.Thread(target=_loop, daemon=True, name="esp-snapshot").start()
+
+    def stop_esp_snapshot_loop(self):
+        stop = getattr(self, "_esp_snapshot_stop", None)
+        if stop:
+            stop.set()
+
+    def get_esp_paint_snapshot(self):
+        """Return the latest snapshot reference (read-only on the UI thread)."""
+        with self._esp_snapshot_lock:
+            return self._esp_paint_snapshot
+
+    def _snapshot_aim_point(self, pdata, config):
+        """World position for aimbot — chest bones with height fallback."""
+        actor = pdata.get("actor")
+        if actor:
+            try:
+                bi = getattr(config, "bone_indices", None) or {}
+                chest_bones = {
+                    "spine_02": bi.get("spine_02", 36),
+                    "spine_03": bi.get("spine_03", 52),
+                }
+                bones = self.get_skeleton_positions_by_indices(actor, chest_bones)
+                if bones:
+                    if "spine_02" in bones and "spine_03" in bones:
+                        a, b = bones["spine_02"], bones["spine_03"]
+                        return (
+                            (a[0] + b[0]) / 2,
+                            (a[1] + b[1]) / 2,
+                            (a[2] + b[2]) / 2,
+                        )
+                    if "spine_02" in bones:
+                        return bones["spine_02"]
+                    if "spine_03" in bones:
+                        return bones["spine_03"]
+            except Exception:
+                pass
+        pos = pdata.get("pos")
+        if not pos:
+            return None
+        off = getattr(config, "aimbot_target_offset", 0.0)
+        if abs(off) < 1.0:
+            off = 60.0
+        return (pos[0], pos[1], pos[2] + off)
+
+    def _compute_aimbot_target(self, config, cam, players, screen_w, screen_h):
+        if not getattr(config, "aimbot_enabled", False) or not cam or screen_w <= 0 or screen_h <= 0:
+            return None
+        world = self._get_world()
+        local_pc = self._get_local_controller(world) if world else 0
+        local_pawn = (
+            rp(self.pm, local_pc + self.offsets["APlayerController::AcknowledgedPawn"])
+            if local_pc else 0
+        )
+        local_pos = self.get_actor_root_pos(local_pawn) if local_pawn else None
+        cx, cy = screen_w / 2.0, screen_h / 2.0
+        cam_loc = cam["loc"]
+        best_dist = float("inf")
+        best_target = None
+        fov_px = getattr(config, "aimbot_fov", 120)
+        for pdata in players:
+            actor = pdata.get("actor")
+            if not actor or actor == local_pawn or pdata.get("is_local"):
+                continue
+            if getattr(config, "aimbot_visible_check", False):
+                vis = pdata.get("visible")
+                if vis is None:
+                    vis = self._is_visible(actor)
+                if not vis:
+                    continue
+            pos = pdata.get("pos")
+            if not pos:
+                continue
+            if local_pos and dist(pos, local_pos) < 150.0:
+                continue
+            if dist(pos, cam_loc) < 100.0:
+                continue
+            aim_pos = self._snapshot_aim_point(pdata, config)
+            if not aim_pos:
+                continue
+            sx, sy, on_screen = world_to_screen(aim_pos, cam, screen_w, screen_h)
+            if not on_screen:
+                continue
+            dx = sx - cx
+            dy = sy - cy
+            d = math.sqrt(dx * dx + dy * dy)
+            if d <= fov_px and d < best_dist:
+                best_dist = d
+                best_target = aim_pos
+        return best_target
+
+    def _build_esp_paint_snapshot(self, config):
+        """Collect camera, players, and draw helpers off the UI thread."""
+        cam = self.get_camera()
+        need_players = bool(getattr(config, "enabled", False) or getattr(config, "aimbot_enabled", False))
+        all_players = []
+        local_pos = None
+        if need_players:
+            all_players = self.get_players(
+                include_local=getattr(config, "show_local", False),
+                team_filter=getattr(config, "team_filter", False),
+                enemy_only=getattr(config, "enemy_only", False),
+            )
+            for p in all_players:
+                if p.get("is_local"):
+                    local_pos = p.get("pos")
+                    break
+        if getattr(self, "_steam_features_active", False):
+            try:
+                self.refresh_steam_ids_lazy()
+            except Exception:
+                pass
+
+        enriched = []
+        want_boxes = bool(getattr(config, "box_esp", False) or getattr(config, "corner_box", False))
+        want_skeleton = bool(getattr(config, "skeleton_esp", False))
+        want_health = bool(
+            getattr(config, "health_bar", False)
+            or getattr(config, "shield_bar", False)
+            or getattr(config, "oof_show_health", False)
+        )
+        enemy_only = bool(getattr(config, "enemy_only", False))
+        bone_indices = getattr(config, "bone_indices", None) or {}
+
+        for pdata in all_players:
+            entry = dict(pdata)
+            actor = pdata.get("actor")
+            ps = pdata.get("player_state")
+            is_local = pdata.get("is_local")
+            if want_boxes and actor:
+                entry["rot"] = self.get_actor_root_rotation(actor)
+            if want_skeleton and actor and not is_local:
+                bones = self.get_skeleton_positions(actor)
+                if not bones:
+                    bones = self.get_skeleton_positions_by_indices(actor, bone_indices)
+                entry["bones"] = bones
+            if want_health and actor:
+                entry["health_info"] = self.get_health(actor, ps)
+            if enemy_only and actor and not is_local:
+                entry["visible"] = self._is_visible(actor)
+            enriched.append(entry)
+
+        sw, sh = getattr(self, "_overlay_screen_geom", (1920, 1080))
+        aim_target = self._compute_aimbot_target(config, cam, enriched, sw, sh) if cam else None
+        return {
+            "cam": cam,
+            "players": enriched,
+            "local_pos": local_pos,
+            "aim_target": aim_target,
+        }
 
     def throttle_game_process(self, on: bool, quality: int = 3):
         """Lower/restore the game process priority class while painting.

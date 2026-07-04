@@ -80,6 +80,9 @@ class Config:
     autokick_enabled: bool = False
     autokick_leave_on_block: bool = True
 
+    # UI / overlay
+    ui_overlay_fps: int = 60  # overlay refresh cap (1–240); menu open throttles lower
+
     # Radar
     radar_enabled: bool = False
     radar_size: int = 180

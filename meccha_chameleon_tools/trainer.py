@@ -129,6 +129,7 @@ class TrainerMixin:
         self._autokick_leave_until = 0.0
         self._autokick_last_scan = 0.0
         self._trainer_last_tick_ts = 0.0
+        self._trainer_last_playable_pawn = 0
         self._cdo_cache = {}
         self._anti_kick_bridge_state = None
         self._anti_kick_bridge_last_attempt = 0.0
@@ -136,6 +137,15 @@ class TrainerMixin:
         self._anti_kick_log_seq = 0
         self._anti_kick_watch_pc = 0
         self._anti_kick_watch_ps = 0
+        self._anti_kick_watch_conn = 0
+        self._anti_kick_watch_pawn = 0
+        self._anti_kick_blocked_count = 0
+        self._anti_kick_reported_blocked = None
+        self._anti_kick_refresh_key = None
+        self._anti_kick_partial_retry_key = None
+        self._anti_kick_spawn_stable_ts = 0.0
+        self._anti_kick_spawn_stable_key = None
+        self._anti_kick_defer_log_ts = 0.0
         self._anti_kick_refresh_last = 0.0
         self._magnet_active = False
         self._magnet_key_was_down = False
@@ -167,7 +177,14 @@ class TrainerMixin:
                     if cfg:
                         self.tick_trainer(cfg)
                 except Exception as exc:
-                    print(f"[TRAINER:LOOP] {exc}", flush=True)
+                    now_loop = time.monotonic()
+                    last_ts = getattr(self, "_trainer_loop_exc_ts", 0.0)
+                    last_msg = getattr(self, "_trainer_loop_exc_msg", "")
+                    msg = str(exc)
+                    if msg != last_msg or now_loop - last_ts >= 5.0:
+                        self._trainer_loop_exc_ts = now_loop
+                        self._trainer_loop_exc_msg = msg
+                        print(f"[TRAINER:LOOP] {exc}", flush=True)
                 self._trainer_loop_stop.wait(0.05)
 
         threading.Thread(target=_loop, daemon=True, name="trainer-loop").start()
@@ -301,6 +318,12 @@ class TrainerMixin:
                 if tb and "NoneType: None" not in tb:
                     print(f"[TRAINER:{tag}] {tb}", flush=True)
 
+    def _trainer_is_playable_pawn(self, pawn):
+        if not pawn or pawn <= 0x100000:
+            return False
+        cls = self.objects.class_name(pawn) or ""
+        return self._is_player_class(cls)
+
     def _trainer_is_hunter(self, pawn):
         if not pawn:
             return False
@@ -414,7 +437,9 @@ class TrainerMixin:
             self._trainer_error("DECOY-CD", exc, config)
 
     def _trainer_anti_detection(self, pawn, config):
-        if not pawn or self._read_is_hunter(pawn) is not False:
+        if not self._trainer_is_playable_pawn(pawn):
+            return
+        if self._read_is_hunter(pawn) is not False:
             return
         try:
             if _wint32(self.pm, pawn + self.OFF_OVERLAP_CHECK_CAPSULES + 8, 0):
@@ -480,17 +505,27 @@ class TrainerMixin:
 
     def _trainer_magnet_key_toggle(self, config):
         try:
-            if getattr(self, "_magnet_hotkey_native", False):
+            if getattr(self, "_magnet_poll_ui", False):
                 return
-            from meccha_chameleon_tools.ui import is_game_foreground, vk_from_name
+            from meccha_chameleon_tools.ui import vk_from_name
             import ctypes
-            game_hwnd = self._game_hwnd_for_magnet()
-            if not is_game_foreground(game_hwnd):
-                vk = vk_from_name(getattr(config, "trainer_magnet_key", "G"))
-                self._magnet_key_was_down = bool(
-                    ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
-                )
-                return
+            allowed = getattr(self, "_magnet_hotkey_allowed", None)
+            if callable(allowed):
+                if not allowed():
+                    vk = vk_from_name(getattr(config, "trainer_magnet_key", "G"))
+                    self._magnet_key_was_down = bool(
+                        ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                    )
+                    return
+            else:
+                from meccha_chameleon_tools.ui import is_game_foreground
+                game_hwnd = self._game_hwnd_for_magnet()
+                if not is_game_foreground(game_hwnd):
+                    vk = vk_from_name(getattr(config, "trainer_magnet_key", "G"))
+                    self._magnet_key_was_down = bool(
+                        ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                    )
+                    return
             vk = vk_from_name(getattr(config, "trainer_magnet_key", "G"))
             down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
             if down and not self._magnet_key_was_down:
@@ -678,24 +713,39 @@ class TrainerMixin:
         pawn = self._find_local_pawn() if world else 0
         ps = self._trainer_local_player_state(pawn) if pawn else 0
         pc = self._get_local_controller(world) if world else 0
-        if getattr(self, "_anti_kick_bridge_state", None) != want:
-            if now - getattr(self, "_anti_kick_bridge_last_attempt", 0.0) >= 2.0:
-                self._anti_kick_bridge_last_attempt = now
-                self._schedule_anti_kick_bridge_sync(want, config)
-        elif want and getattr(self, "_anti_kick_bridge_state", False) and pc:
-            prev_pc = getattr(self, "_anti_kick_watch_pc", 0)
-            prev_ps = getattr(self, "_anti_kick_watch_ps", 0)
-            if (pc != prev_pc or ps != prev_ps) and now - getattr(self, "_anti_kick_refresh_last", 0.0) >= 3.0:
-                self._anti_kick_refresh_last = now
-                self._anti_kick_bridge_last_attempt = now
-                self._schedule_anti_kick_bridge_sync(True, config)
-
-        prev = self._trainer_watch
         conn = 0
         if world and pc:
             player = _rp(self.pm, pc + self.offsets.get("APlayerController::Player", 0x0348))
             if player:
                 conn = _rp(self.pm, player + self.OFF_UPLAYER_CONNECTION)
+
+        if pawn and conn and pc:
+            stable_key = (pc, conn, pawn)
+            if stable_key != getattr(self, "_anti_kick_spawn_stable_key", None):
+                self._anti_kick_spawn_stable_key = stable_key
+                self._anti_kick_spawn_stable_ts = now
+
+        ANTI_KICK_SPAWN_STABLE_SEC = 5.0
+
+        if getattr(self, "_anti_kick_bridge_state", None) != want:
+            if want:
+                if not pawn or not conn or not pc:
+                    if now - getattr(self, "_anti_kick_defer_log_ts", 0.0) >= 12.0:
+                        self._anti_kick_defer_log_ts = now
+                        self._trainer_log(
+                            "ANTI-KICK",
+                            "waiting until spawned in before installing hook (avoids match-load crash)",
+                            config=config,
+                            level="debug",
+                        )
+                    return
+                if now - getattr(self, "_anti_kick_spawn_stable_ts", 0.0) < ANTI_KICK_SPAWN_STABLE_SEC:
+                    return
+            if now - getattr(self, "_anti_kick_bridge_last_attempt", 0.0) >= 2.0:
+                self._anti_kick_bridge_last_attempt = now
+                self._schedule_anti_kick_bridge_sync(want, config)
+
+        prev = self._trainer_watch
         if prev["world"] and not world:
             self._trainer_log(
                 "ANTI-KICK",
@@ -706,17 +756,27 @@ class TrainerMixin:
             )
         if prev["conn"] and not conn and world:
             blocks = int(getattr(self, "_anti_kick_log_seq", 0) or 0)
-            self._trainer_log(
-                "ANTI-KICK",
-                "NetConnection lost while world active — "
-                + (
-                    "no kick RPC was blocked this session; likely EOS/lobby disconnect or transport drop "
-                    "(anti-kick only blocks ProcessEvent RPCs, not platform session kicks)"
-                    if blocks <= 0
-                    else
+            blocked_n = int(getattr(self, "_anti_kick_blocked_count", 0) or 0)
+            if blocks <= 0:
+                if blocked_n <= 3:
+                    detail = (
+                        "no kick RPC was blocked — anti-kick had PARTIAL coverage "
+                        f"(only {blocked_n} RPC(s) hooked; NetConnection.Close was likely not hooked). "
+                        "Enable after spawning in and wait for auto-refresh, or toggle Anti-Kick off/on in match."
+                    )
+                else:
+                    detail = (
+                        "no kick RPC was blocked this session; likely EOS/lobby disconnect or transport drop "
+                        "(anti-kick only blocks ProcessEvent RPCs, not platform session kicks)"
+                    )
+            else:
+                detail = (
                     f"last blocked kick seq={blocks}; disconnect may have bypassed ClientWasKicked "
                     "(EOS/session drop or stale hook — restart game to reload bridge)"
-                ),
+                )
+            self._trainer_log(
+                "ANTI-KICK",
+                "NetConnection lost while world active — " + detail,
                 config=config,
                 level="error",
                 force=True,
@@ -727,6 +787,8 @@ class TrainerMixin:
         if want:
             self._anti_kick_watch_pc = pc
             self._anti_kick_watch_ps = ps
+            self._anti_kick_watch_conn = conn
+            self._anti_kick_watch_pawn = pawn
         if want and getattr(self, "_anti_kick_bridge_state", False):
             self._poll_anti_kick_log(config)
 
@@ -802,9 +864,14 @@ class TrainerMixin:
             self._anti_kick_bridge_state = bool(enabled)
             meta = resp.get("metadata") or {}
             blocked = meta.get("blocked_functions", "?")
+            try:
+                self._anti_kick_blocked_count = int(blocked)
+            except (TypeError, ValueError):
+                self._anti_kick_blocked_count = 0
             hook_mode = meta.get("hook_mode") or ("chained" if meta.get("hook_chained") else "inline")
             monitored = meta.get("monitored_functions") or []
             net_conn = meta.get("net_connection")
+            player_state = meta.get("player_state")
             extra = f" [{hook_mode}]" if hook_mode else ""
             msg = f"{'enabled' if enabled else 'disabled'} via bridge (blocked RPCs={blocked}{extra})"
             if enabled and net_conn and net_conn not in ("0x0", "0"):
@@ -815,7 +882,11 @@ class TrainerMixin:
                     preview += f", +{len(monitored) - 8} more"
                 msg += f" — watching: {preview}"
                 msg += " — log: C:\\peterhack\\logs\\anti_kick.log"
-            self._trainer_log("ANTI-KICK", msg, config=config, force=True)
+            prev_reported = getattr(self, "_anti_kick_reported_blocked", None)
+            if not enabled or prev_reported != self._anti_kick_blocked_count:
+                if enabled:
+                    self._anti_kick_reported_blocked = self._anti_kick_blocked_count
+                self._trainer_log("ANTI-KICK", msg, config=config, force=True)
             if enabled and not getattr(self, "_anti_kick_bridge_state", False):
                 self._anti_kick_log_seq = 0
         else:
@@ -839,7 +910,7 @@ class TrainerMixin:
     # ------------------------------------------------------------------
     # Autokick / blocklist (Redpoint KickPlayerController when host)
     # ------------------------------------------------------------------
-    RVA_PROCESS_EVENT = 0x15D0BC0
+    RVA_PROCESS_EVENT = 0x15D0B80
     AUTOKICK_COOLDOWN_SEC = 12.0
     AUTOKICK_LEAVE_COOLDOWN_SEC = 45.0
 
@@ -1268,7 +1339,7 @@ class TrainerMixin:
                     self._trainer_magnet_key_toggle(config)
                     if self._magnet_active:
                         pawn = self._find_local_pawn()
-                        if pawn:
+                        if pawn and self._trainer_is_playable_pawn(pawn):
                             self._trainer_magnet(pawn, config)
             except Exception as exc:
                 self._trainer_error("MAGNET", exc, config)
@@ -1297,13 +1368,42 @@ class TrainerMixin:
             return
 
         pawn = self._find_local_pawn()
+        playable = self._trainer_is_playable_pawn(pawn)
+        prev_playable = getattr(self, "_trainer_last_playable_pawn", 0)
+        if prev_playable and (not pawn or pawn != prev_playable) and self._trainer_anticlip_saved is not None:
+            self._trainer_anti_clipping(0, config, False)
+        if playable:
+            self._trainer_last_playable_pawn = pawn
+        elif not pawn:
+            self._trainer_last_playable_pawn = 0
+
         if camo_noclip_hold:
-            if pawn and self._trainer_anticlip_saved is None:
+            if playable and self._trainer_anticlip_saved is None:
                 self._trainer_anti_clipping(pawn, config, True)
         elif config.trainer_anti_clipping:
-            self._trainer_anti_clipping(pawn, config, True)
+            if playable:
+                self._trainer_anti_clipping(pawn, config, True)
+            elif self._trainer_anticlip_saved is not None:
+                self._trainer_anti_clipping(pawn, config, False)
         elif self._trainer_anticlip_saved is not None:
             self._trainer_anti_clipping(pawn, config, False)
+
+        if not playable:
+            if pawn and self._trainer_tick_count % 120 == 1:
+                cls = self.objects.class_name(pawn) or "?"
+                self._trainer_log(
+                    "TICK",
+                    f"spectate/non-playable pawn ({cls}) — trainer memory writes paused",
+                    config=config,
+                    level="debug",
+                )
+            if config.trainer_auto_rename:
+                self._trainer_auto_rename(0, config)
+            if config.trainer_anti_kick:
+                self._trainer_anti_kick(config)
+            if getattr(config, "autokick_enabled", False):
+                self._trainer_autokick(config)
+            return
 
         if not pawn:
             if self._trainer_tick_count % 180 == 1:

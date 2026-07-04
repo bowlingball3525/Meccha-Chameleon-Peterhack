@@ -31,6 +31,21 @@ def _set_dpi_aware():
             pass
 
 
+def _enable_high_res_timers():
+    """1 ms Windows timer resolution so overlay FPS slider can go above ~64."""
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+
+def _disable_high_res_timers():
+    try:
+        ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception:
+        pass
+
+
 def _enable_camouflage(config):
     """Camouflage is always on — no startup prompt."""
     config.camouflage_enabled = True
@@ -82,11 +97,20 @@ class GameWaitWindow(QWidget):
         print("[UI] game detected — hiding wait window", flush=True)
         self.hide()
 
+    def _stop_poll_timer(self):
+        timer = self._timer
+        self._timer = None
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+
     def finish(self):
-        """Remove wait window after the main UI is up."""
-        self._timer.stop()
+        """Hide wait window after the main UI is up (do not delete — avoids Qt timer teardown races)."""
+        self._stop_poll_timer()
         self.hide()
-        self.deleteLater()
 
     def _poll(self):
         if not MecchaESP.is_game_detected():
@@ -111,9 +135,12 @@ class GameWaitWindow(QWidget):
             print(f"[UI] game loading, retrying Peterhack connect: {err}", flush=True)
             return
 
-        self._timer.stop()
+        self._stop_poll_timer()
         if self._on_ready:
-            self._on_ready(esp)
+            cb = self._on_ready
+            self._on_ready = None
+            QTimer.singleShot(0, lambda: cb(esp))
+            return
 
 
 def _ensure_admin():
@@ -156,6 +183,7 @@ def main():
 
     setup_file_logging()
     _set_dpi_aware()
+    _enable_high_res_timers()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
@@ -188,18 +216,23 @@ def main():
         esp.start_bridge_preload()
         from meccha_chameleon_tools.webhook import bind_webhook_config
         bind_webhook_config(esp, config)
+        wait.finish()
         menu = Menu(config, esp)
         overlay = Overlay(esp, config, menu=menu)
         menu.attach_overlay(overlay)
         overlay.show()
         menu.show()
-        wait.finish()
 
     def _on_quit():
         save_config(config)
+        _disable_high_res_timers()
         if _esp_holder:
             try:
                 _esp_holder[0].stop_trainer_loop()
+            except Exception:
+                pass
+            try:
+                _esp_holder[0].stop_esp_snapshot_loop()
             except Exception:
                 pass
             try:

@@ -167,7 +167,10 @@ KEY_VK = {v: k for k, v in KEY_NAMES.items()}
 
 
 def vk_from_name(name):
-    return KEY_VK.get(name, 0x2D)  # default Insert
+    key = (name or "").strip()
+    if len(key) == 1 and key.isalpha():
+        key = key.upper()
+    return KEY_VK.get(key, 0x2D)  # default Insert
 
 
 def name_from_vk(vk):
@@ -196,6 +199,18 @@ def is_game_foreground(game_hwnd=0, *, exclude_hwnds=()):
         user32.GetWindowThreadProcessId(int(fg), ctypes.byref(pid_fg))
         user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid_game))
         return pid_fg.value != 0 and pid_fg.value == pid_game.value
+    except Exception:
+        return False
+
+
+def menu_text_input_focused():
+    """True when keyboard focus is in a Peterhack text field (rename, etc.)."""
+    try:
+        w = QApplication.focusWidget()
+        if w is None:
+            return False
+        from PyQt5.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox
+        return isinstance(w, (QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox))
     except Exception:
         return False
 
@@ -480,6 +495,9 @@ class Menu(QWidget):
     bridge_exploit_finished = pyqtSignal(bool, str)
     trainer_rename_finished = pyqtSignal(bool, str)
     update_check_failed = pyqtSignal(str)
+    players_steam_resolved = pyqtSignal(int, str)
+    stop_camo_finished = pyqtSignal(bool)
+    return_lobby_finished = pyqtSignal(bool, str)
 
     # Peter pants green sampled from logo — RGB(32, 96, 16)
     PETER_GREEN       = "#206010"
@@ -560,6 +578,9 @@ class Menu(QWidget):
         self.bridge_exploit_finished.connect(self._bridge_exploit_done, _queued)
         self.trainer_rename_finished.connect(self._trainer_rename_done, _queued)
         self.update_check_failed.connect(self._on_update_check_failed, _queued)
+        self.players_steam_resolved.connect(self._on_player_steam_resolved, _queued)
+        self.stop_camo_finished.connect(self._stop_camo_done, _queued)
+        self.return_lobby_finished.connect(self._return_to_lobby_done, _queued)
         self._paint_watchdog = QTimer(self)
         self._paint_watchdog.setSingleShot(True)
         self._paint_watchdog.timeout.connect(self._paint_watchdog_timeout)
@@ -581,6 +602,10 @@ class Menu(QWidget):
             self.esp.set_rename_notify(
                 lambda ok, msg: self.trainer_rename_finished.emit(ok, msg or "")
             )
+        self._peter_logo_poll_timer = QTimer(self)
+        self._peter_logo_poll_timer.timeout.connect(self._poll_peter_logo_ready)
+        self._peter_logo_fetch_done = None
+        self._peter_logo_fetch_result = None
         self._build_ui()
         self._player_list_timer = QTimer(self)
         self._player_list_timer.timeout.connect(self._refresh_players_tab)
@@ -640,7 +665,26 @@ class Menu(QWidget):
 
     def attach_overlay(self, overlay):
         self._overlay = overlay
+        self.esp._magnet_hotkey_allowed = self._magnet_hotkey_allowed
+        self.esp._magnet_poll_ui = True
         self._register_magnet_hotkey()
+        if self.isVisible():
+            self.esp._menu_ui_active = True
+            overlay._set_menu_ui_active(True)
+        # Overlay timer is configured in Overlay.__init__; slider release applies changes.
+
+    def _on_ui_overlay_fps_label(self, fps):
+        fps = max(1, min(240, int(fps)))
+        self.config.ui_overlay_fps = fps
+        if hasattr(self, "lbl_ui_overlay_fps"):
+            self.lbl_ui_overlay_fps.setText(f"{fps} FPS")
+
+    def _on_ui_overlay_fps_apply(self):
+        fps = max(1, min(240, int(self.sld_ui_overlay_fps.value())))
+        self.config.ui_overlay_fps = fps
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            overlay.request_set_fps(fps)
 
     def _camo_set_overlay_feedback(self, text, frames=60):
         if self._overlay:
@@ -759,7 +803,7 @@ class Menu(QWidget):
                 msg = "return_to_main_lobby unavailable — restart Peterhack"
         except Exception as exc:
             msg = str(exc)
-        QTimer.singleShot(0, lambda: self._return_to_lobby_done(ok, msg))
+        self.return_lobby_finished.emit(ok, msg or "")
 
     def _return_to_lobby_done(self, ok, msg):
         self._return_lobby_busy = False
@@ -851,7 +895,7 @@ class Menu(QWidget):
 
     def _stop_camo_worker(self):
         ok = self.esp.camo_stop()
-        QTimer.singleShot(0, lambda: self._stop_camo_done(ok))
+        self.stop_camo_finished.emit(bool(ok))
 
     def _stop_camo_done(self, ok):
         self._camo_busy = False
@@ -886,28 +930,10 @@ class Menu(QWidget):
         self._register_magnet_hotkey()
 
     def _register_magnet_hotkey(self):
-        """Register magnet toggle globally so it fires while the game has focus."""
-        hwnd = int(self.winId()) if self.winId() else 0
-        if not hwnd:
-            return
-        vk = vk_from_name(getattr(self.config, "trainer_magnet_key", "G"))
-        if self._magnet_hotkey_registered and self._magnet_hotkey_vk == vk:
-            return
+        """Magnet uses GetAsyncKeyState polling (not RegisterHotKey — Qt eats plain keys)."""
         self._unregister_magnet_hotkey()
-        user32 = ctypes.windll.user32
-        ok = bool(user32.RegisterHotKey(hwnd, HK_MAGNET, MOD_NOREPEAT, vk))
-        self._magnet_hotkey_registered = ok
-        self._magnet_hotkey_vk = vk if ok else 0
         if hasattr(self, "esp") and self.esp is not None:
-            self.esp._magnet_hotkey_native = ok
-        print(
-            f"[UI] magnet hotkey {getattr(self.config, 'trainer_magnet_key', 'G')} "
-            f"registered={ok} hwnd=0x{hwnd:X}",
-            flush=True,
-        )
-        if not ok:
-            err = ctypes.windll.kernel32.GetLastError()
-            print(f"[UI] RegisterHotKey magnet err={err}", flush=True)
+            self.esp._magnet_hotkey_native = False
 
     def _unregister_magnet_hotkey(self):
         hwnd = int(self.winId()) if self.winId() else 0
@@ -936,21 +962,50 @@ class Menu(QWidget):
             return overlay.game_hwnd
         return MecchaESP._find_game_window_hwnd()
 
-    def _on_magnet_hotkey(self):
-        if not is_game_foreground(
-            self._game_hwnd_for_input(),
-            exclude_hwnds=(int(self.winId()) if self.winId() else 0,),
-        ):
+    def _magnet_hotkey_allowed(self):
+        """Allow magnet in-game or while any Peterhack window is focused (not while typing)."""
+        if menu_text_input_focused():
+            return False
+        if is_game_foreground(self._game_hwnd_for_input()):
+            return True
+        try:
+            import os
+            user32 = ctypes.windll.user32
+            fg = user32.GetForegroundWindow()
+            if not fg:
+                return False
+            pid_fg = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(int(fg), ctypes.byref(pid_fg))
+            return pid_fg.value != 0 and pid_fg.value == os.getpid()
+        except Exception:
+            return False
+
+    def _try_magnet_key_toggle(self):
+        """Edge-triggered magnet toggle from physical key state (works outside Qt text input)."""
+        if not self._magnet_hotkey_allowed():
+            vk = vk_from_name(getattr(self.config, "trainer_magnet_key", "G"))
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+            if hasattr(self.esp, "_magnet_key_was_down"):
+                self.esp._magnet_key_was_down = down
             return
-        if hasattr(self.esp, "toggle_magnet"):
+        vk = vk_from_name(getattr(self.config, "trainer_magnet_key", "G"))
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+        was_down = bool(getattr(self.esp, "_magnet_key_was_down", False))
+        if down and not was_down and hasattr(self.esp, "toggle_magnet"):
             self.esp.toggle_magnet(self.config)
-        self._update_magnet_status_label()
+            self._update_magnet_status_label()
+        if hasattr(self.esp, "_magnet_key_was_down"):
+            self.esp._magnet_key_was_down = down
 
     def _toggle_menu_visibility(self):
-        self.setVisible(not self.isVisible())
-        if self.isVisible():
+        visible = not self.isVisible()
+        self.setVisible(visible)
+        if visible:
             self.raise_()
             self.activateWindow()
+        self.esp._menu_ui_active = visible
+        if self._overlay:
+            self._overlay._set_menu_ui_active(visible)
 
     def _toggle_esp(self):
         self.config.enabled = not self.config.enabled
@@ -996,9 +1051,6 @@ class Menu(QWidget):
                 if msg.wParam in (HK_MENU_INSERT, HK_MENU_F1):
                     self._toggle_menu_visibility()
                     return True, 0
-                if msg.wParam == HK_MAGNET:
-                    self._on_magnet_hotkey()
-                    return True, 0
         return super().nativeEvent(eventType, message)
 
     # ------------------------------------------------------------------
@@ -1012,8 +1064,11 @@ class Menu(QWidget):
     def _start_peter_logo_fetch(self):
         """Download the Peter logo in a background thread; apply on main thread."""
         import threading as _threading
-        _result = [None]
-        _done = _threading.Event()
+
+        self._peter_logo_fetch_result = [None]
+        self._peter_logo_fetch_done = _threading.Event()
+        done = self._peter_logo_fetch_done
+        result = self._peter_logo_fetch_result
 
         def _fetch():
             try:
@@ -1029,35 +1084,31 @@ class Menu(QWidget):
                     },
                 )
                 with _ur.urlopen(req, timeout=10) as r:
-                    _result[0] = r.read()
+                    result[0] = r.read()
             except Exception as exc:
                 print(f"[UI] Peter logo fetch failed: {exc}")
-            _done.set()
+            done.set()
 
         _threading.Thread(target=_fetch, daemon=True).start()
+        self._peter_logo_poll_timer.start(200)
 
-        # Poll every 200 ms on the main thread; apply once the data arrives.
-        _timer = QTimer(self)
-        _timer.setSingleShot(False)
-
-        def _check():
-            if not _done.is_set():
-                return
-            _timer.stop()
-            data = _result[0]
-            if not data:
-                return
-            from PyQt5.QtCore import QByteArray
-            from PyQt5.QtGui import QPixmap
-            pix = QPixmap()
-            if pix.loadFromData(QByteArray(data)) and not pix.isNull():
-                # Scale up to fill the logo slot; transparent PNG can bleed slightly.
-                self._peter_lbl.setPixmap(
-                    pix.scaled(96, 96, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-                )
-
-        _timer.timeout.connect(_check)
-        _timer.start(200)
+    def _poll_peter_logo_ready(self):
+        done = getattr(self, "_peter_logo_fetch_done", None)
+        if done is None or not done.is_set():
+            return
+        self._peter_logo_poll_timer.stop()
+        data = (getattr(self, "_peter_logo_fetch_result", None) or [None])[0]
+        self._peter_logo_fetch_done = None
+        self._peter_logo_fetch_result = None
+        if not data:
+            return
+        from PyQt5.QtCore import QByteArray
+        from PyQt5.QtGui import QPixmap
+        pix = QPixmap()
+        if pix.loadFromData(QByteArray(data)) and not pix.isNull():
+            self._peter_lbl.setPixmap(
+                pix.scaled(96, 96, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            )
 
     # ------------------------------------------------------------------
 
@@ -1168,14 +1219,14 @@ class Menu(QWidget):
             QScrollBar:vertical {{ width: 0px; }}
             QScrollBar:horizontal {{ height: 0px; }}
         """)
-        self.tab_list.addItems(["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","CHANGELOG"])
+        self.tab_list.addItems(["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG"])
         self.tab_list.currentRowChanged.connect(self._switch_tab)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background: transparent;")
 
         self._pages = {}
-        for tab_name in ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","CHANGELOG"]:
+        for tab_name in ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG"]:
             page = QWidget()
             page.setStyleSheet("background: transparent;")
             self._pages[tab_name] = page
@@ -1230,20 +1281,27 @@ class Menu(QWidget):
         self._build_aimbot_tab()
         self._build_trainer_tab()
         self._build_camouflage_tab()
+        self._build_misc_tab()
         self._build_changelog_tab()
 
     def _switch_tab(self, idx):
-        names = ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","CHANGELOG"]
+        names = ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG"]
         if 0 <= idx < len(names):
             self.stack.setCurrentIndex(idx)
-            if names[idx] == "PLAYERS":
-                self._update_steam_features_active()
-                self._refresh_players_tab()
-                if not self._player_list_timer.isActive():
-                    self._player_list_timer.start(5000)
-            else:
+            # Defer timer/tab work so stack layout cannot re-enter the event loop mid-switch.
+            tab_name = names[idx]
+            QTimer.singleShot(0, lambda n=tab_name: self._after_tab_switch(n))
+
+    def _after_tab_switch(self, tab_name):
+        if tab_name == "PLAYERS":
+            self._update_steam_features_active()
+            self._refresh_players_tab()
+            if not self._player_list_timer.isActive():
+                self._player_list_timer.start(5000)
+        else:
+            if self._player_list_timer.isActive():
                 self._player_list_timer.stop()
-                self._update_steam_features_active()
+            self._update_steam_features_active()
 
     def _build_visuals_tab(self):
         p = self._pages["VISUALS"]
@@ -1569,36 +1627,54 @@ class Menu(QWidget):
         self._schedule_players_steam_resolve()
 
     def _schedule_players_steam_resolve(self):
-        """Resolve one Steam ID per tick so the menu/overlay stay responsive."""
+        """Resolve one Steam ID per tick on a worker thread (never block Qt)."""
         if getattr(self, "_players_steam_resolve_pending", False):
             return
         if self._pages.get("PLAYERS") is not self.stack.currentWidget():
             return
+        thread = getattr(self, "_players_steam_resolve_thread", None)
+        if thread and thread.is_alive():
+            return
         self._players_steam_resolve_pending = True
-        QTimer.singleShot(150, self._resolve_next_player_steam_id)
+        self._players_steam_resolve_thread = threading.Thread(
+            target=self._resolve_next_player_steam_id_worker,
+            daemon=True,
+            name="players-steam-resolve",
+        )
+        self._players_steam_resolve_thread.start()
 
-    def _resolve_next_player_steam_id(self):
-        self._players_steam_resolve_pending = False
+    def _resolve_next_player_steam_id_worker(self):
+        row = -1
+        sid = ""
+        try:
+            rows = getattr(self, "_player_rows", [])
+            for i, pdata in enumerate(rows):
+                if (pdata.get("steam_id") or "").strip():
+                    continue
+                ps = pdata.get("player_state", 0)
+                if not ps:
+                    continue
+                row = i
+                sid = self.esp._bridge_resolve_steam_id(ps, timeout=4)
+                if not sid:
+                    sid = self.esp.get_player_steam_id(ps, force=False)
+                if sid:
+                    pdata["steam_id"] = sid
+                break
+        finally:
+            self._players_steam_resolve_pending = False
+        self.players_steam_resolved.emit(row, sid or "")
+
+    def _on_player_steam_resolved(self, row, sid):
         if self._pages.get("PLAYERS") is not self.stack.currentWidget():
             return
-        rows = getattr(self, "_player_rows", [])
-        for row, pdata in enumerate(rows):
-            if (pdata.get("steam_id") or "").strip():
-                continue
-            ps = pdata.get("player_state", 0)
-            if not ps:
-                continue
-            sid = self.esp._bridge_resolve_steam_id(ps, timeout=4)
-            if not sid:
-                sid = self.esp.get_player_steam_id(ps, force=False)
+        if row >= 0:
             if sid:
-                pdata["steam_id"] = sid
                 item = self.tbl_players.item(row, 2)
                 if item:
                     item.setText(sid)
                 self._players_tab_sig = None
-            self._schedule_players_steam_resolve()
-            return
+            QTimer.singleShot(150, self._schedule_players_steam_resolve)
 
     def _kill_selected_survivor(self):
         pdata = self._selected_player_row()
@@ -1785,7 +1861,8 @@ class Menu(QWidget):
         self.lbl_magnet_key = QLabel("Magnet toggle key: " + getattr(self.config, "trainer_magnet_key", "G"))
         self.btn_record_magnet_key = QPushButton("Record Key")
         self.btn_record_magnet_key.setToolTip(
-            "Press the key to toggle survivor magnet (default G). Works while the game has focus."
+            "Press the key to toggle survivor magnet (default G). "
+            "Works in-game and while the Peterhack menu is focused (not while typing in a text box)."
         )
         self.btn_record_magnet_key.clicked.connect(self._start_magnet_key_record)
         magnet_row.addWidget(self.lbl_magnet_key)
@@ -1798,13 +1875,11 @@ class Menu(QWidget):
         lo.addWidget(self._chk("Anti-Clipping (noclip)", "trainer_anti_clipping"))
         cb_anti_kick = self._chk("Anti-Kick", "trainer_anti_kick")
         cb_anti_kick.setToolTip(
-            "Blocks host kick RPCs via bridge (ClientWasKicked, return-to-menu, Kick, etc.).\n"
-            "Auto-scans PlayerController/PlayerState for kick/ban/disconnect RPCs.\n"
-            "Blocked kicks are logged to C:\\peterhack\\logs\\anti_kick.log and latest.log.\n"
-            "Each entry includes the host's username when available.\n"
-            "Requires bridge injected. Chains with UE4SS when detected.\n"
-            "If enable crashes the game, toggle off, fully quit/relaunch, then retry.\n"
-            "EOS/platform-level kicks may still disconnect you."
+            "Blocks host kick RPCs on your PlayerController (ClientWasKicked, return-to-menu, etc.).\n"
+            "If enabled before a match: waits until you spawn in + 5s stable before hooking (prevents crashes).\n"
+            "Safest: join match first, spawn in, then toggle Anti-Kick on.\n"
+            "Blocked kicks logged to C:\\peterhack\\logs\\anti_kick.log.\n"
+            "EOS/platform session kicks may still disconnect you."
         )
         lo.addWidget(cb_anti_kick)
 
@@ -2325,6 +2400,48 @@ class Menu(QWidget):
         threading.Thread(target=_thread_main, daemon=True).start()
 
     # -------------------------------------------------------------------------
+    def _build_misc_tab(self):
+        p = self._pages["MISC"]
+        lo = QVBoxLayout(p)
+        lo.setContentsMargins(4, 4, 4, 4)
+        lo.setSpacing(4)
+
+        lo.addWidget(QLabel("UI / Overlay"))
+        info = QLabel(
+            "Overlay refresh rate when the menu is hidden (1–240). While this menu\n"
+            "is open, overlay draw is capped at 30 FPS so the UI stays responsive.\n"
+            "Drag the slider, release to apply. OVL shows actual/saved fps."
+        )
+        info.setStyleSheet("color: #7a9a6a; font-size: 10px;")
+        info.setWordWrap(True)
+        lo.addWidget(info)
+
+        fps_row = QHBoxLayout()
+        fps_row.addWidget(QLabel("Overlay FPS:"))
+        self.sld_ui_overlay_fps = QSlider(Qt.Horizontal)
+        self.sld_ui_overlay_fps.setRange(1, 240)
+        init_fps = max(1, min(240, int(getattr(self.config, "ui_overlay_fps", 60))))
+        self.sld_ui_overlay_fps.blockSignals(True)
+        self.sld_ui_overlay_fps.setValue(init_fps)
+        self.sld_ui_overlay_fps.blockSignals(False)
+        self.config.ui_overlay_fps = init_fps
+        self.sld_ui_overlay_fps.setTickPosition(QSlider.TicksBelow)
+        self.sld_ui_overlay_fps.setTickInterval(30)
+        self.sld_ui_overlay_fps.setToolTip(
+            "Overlay repaint rate (1–240 FPS). Release mouse to apply."
+        )
+        self.sld_ui_overlay_fps.valueChanged.connect(self._on_ui_overlay_fps_label)
+        self.sld_ui_overlay_fps.sliderReleased.connect(self._on_ui_overlay_fps_apply)
+        fps_row.addWidget(self.sld_ui_overlay_fps)
+        self.lbl_ui_overlay_fps = QLabel(f"{init_fps} FPS")
+        self.lbl_ui_overlay_fps.setStyleSheet(
+            "color: #8ab870; font-size: 10px; min-width: 56px;"
+        )
+        fps_row.addWidget(self.lbl_ui_overlay_fps)
+        lo.addLayout(fps_row)
+
+        lo.addStretch()
+
     def _build_changelog_tab(self):
         from PyQt5.QtWidgets import QTextEdit
         p = self._pages["CHANGELOG"]
@@ -2394,7 +2511,7 @@ class Menu(QWidget):
             "--- Latest ---\n"
             "\n"
             "[ESP alignment + skeleton]\n"
-            "  + Dot ESP anchored at neck; skeleton uses Chameleon bone map.\n"
+            "  + Dot ESP anchored at chest; skeleton uses Chameleon bone map.\n"
             "  + Camera POV stale detection + aspect-correct world_to_screen.\n"
             "  + esp_screen_y_offset in esp_config.json (default 28px down).\n"
             "\n"
@@ -3111,11 +3228,16 @@ class Menu(QWidget):
 # Overlay widget
 # ---------------------------------------------------------------------------
 class Overlay(QWidget):
+    fps_apply_requested = pyqtSignal(int)
+    # Keep the menu event loop responsive while it is on screen.
+    MENU_OPEN_OVERLAY_FPS_CAP = 30
+
     def __init__(self, esp: MecchaESP, config: Config, menu=None):
         super().__init__()
         self.esp = esp
         self.config = config
         self.menu = menu
+        self.fps_apply_requested.connect(self._apply_overlay_fps, Qt.QueuedConnection)
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
@@ -3149,10 +3271,14 @@ class Overlay(QWidget):
         # Game FPS tracker — 500 Hz background thread counts camera ticks/sec
         self._game_fps_info = self.esp.start_fps_tracker()
         self.esp.start_trainer_loop(lambda: self.config)
+        # Defer heavy ESP reads so the menu can paint/respond first.
+        QTimer.singleShot(800, lambda: self.esp.start_esp_snapshot_loop(lambda: self.config))
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_overlay)
-        self.timer.start(16)
+        self._target_overlay_fps = max(1, min(240, int(getattr(self.config, "ui_overlay_fps", 60))))
+        self._overlay_interval_applied_ms = None
+        self._apply_overlay_fps(self._target_overlay_fps)
 
         self.game_hwnd = self._find_game_window()
         self._resize_to_game()
@@ -3327,9 +3453,70 @@ class Overlay(QWidget):
                 self._last_geom = (0, 0, 1920, 1080)
                 self.setGeometry(0, 0, 1920, 1080)
 
+    @staticmethod
+    def _overlay_interval_ms(fps: int) -> int:
+        fps = max(1, min(240, int(fps)))
+        return max(1, int(round(1000.0 / fps)))
+
+    def request_set_fps(self, fps: int):
+        """Queue an overlay timer update on the Qt UI thread."""
+        self.fps_apply_requested.emit(int(fps))
+
+    def _apply_overlay_fps(self, fps: int):
+        """Store user overlay cap and apply the effective timer interval."""
+        fps = max(1, min(240, int(fps)))
+        self.config.ui_overlay_fps = fps
+        self._target_overlay_fps = fps
+        self._sync_overlay_timer_interval()
+
+    def _effective_overlay_fps(self) -> int:
+        target = max(1, min(240, int(getattr(self, "_target_overlay_fps", 60))))
+        if getattr(self.esp, "_menu_ui_active", False):
+            return min(target, self.MENU_OPEN_OVERLAY_FPS_CAP)
+        return target
+
+    def _sync_overlay_timer_interval(self):
+        """Apply overlay repaint interval (menu open uses a lower cap)."""
+        effective = self._effective_overlay_fps()
+        ms = self._overlay_interval_ms(effective)
+        prev_ms = getattr(self, "_overlay_interval_applied_ms", None)
+        timer = getattr(self, "timer", None)
+        if prev_ms == ms and timer is not None and timer.isActive():
+            return
+        self._overlay_interval_applied_ms = ms
+        if timer is None:
+            return
+        try:
+            timer.setTimerType(Qt.PreciseTimer)
+        except Exception:
+            pass
+        timer.setInterval(ms)
+        if not timer.isActive():
+            timer.start()
+        target = int(getattr(self, "_target_overlay_fps", effective))
+        if effective < target:
+            print(
+                f"[UI] overlay timer {effective} FPS ({ms} ms) — menu open (saved {target} FPS)",
+                flush=True,
+            )
+        else:
+            print(f"[UI] overlay timer {effective} FPS ({ms} ms)", flush=True)
+
+    def set_ui_overlay_fps(self, fps: int):
+        self.request_set_fps(fps)
+
+    def apply_overlay_fps(self):
+        self.request_set_fps(getattr(self.config, "ui_overlay_fps", 60))
+
+    def _set_menu_ui_active(self, active: bool):
+        """Track menu visibility; throttle overlay + ESP snapshot while menu is open."""
+        self.esp._menu_ui_active = bool(active)
+        self._sync_overlay_timer_interval()
+
     def update_overlay(self):
         import time as _time
         now = _time.monotonic()
+        self.esp._overlay_screen_geom = (max(1, self.width()), max(1, self.height()))
         self._fps_times.append(now)
         # Keep only timestamps within the last second
         cutoff = now - 1.0
@@ -3386,6 +3573,9 @@ class Overlay(QWidget):
 
         if not self.game_hwnd:
             self.game_hwnd = self._find_game_window()
+
+        if menu and hasattr(menu, "_try_magnet_key_toggle"):
+            menu._try_magnet_key_toggle()
 
         if menu:
             now_ms = int(time.time() * 1000)
@@ -4189,9 +4379,10 @@ class Overlay(QWidget):
             painter.drawText(x, y, text)
             painter.restore()
 
-        cam = self.esp.get_camera()
-        # During free-cam / transitions get_camera may fail briefly.
-        # Fall back to the last valid camera so the overlay stays rendered.
+        snap = self.esp.get_esp_paint_snapshot() if hasattr(self.esp, "get_esp_paint_snapshot") else None
+        aim_target = snap.get("aim_target") if snap else None
+
+        cam = snap.get("cam") if snap else None
         if cam:
             self._last_cam = cam
         else:
@@ -4203,29 +4394,12 @@ class Overlay(QWidget):
 
         steam_active = self._overlay_steam_features_active()
         self.esp.set_steam_features_active(steam_active)
-        if steam_active:
-            try:
-                self.esp.refresh_steam_ids_lazy()
-            except Exception as exc:
-                print(f"[ESP] steam lazy error: {exc}", flush=True)
 
         if not self.config.enabled:
             _draw_label(painter, 10, 20, "ESP OFF", QColor(200, 200, 200))
         else:
-            # Player list from core.get_players() — living players only; cache clears on leave/end.
-            all_players = self.esp.get_players(
-                include_local=self.config.show_local,
-                team_filter=self.config.team_filter,
-                enemy_only=self.config.enemy_only,
-            )
-
-            # Get local player position for radar
-            local_pos = None
-            if all_players:
-                for p in all_players:
-                    if p["is_local"]:
-                        local_pos = p["pos"]
-                        break
+            all_players = list((snap or {}).get("players") or [])
+            local_pos = (snap or {}).get("local_pos")
 
             # Draw each player — wrapped so one bad player never kills the whole frame
             for pdata in all_players:
@@ -4256,7 +4430,7 @@ class Overlay(QWidget):
                     steam_id = (pdata.get("steam_id") or "").strip()
                     blocked = self.esp.is_blocked_steam_id(steam_id)
                     if self.config.enemy_only:
-                        visible = self.esp._is_visible(actor)
+                        visible = pdata.get("visible")
                         base_color = (
                             self.config.visible_color if visible
                             else self.config.not_visible_color
@@ -4316,12 +4490,9 @@ class Overlay(QWidget):
                         d_m = int(d / 100.0)
                         oof_parts.append(f"{d_m}m")
                     if self.config.oof_show_health and actor:
-                        try:
-                            health_info = self.esp.get_health(actor, ps)
-                            if health_info and health_info[0] is not None:
-                                oof_parts.append(f"{int(health_info[0])} HP")
-                        except Exception:
-                            pass
+                        health_info = pdata.get("health_info")
+                        if health_info and health_info[0] is not None:
+                            oof_parts.append(f"{int(health_info[0])} HP")
                     if oof_parts:
                         _draw_label(painter, int(ex + ux * 14), int(ey + uy * 14),
                                     " | ".join(oof_parts), QColor(*color))
@@ -4339,7 +4510,7 @@ class Overlay(QWidget):
                     self._draw_dot(painter, dsx, dsy, max(2, radius), color)
 
                 # 2D Box ESP
-                rot = self.esp.get_actor_root_rotation(actor) if actor else None
+                rot = pdata.get("rot")
                 hw = self.config.box_height_world / 3.0
                 if self.config.box_esp and not self.config.corner_box:
                     draw_2d_box(painter, pos, cam, w, h,
@@ -4351,10 +4522,7 @@ class Overlay(QWidget):
                 # Skeleton ESP — isolated so bone-read failures never affect dot/box/labels
                 if self.config.skeleton_esp and actor and not is_local:
                     try:
-                        bones = self.esp.get_skeleton_positions(actor)
-                        if not bones:
-                            bones = self.esp.get_skeleton_positions_by_indices(
-                                actor, self.config.bone_indices)
+                        bones = pdata.get("bones")
                         if bones:
                             draw_skeleton(
                                 painter, bones, cam, w, h, self.config.skeleton_color)
@@ -4363,7 +4531,7 @@ class Overlay(QWidget):
 
                 # Health / Shield bars
                 if self.config.health_bar or self.config.shield_bar:
-                    health_info = self.esp.get_health(actor, ps)
+                    health_info = pdata.get("health_info")
                     if health_info and health_info[0] is not None:
                         hp, sh = health_info
                         bar_x = dsx - 12 * scale
@@ -4436,8 +4604,10 @@ class Overlay(QWidget):
                            self.config.radar_size, self.config.radar_range,
                            self.config.radar_color, self.config.radar_opacity)
 
-        # FPS counters — overlay (timer-derived) + in-game (500 Hz camera tracker)
-        overlay_fps = round(1000 / max(1, self.timer.interval()))
+        # FPS counters — configured cap + measured paint rate + in-game FPS
+        target_fps = int(getattr(self, "_target_overlay_fps", 0) or getattr(self.config, "ui_overlay_fps", 60))
+        overlay_fps = self._current_fps
+        timer_ms = max(1, self.timer.interval())
         game_fps    = self._game_fps_info.get("game_fps", 0)
 
         if self._paint_throttle:
@@ -4457,7 +4627,11 @@ class Overlay(QWidget):
                 else QColor(255, 80, 80)
             ) if game_fps > 0 else QColor(150, 150, 150)
 
-            _draw_label(painter, 10, 40, f"OVL: {overlay_fps}fps", ovl_color)
+            _draw_label(
+                painter, 10, 40,
+                f"OVL: {overlay_fps}/{target_fps}fps ({timer_ms}ms)",
+                ovl_color,
+            )
             game_label = f"GAME: {game_fps}fps" if game_fps > 0 else "GAME: --"
             _draw_label(painter, 10, 57, game_label, game_color)
 
@@ -4486,9 +4660,9 @@ class Overlay(QWidget):
                     self.config.aimbot_fov * 2,
                     self.config.aimbot_fov * 2,
                 )
-            best_target = self._find_best_target(cam, w, h)
+            best_target = aim_target
             if best_target and self._aim_key_held():
-                self._aim_at(best_target)
+                self._aim_at(best_target, cam)
 
     def _draw_dot(self, painter, cx, cy, r, color):
         painter.setPen(Qt.NoPen)
@@ -4503,6 +4677,9 @@ class Overlay(QWidget):
         return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
     def _find_best_target(self, camera, screen_w, screen_h):
+        snap = self.esp.get_esp_paint_snapshot() if hasattr(self.esp, "get_esp_paint_snapshot") else None
+        if snap and snap.get("aim_target") is not None:
+            return snap.get("aim_target")
         world = self.esp._get_world()
         local_pc = self.esp._get_local_controller(world) if world else 0
         local_pawn = rp(self.esp.pm, local_pc + self.esp.offsets["APlayerController::AcknowledgedPawn"]) if local_pc else 0
@@ -4616,8 +4793,10 @@ class Overlay(QWidget):
         addr = pc + self.esp.offsets["AController::ControlRotation"]
         return wvec3(self.esp.pm, addr, rot)
 
-    def _aim_at(self, target_pos):
-        cam = self.esp.get_camera()
+    def _aim_at(self, target_pos, camera=None):
+        cam = camera or getattr(self, "_last_cam", None)
+        if not cam:
+            cam = self.esp.get_camera()
         if not cam:
             return
         current = self._read_control_rotation()
