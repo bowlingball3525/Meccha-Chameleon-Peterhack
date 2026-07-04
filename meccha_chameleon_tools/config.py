@@ -44,7 +44,6 @@ class Config:
     dot_radius: int = 8
     box_height_world: float = 100.0
     box_y_offset: int = 0
-    esp_screen_y_offset: int = 28  # extra pixels down on screen (positive = lower)
 
     # Distance scaling
     distance_scaling: bool = True
@@ -145,6 +144,7 @@ def config_from_dict(d: dict) -> Config:
     # Flatten bone_indices if stored as list of pairs
     if "bone_indices" in d and isinstance(d["bone_indices"], list):
         d["bone_indices"] = {k: v for k, v in d["bone_indices"]}
+    # Migrate renamed ESP fields from older configs.
     # Strip unknown keys so stale JSON fields never crash the dataclass constructor.
     valid = {f.name for f in dataclasses.fields(Config)}
     d = {k: v for k, v in d.items() if k in valid}

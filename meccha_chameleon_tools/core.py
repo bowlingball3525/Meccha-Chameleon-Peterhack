@@ -762,6 +762,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._camo_abort = False
         self._esp_snapshot_lock = threading.Lock()
         self._esp_paint_snapshot = None
+        self._esp_bone_indices = {}
         self._esp_snapshot_stop = None
         self._esp_snapshot_started = False
         self._menu_ui_active = False
@@ -980,32 +981,65 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return cam
         return last_cam if last_cam else None
 
-    def get_esp_world_pos(self, actor):
-        """World point for ESP — chest height (dot/name anchor)."""
+    def _esp_bone_index_map(self, config=None):
+        """Merge user/config bone indices with mesh-resolved names (config wins on ties)."""
+        bi = dict(self._CHAMELEON_BONE_INDICES)
+        stored = getattr(self, "_esp_bone_indices", None)
+        if stored:
+            bi.update(stored)
+        if config:
+            user = getattr(config, "bone_indices", None) or {}
+            bi.update(user)
+        return bi
+
+    @staticmethod
+    def _chest_world_pos_from_bones(bones):
+        """Lower sternum from spine bones — avoid spine_03/neck (reads too high)."""
+        if not bones:
+            return None
+        if "spine_01" in bones and "spine_02" in bones:
+            a, b = bones["spine_01"], bones["spine_02"]
+            return (
+                (a[0] + b[0]) / 2,
+                (a[1] + b[1]) / 2,
+                (a[2] + b[2]) / 2,
+            )
+        if "spine_02" in bones:
+            return bones["spine_02"]
+        if "pelvis" in bones and "spine_01" in bones:
+            a, b = bones["pelvis"], bones["spine_01"]
+            t = 0.55
+            return (
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            )
+        for key in ("spine_01", "pelvis"):
+            if key in bones:
+                return bones[key]
+        return None
+
+    def get_esp_world_pos(self, actor, config=None):
+        """World point for dot ESP — chest height (uses config bone_indices, not legacy 1–6 map)."""
         if not actor:
             return None
+        if config is None:
+            config = getattr(self, "config", None)
         chest = None
         try:
-            bi = self._CHAMELEON_BONE_INDICES
-            chest_map = self.get_skeleton_positions_by_indices(
-                actor,
-                {"spine_02": bi["spine_02"], "spine_03": bi["spine_03"]},
-            )
-            if chest_map:
-                if "spine_02" in chest_map and "spine_03" in chest_map:
-                    a, b = chest_map["spine_02"], chest_map["spine_03"]
-                    chest = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2)
-                elif "spine_02" in chest_map:
-                    chest = chest_map["spine_02"]
-                elif "spine_03" in chest_map:
-                    chest = chest_map["spine_03"]
-            if not chest:
-                bones = self.get_skeleton_positions(actor)
-                if bones:
-                    for key in ("spine_02", "spine_03", "neck_01"):
-                        if key in bones:
-                            chest = bones[key]
-                            break
+            bi = self._esp_bone_index_map(config)
+            mesh_comp = self.get_skeletal_mesh(actor)
+            if mesh_comp:
+                name_map = self._resolve_bone_indices(mesh_comp)
+                for bname in self.COMMON_BONE_NAMES:
+                    idx = name_map.get(bname)
+                    if idx is not None:
+                        bi[bname] = idx
+            chest_keys = ("pelvis", "spine_01", "spine_02")
+            chest_bones = {k: bi[k] for k in chest_keys if k in bi}
+            if chest_bones:
+                bones = self.get_skeleton_positions_by_indices(actor, chest_bones)
+                chest = self._chest_world_pos_from_bones(bones)
         except Exception:
             pass
         if chest and self._is_valid_world_loc(chest):
@@ -1013,7 +1047,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         root = self.get_actor_root_pos(actor)
         if not root:
             return None
-        return (root[0], root[1], root[2] + 60.0)
+        # Root is at feet — approximate sternum height for this game.
+        return (root[0], root[1], root[2] + 85.0)
 
     def get_viewport_size(self):
         """Return game client width/height in pixels."""
@@ -3409,6 +3444,25 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         _threading.Thread(target=_tracker, daemon=True).start()
         return fps_info
 
+    def _refresh_esp_snapshot_camera_only(self):
+        """Cheap camera read for overlay HUD / W2S while the menu is open."""
+        cam = self.get_camera()
+        if not cam:
+            return
+        with self._esp_snapshot_lock:
+            prev = self._esp_paint_snapshot
+            if prev:
+                snap = dict(prev)
+                snap["cam"] = cam
+            else:
+                snap = {
+                    "cam": cam,
+                    "players": [],
+                    "local_pos": None,
+                    "aim_target": None,
+                }
+            self._esp_paint_snapshot = snap
+
     def start_esp_snapshot_loop(self, config_getter):
         """Background ESP reads so Qt paint/menu never block on game memory."""
         if getattr(self, "_esp_snapshot_started", False):
@@ -3419,40 +3473,61 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         def _loop():
             import time as _time
 
+            last_full_snap = 0.0
+            PLAYER_SNAP_INTERVAL = 0.033  # ~30 Hz player positions
+
+            try:
+                self._refresh_esp_snapshot_camera_only()
+            except Exception:
+                pass
+
             while not self._esp_snapshot_stop.is_set():
                 menu_open = bool(getattr(self, "_menu_ui_active", False))
-                # Menu open: do not hammer pymem — reuse the last snapshot for overlay paint.
-                interval = 0.35 if menu_open else 0.10
                 try:
-                    if menu_open:
-                        self._esp_snapshot_stop.wait(interval)
-                        continue
                     cfg = config_getter()
-                    if cfg is None:
-                        self._esp_snapshot_stop.wait(interval)
-                        continue
-                    need_players = bool(
-                        getattr(cfg, "enabled", False)
-                        or getattr(cfg, "aimbot_enabled", False)
-                    )
-                    if need_players:
-                        snap = self._build_esp_paint_snapshot(cfg)
-                    else:
-                        snap = {
-                            "cam": self.get_camera(),
-                            "players": [],
-                            "local_pos": None,
-                            "aim_target": None,
-                        }
-                    with self._esp_snapshot_lock:
-                        self._esp_paint_snapshot = snap
+                except Exception:
+                    cfg = None
+                if cfg is not None:
+                    self._esp_bone_indices = getattr(cfg, "bone_indices", None) or {}
+                target_fps = max(
+                    1,
+                    min(240, int(getattr(cfg, "ui_overlay_fps", 60) if cfg else 60)),
+                )
+                if menu_open:
+                    wait_s = 1.0 / min(target_fps, 30)
+                else:
+                    wait_s = 1.0 / min(target_fps, 144)
+
+                try:
+                    self._refresh_esp_snapshot_camera_only()
+
+                    now = _time.monotonic()
+                    if not menu_open and cfg is not None:
+                        if (now - last_full_snap) >= PLAYER_SNAP_INTERVAL:
+                            last_full_snap = now
+                            need_players = bool(
+                                getattr(cfg, "enabled", False)
+                                or getattr(cfg, "aimbot_enabled", False)
+                            )
+                            if need_players:
+                                snap = self._build_esp_paint_snapshot(cfg)
+                            else:
+                                snap = {
+                                    "cam": self.get_camera(),
+                                    "players": [],
+                                    "local_pos": None,
+                                    "aim_target": None,
+                                }
+                            with self._esp_snapshot_lock:
+                                self._esp_paint_snapshot = snap
                 except Exception as exc:
                     now = _time.monotonic()
                     last = getattr(self, "_esp_snapshot_exc_ts", 0.0)
                     if now - last >= 5.0:
                         self._esp_snapshot_exc_ts = now
                         print(f"[ESP] snapshot error: {exc}", flush=True)
-                self._esp_snapshot_stop.wait(interval)
+
+                self._esp_snapshot_stop.wait(wait_s)
 
         threading.Thread(target=_loop, daemon=True, name="esp-snapshot").start()
 
@@ -3471,24 +3546,16 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         actor = pdata.get("actor")
         if actor:
             try:
-                bi = getattr(config, "bone_indices", None) or {}
+                bi = self._esp_bone_index_map(config)
                 chest_bones = {
-                    "spine_02": bi.get("spine_02", 36),
-                    "spine_03": bi.get("spine_03", 52),
+                    k: bi[k]
+                    for k in ("pelvis", "spine_01", "spine_02")
+                    if k in bi
                 }
                 bones = self.get_skeleton_positions_by_indices(actor, chest_bones)
-                if bones:
-                    if "spine_02" in bones and "spine_03" in bones:
-                        a, b = bones["spine_02"], bones["spine_03"]
-                        return (
-                            (a[0] + b[0]) / 2,
-                            (a[1] + b[1]) / 2,
-                            (a[2] + b[2]) / 2,
-                        )
-                    if "spine_02" in bones:
-                        return bones["spine_02"]
-                    if "spine_03" in bones:
-                        return bones["spine_03"]
+                chest = self._chest_world_pos_from_bones(bones)
+                if chest:
+                    return chest
             except Exception:
                 pass
         pos = pdata.get("pos")
@@ -3583,6 +3650,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             actor = pdata.get("actor")
             ps = pdata.get("player_state")
             is_local = pdata.get("is_local")
+            if actor:
+                chest = self.get_esp_world_pos(actor, config)
+                if chest:
+                    entry["pos"] = chest
             if want_boxes and actor:
                 entry["rot"] = self.get_actor_root_rotation(actor)
             if want_skeleton and actor and not is_local:

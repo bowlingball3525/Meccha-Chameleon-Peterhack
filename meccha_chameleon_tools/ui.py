@@ -563,6 +563,7 @@ class Menu(QWidget):
         self.config = config
         self.esp = esp
         self.esp.config = config
+        self.esp._esp_bone_indices = getattr(config, "bone_indices", None) or {}
         self.setWindowTitle("Peterhack | Meccha Chameleon")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -612,7 +613,7 @@ class Menu(QWidget):
         self._bridge_preload_timer = QTimer(self)
         self._bridge_preload_timer.timeout.connect(self._poll_bridge_preload)
         self._watch_bridge_preload()
-        self.setFixedSize(580, 820)
+        self.setFixedSize(580, 861)
 
     def _watch_bridge_preload(self):
         ok = getattr(self.esp, "_bridge_preload_ok", None)
@@ -668,16 +669,22 @@ class Menu(QWidget):
         self.esp._magnet_hotkey_allowed = self._magnet_hotkey_allowed
         self.esp._magnet_poll_ui = True
         self._register_magnet_hotkey()
-        if self.isVisible():
-            self.esp._menu_ui_active = True
+        # menu.show() runs immediately after attach_overlay in main(); treat as open.
+        self.esp._menu_ui_active = True
+        if overlay is not None:
             overlay._set_menu_ui_active(True)
-        # Overlay timer is configured in Overlay.__init__; slider release applies changes.
+            overlay._last_menu_visible = True
 
     def _on_ui_overlay_fps_label(self, fps):
         fps = max(1, min(240, int(fps)))
         self.config.ui_overlay_fps = fps
         if hasattr(self, "lbl_ui_overlay_fps"):
-            self.lbl_ui_overlay_fps.setText(f"{fps} FPS")
+            if self.isVisible() and fps > Overlay.MENU_OPEN_OVERLAY_FPS_CAP:
+                self.lbl_ui_overlay_fps.setText(
+                    f"{fps} FPS (≤{Overlay.MENU_OPEN_OVERLAY_FPS_CAP} while menu open)"
+                )
+            else:
+                self.lbl_ui_overlay_fps.setText(f"{fps} FPS")
 
     def _on_ui_overlay_fps_apply(self):
         fps = max(1, min(240, int(self.sld_ui_overlay_fps.value())))
@@ -770,16 +777,25 @@ class Menu(QWidget):
         )
 
     def _run_trainer_rename(self):
+        if getattr(self, "_trainer_rename_cooldown_active", False):
+            return
         name = self.txt_trainer_rename.text().strip()[:32]
         if not name:
             self.lbl_trainer_rename_status.setText("Enter a name first.")
             return
+        self._trainer_rename_cooldown_active = True
+        self.btn_trainer_rename.setEnabled(False)
+        QTimer.singleShot(1000, self._trainer_rename_cooldown_done)
         self.config.trainer_rename_text = name
         if hasattr(self.esp, "queue_trainer_rename"):
             self.esp.queue_trainer_rename(name, self.config, force=True)
             self.lbl_trainer_rename_status.setText(f"Queued '{name}'...")
         else:
             self.lbl_trainer_rename_status.setText("Rename unavailable — restart Peterhack.")
+
+    def _trainer_rename_cooldown_done(self):
+        self._trainer_rename_cooldown_active = False
+        self.btn_trainer_rename.setEnabled(True)
 
     def _run_return_to_lobby(self):
         if getattr(self, "_return_lobby_busy", False):
@@ -1005,6 +1021,7 @@ class Menu(QWidget):
             self.activateWindow()
         self.esp._menu_ui_active = visible
         if self._overlay:
+            self._overlay._last_menu_visible = visible
             self._overlay._set_menu_ui_active(visible)
 
     def _toggle_esp(self):
@@ -1038,6 +1055,11 @@ class Menu(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._register_global_hotkeys()
+        self.esp._menu_ui_active = True
+
+    def hideEvent(self, event):
+        self.esp._menu_ui_active = False
+        super().hideEvent(event)
 
     def closeEvent(self, event):
         self._unregister_global_hotkeys()
@@ -2408,9 +2430,9 @@ class Menu(QWidget):
 
         lo.addWidget(QLabel("UI / Overlay"))
         info = QLabel(
-            "Overlay refresh rate when the menu is hidden (1–240). While this menu\n"
-            "is open, overlay draw is capped at 30 FPS so the UI stays responsive.\n"
-            "Drag the slider, release to apply. OVL shows actual/saved fps."
+            "ESP overlay refresh when the menu is hidden (1–240). While this menu\n"
+            "is open, overlay draw is capped at 30 FPS (or lower if you set below 30)\n"
+            "so the menu stays responsive. Release the slider to apply."
         )
         info.setStyleSheet("color: #7a9a6a; font-size: 10px;")
         info.setWordWrap(True)
@@ -2513,7 +2535,7 @@ class Menu(QWidget):
             "[ESP alignment + skeleton]\n"
             "  + Dot ESP anchored at chest; skeleton uses Chameleon bone map.\n"
             "  + Camera POV stale detection + aspect-correct world_to_screen.\n"
-            "  + esp_screen_y_offset in esp_config.json (default 28px down).\n"
+            "  + Dot ESP on chest (bone W2S); labels share chest anchor.\n"
             "\n"
             "[Stability]\n"
             "  + Trainer loop off UI thread; async anti-kick bridge sync.\n"
@@ -3236,6 +3258,7 @@ class Overlay(QWidget):
         super().__init__()
         self.esp = esp
         self.config = config
+        self.esp._esp_bone_indices = getattr(config, "bone_indices", None) or {}
         self.menu = menu
         self.fps_apply_requested.connect(self._apply_overlay_fps, Qt.QueuedConnection)
         self.setWindowFlags(
@@ -3250,6 +3273,10 @@ class Overlay(QWidget):
         self._key_states = {}
         self._last_cam = None           # last-known-good camera; survives free-cam gaps
         self._last_geom = None          # skip setGeometry when unchanged (reduces flicker)
+        self._last_menu_visible = None
+        self._last_resize_check = 0.0
+        self._paint_cam_cache = None
+        self._paint_cam_ts = 0.0
         self._camouflage_active = False
         self._camouflage_color = None  # Tuple[int,int,int] when sampled
         self._camo_key_held = False    # legacy edge detect (unused)
@@ -3278,6 +3305,8 @@ class Overlay(QWidget):
         self.timer.timeout.connect(self.update_overlay)
         self._target_overlay_fps = max(1, min(240, int(getattr(self.config, "ui_overlay_fps", 60))))
         self._overlay_interval_applied_ms = None
+        if menu is not None:
+            self.esp._menu_ui_active = True
         self._apply_overlay_fps(self._target_overlay_fps)
 
         self.game_hwnd = self._find_game_window()
@@ -3469,9 +3498,15 @@ class Overlay(QWidget):
         self._target_overlay_fps = fps
         self._sync_overlay_timer_interval()
 
+    def _menu_is_open(self) -> bool:
+        menu = getattr(self, "menu", None)
+        if menu is not None:
+            return menu.isVisible()
+        return bool(getattr(self.esp, "_menu_ui_active", False))
+
     def _effective_overlay_fps(self) -> int:
         target = max(1, min(240, int(getattr(self, "_target_overlay_fps", 60))))
-        if getattr(self.esp, "_menu_ui_active", False):
+        if self._menu_is_open():
             return min(target, self.MENU_OPEN_OVERLAY_FPS_CAP)
         return target
 
@@ -3494,7 +3529,9 @@ class Overlay(QWidget):
         if not timer.isActive():
             timer.start()
         target = int(getattr(self, "_target_overlay_fps", effective))
-        if effective < target:
+        menu = getattr(self, "menu", None)
+        menu_open = effective < target
+        if menu_open:
             print(
                 f"[UI] overlay timer {effective} FPS ({ms} ms) — menu open (saved {target} FPS)",
                 flush=True,
@@ -3516,6 +3553,13 @@ class Overlay(QWidget):
     def update_overlay(self):
         import time as _time
         now = _time.monotonic()
+        menu = self.menu
+        if menu is not None:
+            visible = menu.isVisible()
+            if visible != self._last_menu_visible:
+                self._last_menu_visible = visible
+                self.esp._menu_ui_active = visible
+                self._sync_overlay_timer_interval()
         self.esp._overlay_screen_geom = (max(1, self.width()), max(1, self.height()))
         self._fps_times.append(now)
         # Keep only timestamps within the last second
@@ -3524,7 +3568,9 @@ class Overlay(QWidget):
             self._fps_times.pop(0)
         self._current_fps = len(self._fps_times)
 
-        self._resize_to_game()
+        if now - self._last_resize_check >= 0.15:
+            self._last_resize_check = now
+            self._resize_to_game()
         if not self._camo_sampling and not self.isVisible():
             self.setVisible(True)
             self.raise_()
@@ -4382,7 +4428,20 @@ class Overlay(QWidget):
         snap = self.esp.get_esp_paint_snapshot() if hasattr(self.esp, "get_esp_paint_snapshot") else None
         aim_target = snap.get("aim_target") if snap else None
 
-        cam = snap.get("cam") if snap else None
+        # Fresh camera while playing — throttled so high overlay FPS cannot starve Qt.
+        cam = None
+        if not getattr(self.esp, "_menu_ui_active", False):
+            import time as _time
+            now = _time.monotonic()
+            if now - getattr(self, "_paint_cam_ts", 0.0) >= (1.0 / 90.0):
+                try:
+                    self._paint_cam_cache = self.esp.get_camera()
+                    self._paint_cam_ts = now
+                except Exception:
+                    pass
+            cam = getattr(self, "_paint_cam_cache", None)
+        if not cam and snap:
+            cam = snap.get("cam")
         if cam:
             self._last_cam = cam
         else:
@@ -4417,10 +4476,20 @@ class Overlay(QWidget):
                     scale = self.config.scale_reference_dist / d
                     scale = max(0.3, min(scale, 3.0))
 
-                # Project center position — always returns (sx, sy, on_screen)
-                screen_center = w2s(pos, cam, w, h)
-                sx, sy, on_screen = screen_center
-                sy += self.config.box_y_offset
+                # Dot: chest bone world position → screen (no pixel offset — that drifts with distance).
+                dot_pos = pos
+                if actor:
+                    live_chest = self.esp.get_esp_world_pos(actor, self.config)
+                    if live_chest:
+                        dot_pos = live_chest
+                dot_sx, dot_sy, dot_on = w2s(dot_pos, cam, w, h)
+                dot_x, dot_y = dot_sx, dot_sy
+                if dot_on:
+                    dot_x, dot_y = clamp_screen(dot_x, dot_y, w, h)
+
+                chest_sx, chest_sy, on_screen = dot_sx, dot_sy, dot_on
+
+                sx, sy = chest_sx, chest_sy
 
                 if is_local:
                     color = self.config.local_color
@@ -4498,16 +4567,10 @@ class Overlay(QWidget):
                                     " | ".join(oof_parts), QColor(*color))
                     continue  # skip on-screen rendering for this player
 
-                # Clamped coords for on-screen elements (dots, bars, labels)
-                # Snap lines use raw sx/sy so they reach screen edges
-                y_down = int(getattr(self.config, "esp_screen_y_offset", 0) or 0)
-                dsx, dsy = clamp_screen(sx, sy - self.config.box_y_offset + y_down, w, h)
-                dsy += self.config.box_y_offset
-
-                # Dot ESP
+                # Dot ESP — exact chest projection (no legacy screen nudge)
                 if self.config.dot_esp:
                     radius = int(self.config.dot_radius * scale)
-                    self._draw_dot(painter, dsx, dsy, max(2, radius), color)
+                    self._draw_dot(painter, dot_x, dot_y, max(2, radius), color)
 
                 # 2D Box ESP
                 rot = pdata.get("rot")
@@ -4534,14 +4597,14 @@ class Overlay(QWidget):
                     health_info = pdata.get("health_info")
                     if health_info and health_info[0] is not None:
                         hp, sh = health_info
-                        bar_x = dsx - 12 * scale
-                        bar_y = dsy - 20 * scale
+                        bar_x = dot_x - 12 * scale
+                        bar_y = dot_y - 20 * scale
                         draw_health_bar(painter, bar_x, bar_y, 24 * scale, 4, hp, sh if self.config.shield_bar else None)
 
                 # Snap lines
                 if self.config.snap_lines:
                     painter.setPen(QPen(QColor(*color), 1))
-                    painter.drawLine(int(w / 2), int(h), int(sx), int(sy))
+                    painter.drawLine(int(w / 2), int(h), int(dot_x), int(dot_y))
 
                 # Labels
                 label_parts = []
@@ -4574,9 +4637,8 @@ class Overlay(QWidget):
                     fm = painter.fontMetrics()
                     tw = fm.horizontalAdvance(text)
                     th = fm.height()
-                    label_x = int(dsx - tw / 2)
-                    # Sit just above the anchor (nameplate height), not stacked above the dot
-                    label_y = int(dsy - th - 4)
+                    label_x = int(dot_x - tw / 2)
+                    label_y = int(dot_y - th - 4)
                     _draw_label(painter, label_x, label_y, text, QColor(*color))
 
               except Exception:
@@ -4604,8 +4666,9 @@ class Overlay(QWidget):
                            self.config.radar_size, self.config.radar_range,
                            self.config.radar_color, self.config.radar_opacity)
 
-        # FPS counters — configured cap + measured paint rate + in-game FPS
+        # FPS counters — effective cap + measured paint rate + in-game FPS
         target_fps = int(getattr(self, "_target_overlay_fps", 0) or getattr(self.config, "ui_overlay_fps", 60))
+        effective_cap = self._effective_overlay_fps()
         overlay_fps = self._current_fps
         timer_ms = max(1, self.timer.interval())
         game_fps    = self._game_fps_info.get("game_fps", 0)
@@ -4627,9 +4690,10 @@ class Overlay(QWidget):
                 else QColor(255, 80, 80)
             ) if game_fps > 0 else QColor(150, 150, 150)
 
+            cap_note = f" saved:{target_fps}" if effective_cap < target_fps else ""
             _draw_label(
                 painter, 10, 40,
-                f"OVL: {overlay_fps}/{target_fps}fps ({timer_ms}ms)",
+                f"OVL: {overlay_fps}/{effective_cap}fps ({timer_ms}ms){cap_note}",
                 ovl_color,
             )
             game_label = f"GAME: {game_fps}fps" if game_fps > 0 else "GAME: --"

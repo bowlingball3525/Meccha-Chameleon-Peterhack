@@ -194,6 +194,9 @@ def main():
         msg = (message or "").strip()
         if not msg:
             return
+        # Windows often reports this for our frameless menu — harmless after size fix.
+        if "QWindowsWindow::setGeometry" in msg and "MenuClassWindow" in msg:
+            return
         print(f"[QT] {msg}", flush=True)
 
     try:
@@ -222,6 +225,8 @@ def main():
         menu.attach_overlay(overlay)
         overlay.show()
         menu.show()
+        overlay._set_menu_ui_active(True)
+        overlay._last_menu_visible = True
 
     def _on_quit():
         save_config(config)
