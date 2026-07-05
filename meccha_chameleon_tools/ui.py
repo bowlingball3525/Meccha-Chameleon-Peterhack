@@ -2946,12 +2946,12 @@ class Menu(QWidget):
         lo.addStretch()
 
     def _set_log_toggles(self, enabled: bool):
-        for _label, attr in getattr(self, "_log_toggle_boxes", []):
-            setattr(self.config, attr, enabled)
         for attr, cb in getattr(self, "_log_toggle_boxes", []):
+            setattr(self.config, attr, enabled)
             cb.blockSignals(True)
             cb.setChecked(enabled)
             cb.blockSignals(False)
+        set_log_config(self.config)
 
     def _browse_paint_image(self):
         path, _ = QFileDialog.getOpenFileName(
