@@ -76,6 +76,10 @@ class TrainerMixin:
     # BP_FirstPersonCharacter_cLeon_Character_Hunter_C
     OFF_GUN_COOL_TIME = 0x0D20
     OFF_INFINITY_BULLET = 0x0D94
+    OFF_HEALTH = 0x0640
+    OFF_MAX_HEALTH = 0x0648
+    OFF_INVINCIBLE = 0x05AB
+    OFF_DEAD = 0x05AA
     OFF_MY_PLAYER_STATE = 0x0808
     OFF_IS_HUNTER = 0x0C3A
     # BP_FirstPersonCharacter_cLeon_Character_Survivor_C
@@ -122,7 +126,18 @@ class TrainerMixin:
         self._trainer_last_rename = None
         self._trainer_last_rename_ts = 0.0
         self._trainer_anticlip_saved = None
-        self._trainer_watch = {"world": 0, "pawn": 0, "ps": 0, "conn": 0}
+        self._trainer_watch = {
+            "world": 0,
+            "conn": 0,
+            "ps": 0,
+            "ack_pawn": 0,
+            "owned_pawn": 0,
+            "resolved_pawn": 0,
+            "view_target": 0,
+            "mode": "unknown",
+        }
+        self._anti_kick_drop_streak = 0
+        self._anti_kick_last_mode = "unknown"
         self._trainer_tick_count = 0
         self._ue_func_cache = {}
         self._autokick_last_attempt = {}
@@ -156,10 +171,12 @@ class TrainerMixin:
         self._rename_notify = None
         self._rename_last_send_ts = 0.0
         self._rename_min_interval = 0.45
-        self._trainer_auto_rename_queued_for = None
         self._trainer_rename_bridge_timeout = 10
         self._trainer_loop_started = False
         self._trainer_loop_stop = None
+        self._god_mode_bridge_state = None
+        self._god_mode_bridge_pawn = 0
+        self._god_mode_bridge_last_attempt = 0.0
         self._anti_kick_sync_thread = None
         self._anti_kick_sync_pending = None
 
@@ -281,15 +298,16 @@ class TrainerMixin:
             config.trainer_anti_clipping,
             config.trainer_anti_detection,
             config.trainer_infinite_bullets,
+            config.trainer_god_mode,
             config.trainer_anti_kick,
-            config.trainer_auto_rename,
         ))
 
     def _trainer_any_active(self, config):
         return self._trainer_enabled(config) or bool(getattr(config, "autokick_enabled", False))
 
     def _trainer_log(self, tag, msg, *, config=None, level="info", interval=3.0, force=False):
-        if config is not None and not config.trainer_debug and level != "error":
+        from meccha_chameleon_tools.log_util import is_trainer_log_enabled
+        if config is not None and not is_trainer_log_enabled(config, tag, level):
             return
         key = f"{tag}:{level}:{msg[:72]}"
         now = time.monotonic()
@@ -313,7 +331,7 @@ class TrainerMixin:
                 level="error",
                 force=True,
             )
-            if count == 1 and config and config.trainer_debug:
+            if count == 1 and config and getattr(config, "log_trainer", False):
                 tb = traceback.format_exc()
                 if tb and "NoneType: None" not in tb:
                     print(f"[TRAINER:{tag}] {tb}", flush=True)
@@ -349,6 +367,9 @@ class TrainerMixin:
                 return ps2
         return 0
 
+    def _trainer_local_net_connection(self, world, pc=None):
+        return self._local_net_connection(world, pc)
+
     def _trainer_paintable_comp(self, pawn):
         if not pawn:
             return 0
@@ -380,6 +401,99 @@ class TrainerMixin:
             return True
         except Exception:
             return False
+
+    def _trainer_is_survivor(self, pawn):
+        return self._trainer_is_playable_pawn(pawn) and not self._trainer_is_hunter(pawn)
+
+    def _trainer_god_mode_scrub(self, pawn, config):
+        """Keep Health/Invincible/Dead scrubbed each tick (MechaSRC tick path)."""
+        if not pawn or not self._trainer_is_survivor(pawn):
+            return
+        try:
+            max_hp = struct.unpack("<d", self.pm.read_bytes(pawn + self.OFF_MAX_HEALTH, 8))[0]
+            if math.isfinite(max_hp) and max_hp > 0:
+                cur = struct.unpack("<d", self.pm.read_bytes(pawn + self.OFF_HEALTH, 8))[0]
+                if not math.isfinite(cur) or cur < max_hp:
+                    _wdouble(self.pm, pawn + self.OFF_HEALTH, max_hp)
+            _wbyte(self.pm, pawn + self.OFF_INVINCIBLE, 1)
+            _wbyte(self.pm, pawn + self.OFF_DEAD, 0)
+        except Exception as exc:
+            self._trainer_error("GOD-MODE", exc, config)
+
+    def _sync_god_mode_bridge(self, enabled, config):
+        if not hasattr(self, "_bridge_request"):
+            self._trainer_log(
+                "GOD-MODE",
+                "bridge not ready — enable god mode after bridge injects",
+                config=config,
+                level="debug",
+                interval=12.0,
+            )
+            return False
+        try:
+            resp = self._bridge_request("set_god_mode", {"enabled": bool(enabled)}, timeout=8)
+        except Exception as exc:
+            self._trainer_log(
+                "GOD-MODE",
+                f"bridge request failed: {exc}",
+                config=config,
+                level="error",
+                force=True,
+            )
+            return False
+        ok = bool(resp and resp.get("success"))
+        if ok:
+            self._god_mode_bridge_state = bool(enabled)
+            msg = resp.get("message") or ("enabled" if enabled else "disabled")
+            meta = resp.get("metadata") or {}
+            blocked = meta.get("blocked_functions", "?")
+            self._trainer_log(
+                "GOD-MODE",
+                f"{msg} via bridge (blocked UFunctions={blocked})",
+                config=config,
+                force=True,
+            )
+        else:
+            err = (resp or {}).get("message") or "unknown error"
+            self._trainer_log(
+                "GOD-MODE",
+                f"bridge set_god_mode failed: {err}",
+                config=config,
+                level="error",
+                force=True,
+            )
+        return ok
+
+    def _trainer_god_mode(self, pawn, config):
+        want = bool(config.trainer_god_mode)
+        bridge_want = want and bool(pawn) and self._trainer_is_survivor(pawn)
+        if want and pawn and not self._trainer_is_survivor(pawn):
+            self._trainer_log(
+                "GOD-MODE",
+                "survivor/hider only — god mode has no effect as hunter",
+                config=config,
+                level="debug",
+                interval=10.0,
+            )
+            bridge_want = False
+
+        state = getattr(self, "_god_mode_bridge_state", None)
+        prev_pawn = getattr(self, "_god_mode_bridge_pawn", 0)
+        if state != bridge_want or (bridge_want and pawn and pawn != prev_pawn):
+            now = time.monotonic()
+            if now - getattr(self, "_god_mode_bridge_last_attempt", 0.0) >= 2.0:
+                self._god_mode_bridge_last_attempt = now
+                if self._sync_god_mode_bridge(bridge_want, config):
+                    self._god_mode_bridge_pawn = pawn if bridge_want else 0
+        elif not bridge_want and state:
+            now = time.monotonic()
+            if now - getattr(self, "_god_mode_bridge_last_attempt", 0.0) >= 2.0:
+                self._god_mode_bridge_last_attempt = now
+                if self._sync_god_mode_bridge(False, config):
+                    self._god_mode_bridge_pawn = 0
+
+        if bridge_want:
+            self._trainer_god_mode_scrub(pawn, config)
 
     def _trainer_no_gun_cooldown(self, pawn, config):
         if not self._trainer_is_hunter(pawn):
@@ -539,11 +653,21 @@ class TrainerMixin:
             return
         if self._read_is_hunter(hunter_pawn) is not True:
             return
-        loc = self.get_actor_root_pos(hunter_pawn) if hasattr(self, "get_actor_root_pos") else None
-        rot = self.get_control_rotation() if hasattr(self, "get_control_rotation") else None
-        if not loc or not rot:
+        # Build the aim ray from the actual camera (eye) — NOT the capsule root.
+        # The crosshair fires from the camera, which sits well above the capsule
+        # center, so using the root position pulls targets below where you look.
+        origin = None
+        aim_rot = None
+        cam = self.get_camera() if hasattr(self, "get_camera") else None
+        if cam and cam.get("loc") and cam.get("rot"):
+            origin = cam["loc"]
+            aim_rot = cam["rot"]
+        else:
+            origin = self.get_actor_root_pos(hunter_pawn) if hasattr(self, "get_actor_root_pos") else None
+            aim_rot = self.get_control_rotation() if hasattr(self, "get_control_rotation") else None
+        if not origin or not aim_rot:
             return
-        fx, fy, fz = self._forward_from_control_rotation(rot[0], rot[1])
+        fx, fy, fz = self._forward_from_control_rotation(aim_rot[0], aim_rot[1])
         depth = 0
         try:
             players = self.get_session_players(force=False) if hasattr(self, "get_session_players") else []
@@ -555,11 +679,13 @@ class TrainerMixin:
                 actor = pdata.get("pawn") or 0
                 if not actor:
                     continue
-                spread = depth * 120.0
-                dist = 150.0 + spread
-                tx = loc[0] + fx * dist
-                ty = loc[1] + fy * dist
-                tz = loc[2] + fz * dist
+                # Keep targets comfortably past the near-clip plane so the game
+                # doesn't cull them (the "flashing" the user saw at dist=150).
+                spread = depth * 90.0
+                dist = 280.0 + spread
+                tx = origin[0] + fx * dist
+                ty = origin[1] + fy * dist
+                tz = origin[2] + fz * dist
                 self._teleport_pawn_pe(actor, tx, ty, tz)
                 depth += 1
         except Exception as exc:
@@ -621,19 +747,43 @@ class TrainerMixin:
             self._trainer_log("DECOY-NUM", "no RuntimePaintable", config=config, level="debug", interval=8.0)
             return
         target = max(0, min(int(config.trainer_decoy_count), 99))
-        if self._trainer_last_decoy_num == target:
-            return
         addr = comp + self.OFF_MAX_DECOY_SPAWN
         try:
             cur = _ru32(self.pm, addr)
-            if cur == target:
-                self._trainer_last_decoy_num = target
+            now = time.monotonic()
+            last_rpc = getattr(self, "_trainer_decoy_rpc_ts", 0.0)
+            if cur == target and self._trainer_last_decoy_num == target and (now - last_rpc) < 3.0:
                 return
             if not _wint32(self.pm, addr, target):
                 self._trainer_log("DECOY-NUM", f"write failed @ 0x{addr:X}", config=config, level="error", force=True)
                 return
+            rpc_name = ""
+            fn, rpc_name = self._find_ue_function_on_object(
+                comp, ("ServerSetMaxDecoySpawnCount", "SetMaxDecoySpawnCount"),
+            )
+            if fn:
+                psize = max(_ru32(self.pm, fn + self.OFF_UFUNCTION_PARMS_SIZE), 4)
+                buf = bytearray(psize)
+                struct.pack_into("<i", buf, 0, int(target))
+                if not self._process_event_call(comp, fn, bytes(buf)):
+                    self._trainer_log(
+                        "DECOY-NUM",
+                        f"{rpc_name or 'SetMaxDecoySpawnCount'} RPC failed",
+                        config=config,
+                        level="error",
+                        interval=5.0,
+                        force=True,
+                    )
+                else:
+                    self._trainer_decoy_rpc_ts = now
             self._trainer_last_decoy_num = target
-            self._trainer_log("DECOY-NUM", f"MaxDecoySpawnCount {cur} -> {target}", config=config, force=True)
+            if cur != target:
+                self._trainer_log(
+                    "DECOY-NUM",
+                    f"MaxDecoySpawnCount {cur} -> {target} via {rpc_name or 'mem'}",
+                    config=config,
+                    force=True,
+                )
         except Exception as exc:
             self._trainer_error("DECOY-NUM", exc, config)
 
@@ -702,59 +852,29 @@ class TrainerMixin:
             self._trainer_anticlip_saved = None
             self._trainer_log("NO-CLIP", "restored collision", config=config, force=True)
 
-    def _trainer_anti_kick(self, config):
-        want = bool(config.trainer_anti_kick)
-        if not want:
-            self._anti_kick_bridge_give_up = False
-        elif getattr(self, "_anti_kick_bridge_give_up", False):
-            return
-        now = time.monotonic()
-        world = self._get_world()
-        pawn = self._find_local_pawn() if world else 0
-        ps = self._trainer_local_player_state(pawn) if pawn else 0
-        pc = self._get_local_controller(world) if world else 0
-        conn = 0
-        if world and pc:
-            player = _rp(self.pm, pc + self.offsets.get("APlayerController::Player", 0x0348))
-            if player:
-                conn = _rp(self.pm, player + self.OFF_UPLAYER_CONNECTION)
+    def _trainer_log_session_transition(self, prev, ctx, config):
+        """Log session changes with clear labels — not a generic 'pawn lost' error."""
+        world = ctx.get("world") or 0
+        conn = ctx.get("conn") or 0
+        mode = ctx.get("mode") or "unknown"
+        prev_mode = prev.get("mode") or "unknown"
+        owned = ctx.get("owned_pawn") or 0
+        prev_owned = prev.get("owned_pawn") or 0
 
-        if pawn and conn and pc:
-            stable_key = (pc, conn, pawn)
-            if stable_key != getattr(self, "_anti_kick_spawn_stable_key", None):
-                self._anti_kick_spawn_stable_key = stable_key
-                self._anti_kick_spawn_stable_ts = now
-
-        ANTI_KICK_SPAWN_STABLE_SEC = 5.0
-
-        if getattr(self, "_anti_kick_bridge_state", None) != want:
-            if want:
-                if not pawn or not conn or not pc:
-                    if now - getattr(self, "_anti_kick_defer_log_ts", 0.0) >= 12.0:
-                        self._anti_kick_defer_log_ts = now
-                        self._trainer_log(
-                            "ANTI-KICK",
-                            "waiting until spawned in before installing hook (avoids match-load crash)",
-                            config=config,
-                            level="debug",
-                        )
-                    return
-                if now - getattr(self, "_anti_kick_spawn_stable_ts", 0.0) < ANTI_KICK_SPAWN_STABLE_SEC:
-                    return
-            if now - getattr(self, "_anti_kick_bridge_last_attempt", 0.0) >= 2.0:
-                self._anti_kick_bridge_last_attempt = now
-                self._schedule_anti_kick_bridge_sync(want, config)
-
-        prev = self._trainer_watch
-        if prev["world"] and not world:
+        if prev.get("world") and not world:
+            self._anti_kick_drop_streak = 0
+            self._local_owned_pawn_sticky = 0
+            self._local_owned_pawn_sticky_ps = 0
             self._trainer_log(
                 "ANTI-KICK",
-                "world lost — disconnected (EOS/platform kick may bypass bridge hook)",
+                "DISCONNECTED: UWorld lost — left match, returned to menu, or game closed",
                 config=config,
                 level="error",
                 force=True,
             )
-        if prev["conn"] and not conn and world:
+            return
+
+        if prev.get("conn") and not conn and world:
             blocks = int(getattr(self, "_anti_kick_log_seq", 0) or 0)
             blocked_n = int(getattr(self, "_anti_kick_blocked_count", 0) or 0)
             if blocks <= 0:
@@ -776,14 +896,136 @@ class TrainerMixin:
                 )
             self._trainer_log(
                 "ANTI-KICK",
-                "NetConnection lost while world active — " + detail,
+                "SESSION DROP: NetConnection lost while world still loaded — " + detail,
                 config=config,
                 level="error",
                 force=True,
             )
-        if prev["pawn"] and not pawn and world:
-            self._trainer_log("ANTI-KICK", "local pawn lost", config=config, level="error", force=True)
-        self._trainer_watch = {"world": world, "pawn": pawn, "ps": ps, "conn": conn}
+            self._anti_kick_drop_streak = 0
+            return
+
+        if mode != prev_mode and mode != getattr(self, "_anti_kick_last_mode", None):
+            self._anti_kick_last_mode = mode
+            if mode == "spectating" and owned:
+                self._trainer_log(
+                    "ANTI-KICK",
+                    "SPECTATING: camera on another player — your character is still alive (not a kick/disconnect)",
+                    config=config,
+                    level="info",
+                    force=True,
+                )
+            elif mode == "freecam" and owned:
+                self._trainer_log(
+                    "ANTI-KICK",
+                    "FREECAM: detached camera — your character is still alive (not a kick/disconnect)",
+                    config=config,
+                    level="info",
+                    force=True,
+                )
+            elif mode == "dead":
+                self._trainer_log(
+                    "ANTI-KICK",
+                    "DIED: owned character dead — expect spectate/respawn (not a network kick)",
+                    config=config,
+                    level="info",
+                    force=True,
+                )
+            elif mode == "in_match" and prev_mode in ("freecam", "spectating", "dead", "unpossessed"):
+                self._trainer_log(
+                    "ANTI-KICK",
+                    "IN MATCH: control restored after freecam/spectate/death",
+                    config=config,
+                    level="debug",
+                    interval=15.0,
+                )
+
+        if prev_owned and not owned and world:
+            if mode == "session_drop" or (prev.get("conn") and not conn):
+                self._trainer_log(
+                    "ANTI-KICK",
+                    "SESSION DROP: owned character lost and connection closing — removed from session",
+                    config=config,
+                    level="error",
+                    force=True,
+                )
+                self._anti_kick_drop_streak = 0
+            elif mode in ("unpossessed", "unknown", "loading"):
+                self._anti_kick_drop_streak = int(getattr(self, "_anti_kick_drop_streak", 0)) + 1
+                if self._anti_kick_drop_streak == 8:
+                    self._trainer_log(
+                        "ANTI-KICK",
+                        "TRANSITION: owned pawn unreadable while connected — loading, menu travel, or disconnect starting",
+                        config=config,
+                        level="warning",
+                        force=True,
+                    )
+            else:
+                self._anti_kick_drop_streak = 0
+        elif owned or mode in ("in_match", "freecam", "spectating"):
+            self._anti_kick_drop_streak = 0
+
+    def _trainer_anti_kick(self, config):
+        want = bool(config.trainer_anti_kick)
+        if not want:
+            self._anti_kick_bridge_give_up = False
+        elif getattr(self, "_anti_kick_bridge_give_up", False):
+            return
+        now = time.monotonic()
+        ctx = self._local_pawn_context()
+        world = ctx.get("world") or 0
+        pc = ctx.get("pc") or 0
+        ps = ctx.get("ps") or 0
+        conn = ctx.get("conn") or 0
+        pawn = ctx.get("resolved_pawn") or 0
+        owned = ctx.get("owned_pawn") or 0
+        mode = ctx.get("mode") or "unknown"
+        in_active_session = mode in ("in_match", "freecam", "spectating") and bool(owned or pawn)
+
+        if (owned or pawn) and pc and in_active_session:
+            stable_key = (pc, owned or pawn)
+            if stable_key != getattr(self, "_anti_kick_spawn_stable_key", None):
+                self._anti_kick_spawn_stable_key = stable_key
+                self._anti_kick_spawn_stable_ts = now
+
+        ANTI_KICK_SPAWN_STABLE_SEC = 2.0
+
+        if getattr(self, "_anti_kick_bridge_state", None) != want:
+            if want:
+                if not pc or not in_active_session:
+                    if now - getattr(self, "_anti_kick_defer_log_ts", 0.0) >= 12.0:
+                        self._anti_kick_defer_log_ts = now
+                        missing = []
+                        if not pc:
+                            missing.append("controller")
+                        if not in_active_session:
+                            missing.append(f"active session (mode={mode})")
+                        self._trainer_log(
+                            "ANTI-KICK",
+                            "waiting for "
+                            + (" + ".join(missing) if missing else "spawn")
+                            + " before installing hook (NetConnection optional — bridge hooks controller RPCs)",
+                            config=config,
+                            level="debug",
+                        )
+                    return
+                if now - getattr(self, "_anti_kick_spawn_stable_ts", 0.0) < ANTI_KICK_SPAWN_STABLE_SEC:
+                    return
+            if now - getattr(self, "_anti_kick_bridge_last_attempt", 0.0) >= 2.0:
+                self._anti_kick_bridge_last_attempt = now
+                self._schedule_anti_kick_bridge_sync(want, config)
+
+        prev = self._trainer_watch
+        self._trainer_log_session_transition(prev, ctx, config)
+        self._trainer_watch = {
+            "world": world,
+            "conn": conn,
+            "ps": ps,
+            "ack_pawn": ctx.get("ack_pawn") or 0,
+            "owned_pawn": owned,
+            "resolved_pawn": pawn,
+            "view_target": ctx.get("view_target") or 0,
+            "mode": mode,
+        }
         if want:
             self._anti_kick_watch_pc = pc
             self._anti_kick_watch_ps = ps
@@ -891,9 +1133,29 @@ class TrainerMixin:
                 self._anti_kick_log_seq = 0
         else:
             err = (resp or {}).get("message") or (resp or {}).get("stage") or "unknown error"
+            stage = str((resp or {}).get("stage") or "")
             if enabled:
-                self._anti_kick_bridge_give_up = True
                 self._anti_kick_bridge_state = False
+                retryable = (
+                    stage in ("pawn_unavailable", "controller_unavailable", "sdk_unavailable")
+                    or "spawned in" in str(err)
+                )
+                if retryable:
+                    # Transient — the bridge's pawn/controller lookup can lag right
+                    # after inject or during a loading screen. Giving up here left
+                    # anti-kick silently disabled for the whole match; let the
+                    # trainer tick keep retrying instead.
+                    now = time.monotonic()
+                    if now - getattr(self, "_anti_kick_retry_log_ts", 0.0) >= 15.0:
+                        self._anti_kick_retry_log_ts = now
+                        self._trainer_log(
+                            "ANTI-KICK",
+                            f"bridge not ready ({err}) — retrying automatically",
+                            config=config,
+                            force=True,
+                        )
+                    return False
+                self._anti_kick_bridge_give_up = True
                 err = (
                     f"{err} — toggle Anti-Kick off/on to retry. "
                     "If this repeats, fully quit/relaunch the game or disable UE4SS/other ProcessEvent hooks."
@@ -1240,6 +1502,13 @@ class TrainerMixin:
                 return False, ""
         else:
             cur = self.get_custom_player_name(ps)
+            # Drop a redundant force rename: if the name is already live and we
+            # just sent it, another identical SetName only piles more work onto
+            # the game thread (each RPC is dispatched + waited on there). A burst
+            # of identical renames is what stalls rendering / freezes the UI.
+            if (cur == name and self._trainer_last_rename == name
+                    and (now - self._trainer_last_rename_ts) < 2.5):
+                return False, ""
 
         if not hasattr(self, "_bridge_request"):
             self._trainer_log(
@@ -1268,8 +1537,6 @@ class TrainerMixin:
         if ok:
             self._trainer_last_rename = name
             self._trainer_last_rename_ts = now
-            if getattr(self, "_trainer_auto_rename_queued_for", None) == name:
-                self._trainer_auto_rename_queued_for = None
             new_cur = self.get_custom_player_name(ps)
             msg = f"'{cur or '?'}' -> '{name}' readback='{new_cur or '?'}'"
             self._trainer_log("RENAME", f"SetName {msg} ({cls})", config=config, interval=2.0 if force else 3.0)
@@ -1277,8 +1544,6 @@ class TrainerMixin:
 
         err = (resp or {}).get("message") or (resp or {}).get("stage") or "unknown error"
         self._trainer_log("RENAME", f"SetName failed via bridge: {err}", config=config, level="error", force=True)
-        if getattr(self, "_trainer_auto_rename_queued_for", None) == name:
-            self._trainer_auto_rename_queued_for = None
         off = self._custom_player_name_offset(ps)
         if off and self._trainer_write_fstring(ps + off, name):
             self._trainer_log(
@@ -1299,35 +1564,6 @@ class TrainerMixin:
         if self.queue_trainer_rename(name, config, force=force):
             return True, "queued"
         return False, "name is empty"
-
-    def _trainer_auto_rename(self, pawn, config):
-        name = (config.trainer_rename_text or "").strip()[:32]
-        if not name:
-            self._trainer_auto_rename_queued_for = None
-            return
-
-        now = time.monotonic()
-        pending = getattr(self, "_trainer_rename_pending_name", None)
-        if name != pending:
-            self._trainer_rename_pending_name = name
-            self._trainer_rename_pending_ts = now
-            self._trainer_auto_rename_queued_for = None
-            return
-        if now - self._trainer_rename_pending_ts < 1.5:
-            return
-        if name == self._trainer_last_rename and (now - self._trainer_last_rename_ts) < 5.0:
-            return
-        ps = self._trainer_local_player_state(pawn)
-        cur = self.get_custom_player_name(ps) if ps else None
-        if cur == name and self._trainer_last_rename == name:
-            return
-        if getattr(self, "_trainer_auto_rename_queued_for", None) == name:
-            return
-        with self._rename_lock:
-            if self._rename_pending and self._rename_pending[0] == name:
-                return
-        self._trainer_auto_rename_queued_for = name
-        self.queue_trainer_rename(name, config, force=False)
 
     def tick_trainer(self, config):
         """Apply enabled trainer features (throttled — not every overlay frame)."""
@@ -1397,8 +1633,6 @@ class TrainerMixin:
                     config=config,
                     level="debug",
                 )
-            if config.trainer_auto_rename:
-                self._trainer_auto_rename(0, config)
             if config.trainer_anti_kick:
                 self._trainer_anti_kick(config)
             if getattr(config, "autokick_enabled", False):
@@ -1408,8 +1642,6 @@ class TrainerMixin:
         if not pawn:
             if self._trainer_tick_count % 180 == 1:
                 self._trainer_log("TICK", "no local pawn (not in match?)", config=config, level="debug")
-            if config.trainer_auto_rename:
-                self._trainer_auto_rename(pawn, config)
             if config.trainer_anti_kick:
                 self._trainer_anti_kick(config)
             if getattr(config, "autokick_enabled", False):
@@ -1427,12 +1659,14 @@ class TrainerMixin:
                 self._trainer_anti_detection(pawn, config)
             if config.trainer_infinite_bullets:
                 self._trainer_infinite_bullets(pawn, config)
+            if config.trainer_god_mode:
+                self._trainer_god_mode(pawn, config)
+            elif getattr(self, "_god_mode_bridge_state", None):
+                self._trainer_god_mode(pawn, config)
             if config.trainer_set_decoy_num:
                 self._trainer_set_decoy_num(pawn, config)
             elif self._trainer_last_decoy_num is not None:
                 self._trainer_last_decoy_num = None
-            if config.trainer_auto_rename:
-                self._trainer_auto_rename(pawn, config)
             if config.trainer_anti_kick:
                 self._trainer_anti_kick(config)
             if getattr(config, "autokick_enabled", False):

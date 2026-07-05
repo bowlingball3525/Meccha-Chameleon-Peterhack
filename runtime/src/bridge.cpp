@@ -99,12 +99,84 @@ namespace
     std::size_t g_anti_kick_vtable_restore_count{0};
     bool g_anti_kick_vtable_hook_installed{false};
     std::atomic<bool> g_anti_kick_enabled{false};
+
+    // God mode (MechaSRC port) — block Damage/DeathPlayer/KillPlayer on local pawn.
+    constexpr std::size_t GodModeMaxBlockedFunctions = 8;
+    std::atomic<bool> g_god_mode_enabled{false};
+    std::atomic<std::uintptr_t> g_god_mode_local_pawn{0};
+    std::atomic<std::uintptr_t> g_god_mode_blocked_functions[GodModeMaxBlockedFunctions]{};
+    std::atomic<std::size_t> g_god_mode_blocked_function_count{0};
+    std::atomic<int> g_god_mode_block_count{0};
+    constexpr std::uintptr_t GodModeOffHealth = 0x0640;
+    constexpr std::uintptr_t GodModeOffMaxHealth = 0x0648;
+    constexpr std::uintptr_t GodModeOffInvincible = 0x05AB;
+    constexpr std::uintptr_t GodModeOffDead = 0x05AA;
     std::atomic<std::uintptr_t> g_anti_kick_local_controller{0};
     std::atomic<std::uintptr_t> g_anti_kick_local_player{0};
     std::atomic<std::uintptr_t> g_anti_kick_local_player_state{0};
     std::atomic<std::uintptr_t> g_anti_kick_local_net_connection{0};
+    std::atomic<std::uintptr_t> g_anti_kick_local_pawn{0};
+
+    // Capture mode: while anti-kick is on, log every distinct UFunction that is
+    // dispatched on one of our local objects (controller / player state / net
+    // connection / pawn). The kick that keeps getting through fires no function
+    // in our block list, so we need to SEE what (if anything) the engine calls
+    // on us during a host kick. Pointer-gated to the four local objects so it
+    // costs almost nothing on the hot ProcessEvent path, and deduped so each
+    // distinct call logs once per session. Read-only — never blocks.
+    std::atomic<bool> g_anti_kick_capture_enabled{false};
+    std::atomic<std::uintptr_t> g_anti_kick_capture_names_pool{0};
+    std::atomic<int> g_anti_kick_capture_names_table_offset{0x10};
+    std::atomic<int> g_anti_kick_capture_names_style{1};
+    std::mutex g_anti_kick_capture_mutex;
+    std::unordered_set<std::string> g_anti_kick_capture_seen;
+
+    // Widened capture (every object, not just the 4 local ones). To keep the hot
+    // ProcessEvent path cheap we classify each distinct UFunction pointer exactly
+    // once: the first time a function is ever dispatched we resolve + keyword-test
+    // its name, then record the pointer here so every later call is just a
+    // lock-free probe + skip. This lets us prove whether ANY kick RPC fires on a
+    // GameSession/OnlineSession/etc., and simultaneously discover the game's
+    // session/join functions (needed to wire auto-rejoin).
+    constexpr std::size_t CaptureSeenTableSize = 16384;  // power of two
+    std::atomic<std::uintptr_t> g_capture_seen_funcs[CaptureSeenTableSize]{};
+    std::atomic<std::size_t> g_capture_seen_func_fill{0};
+
+    // Diagnostic native probe: registry of disconnect-reason-carrying RPCs
+    // (ClientTravelInternal, ClientReturnToMainMenu*, ClientWasKicked, network/
+    // travel-failure). When one of these fires during a kick we read its FString
+    // URL/reason param — that string carries the engine's actual close reason,
+    // which is what we need to distinguish an application kick from a transport /
+    // EOS session drop. Pointers are discovered lazily (once) and compared on the
+    // hot path with cheap atomic loads, so cost is negligible until a kick occurs.
+    constexpr std::size_t CaptureReasonMaxFuncs = 16;
+    std::atomic<std::uintptr_t> g_capture_reason_funcs[CaptureReasonMaxFuncs]{};
+    std::atomic<std::size_t> g_capture_reason_func_count{0};
+    std::mutex g_capture_reason_mutex;
+    std::unordered_set<std::string> g_capture_reason_seen_text;
+
+    // ---- NetConnection close watcher (diagnostic) --------------------------
+    // Background thread that polls the local UNetConnection and logs the exact
+    // moment it goes away (pointer nulled on the local player, or the object
+    // becomes invalid), so we can time the transport close relative to the
+    // ProcessEvent capture sequence (ReceiveUnPossess/EndPlay/Destroyed). Pure
+    // SEH-guarded reads — no patching — so it cannot crash the game.
+    std::atomic<bool> g_netconn_watch_enabled{false};
+    std::atomic<bool> g_netconn_watch_thread_alive{false};
+    std::atomic<std::uintptr_t> g_netconn_watch_conn{0};
+    std::atomic<std::uintptr_t> g_netconn_watch_local_player{0};
     std::atomic<std::uintptr_t> g_anti_kick_blocked_functions[AntiKickMaxBlockedFunctions]{};
     std::atomic<std::size_t> g_anti_kick_blocked_function_count{0};
+    // FName comparison indices of the well-known kick RPC names (Kick,
+    // ClientWasKicked, ...). The engine recreates BP UFunction objects between
+    // rounds, which invalidates the pointer list above; the FName index for a
+    // given name is stable for the whole session, so matching on it keeps the
+    // block working after a round transition (chameleonEsp re-matches by name
+    // on every call for the same reason).
+    constexpr std::size_t AntiKickMaxBlockedNames = 8;
+    std::atomic<std::uint32_t> g_anti_kick_blocked_name_indices[AntiKickMaxBlockedNames]{};
+    char g_anti_kick_blocked_name_texts[AntiKickMaxBlockedNames][64]{};
+    std::atomic<std::size_t> g_anti_kick_blocked_name_count{0};
     std::atomic<std::uint64_t> g_anti_kick_block_count{0};
     std::size_t g_anti_kick_last_logged_blocked_count{static_cast<std::size_t>(-1)};
     std::uintptr_t g_anti_kick_last_logged_net_connection{0};
@@ -190,6 +262,10 @@ namespace
     auto handle_game_set_fov(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
     auto handle_game_kill(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
     auto handle_game_set_anti_kick(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_set_god_mode(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_get_skeleton(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto god_mode_should_block(void* object, void* function) -> bool;
+    auto god_mode_scrub_pawn(std::uintptr_t pawn) -> void;
     auto handle_get_anti_kick_log(const std::string& payload) -> std::string;
     auto handle_game_set_player_name(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
     auto handle_game_get_player_steam_id(const std::string& payload, Reflection& ref) -> std::string;
@@ -831,6 +907,29 @@ namespace
             return found;
         }
 
+        auto find_class_any(const char* name) -> std::uintptr_t
+        {
+            // find_class only matches native classes (meta == "Class");
+            // Blueprint-generated classes like BP_FirstPersonPlayerState_Online_C
+            // have BlueprintGeneratedClass as their class, so match those too.
+            std::uintptr_t found = 0;
+            for_each_object([&](std::uintptr_t obj) {
+                if (object_name(obj) != name)
+                {
+                    return false;
+                }
+                const auto meta_name = class_name(obj);
+                if (meta_name == "Class" || meta_name == "BlueprintGeneratedClass"
+                    || meta_name == "WidgetBlueprintGeneratedClass" || meta_name == "AnimBlueprintGeneratedClass")
+                {
+                    found = obj;
+                    return true;
+                }
+                return false;
+            });
+            return found;
+        }
+
         auto find_first_instance(const char* class_name_text) -> std::uintptr_t
         {
             const auto cls = find_class(class_name_text);
@@ -877,9 +976,8 @@ namespace
             return -1;
         }
 
-        auto find_function(std::uintptr_t object, const char* function_name) -> std::uintptr_t
+        auto find_function_in_class(std::uintptr_t cls, const char* function_name) -> std::uintptr_t
         {
-            auto cls = class_ptr(object);
             for (int depth = 0; cls && depth < 64; ++depth)
             {
                 for (auto child = safe_read<std::uintptr_t>(cls + OffChildren); child; child = safe_read<std::uintptr_t>(child + OffUFieldNext))
@@ -892,6 +990,11 @@ namespace
                 cls = safe_read<std::uintptr_t>(cls + OffSuperStruct);
             }
             return 0;
+        }
+
+        auto find_function(std::uintptr_t object, const char* function_name) -> std::uintptr_t
+        {
+            return find_function_in_class(class_ptr(object), function_name);
         }
     };
 
@@ -1065,10 +1168,12 @@ namespace
         return false;
     }
 
-    auto anti_kick_record_block(std::uintptr_t func, void* params) -> void
+    auto anti_kick_record_block(std::uintptr_t func, void* params,
+                                const char* fallback_name = nullptr,
+                                const char* fallback_owner = nullptr) -> void
     {
-        const char* func_name = "unknown";
-        const char* owner = "local";
+        const char* func_name = fallback_name ? fallback_name : "unknown";
+        const char* owner = fallback_owner ? fallback_owner : "local";
         anti_kick_lookup_meta(func, &func_name, &owner);
 
         char detail[128]{};
@@ -1337,6 +1442,51 @@ namespace
     auto hex_address(std::uintptr_t value) -> std::string
     {
         return early_hex_address(value);
+    }
+
+    auto parse_hex_address(const std::string& text) -> std::uintptr_t
+    {
+        if (text.empty())
+        {
+            return 0;
+        }
+        try
+        {
+            std::string trimmed = text;
+            while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '"'))
+            {
+                trimmed.erase(trimmed.begin());
+            }
+            while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '"'))
+            {
+                trimmed.pop_back();
+            }
+            if (trimmed.empty())
+            {
+                return 0;
+            }
+            std::size_t idx = 0;
+            const int base = (trimmed.rfind("0x", 0) == 0 || trimmed.rfind("0X", 0) == 0) ? 16 : 10;
+            return static_cast<std::uintptr_t>(std::stoull(trimmed, &idx, base));
+        }
+        catch (...)
+        {
+            return 0;
+        }
+    }
+
+    template <typename T>
+    auto safe_write(std::uintptr_t address, T value) -> bool
+    {
+        __try
+        {
+            *reinterpret_cast<T*>(address) = value;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     auto early_json_bool(bool value) -> const char*
@@ -3065,6 +3215,354 @@ namespace
         return anti_kick_is_local_object(obj);
     }
 
+    // Session/join/travel function names — used purely for auto-rejoin discovery.
+    // Kept separate from the kick list so the two show up under distinct log tags.
+    auto is_session_join_like_name(const std::string& lower_name) -> bool
+    {
+        static const char* needles[] = {
+            "joinsession",
+            "join",
+            "rejoin",
+            "reconnect",
+            "session",
+            "clienttravel",
+            "servertravel",
+            "openlevel",
+            "browse",
+            "invite",
+            "enterlobby",
+            "joinlobby",
+            "findsession",
+            "createsession",
+        };
+        for (const char* needle : needles)
+        {
+            if (lower_name.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Disconnect-reason-carrying RPCs whose FString/URL param reveals WHY we were
+    // dropped (application kick text vs. transport/EOS failure URL).
+    auto is_disconnect_reason_function(const std::string& lower_name) -> bool
+    {
+        static const char* needles[] = {
+            "clienttravel",
+            "returntomainmenu",
+            "clientwaskicked",
+            "waskicked",
+            "networkfailure",
+            "travelfailure",
+            "handlenetworkfailure",
+            "notifyconnectionlost",
+        };
+        for (const char* needle : needles)
+        {
+            if (lower_name.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    auto capture_register_reason_func(const std::uintptr_t func) -> void
+    {
+        if (!func)
+        {
+            return;
+        }
+        const auto count = g_capture_reason_func_count.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (g_capture_reason_funcs[i].load(std::memory_order_relaxed) == func)
+            {
+                return;  // already registered
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_capture_reason_mutex);
+        const auto cur = g_capture_reason_func_count.load(std::memory_order_relaxed);
+        for (std::size_t i = 0; i < cur; ++i)
+        {
+            if (g_capture_reason_funcs[i].load(std::memory_order_relaxed) == func)
+            {
+                return;
+            }
+        }
+        if (cur >= CaptureReasonMaxFuncs)
+        {
+            return;
+        }
+        g_capture_reason_funcs[cur].store(func, std::memory_order_relaxed);
+        g_capture_reason_func_count.store(cur + 1, std::memory_order_release);
+    }
+
+    // Classify each distinct UFunction pointer exactly once. Returns true only the
+    // first time a given pointer is seen (caller should resolve + keyword-test it);
+    // every later call is a lock-free probe that returns false so the hot path stays
+    // cheap. When the table fills we stop classifying to bound cost.
+    auto capture_mark_func_seen(const std::uintptr_t func) -> bool
+    {
+        if (g_capture_seen_func_fill.load(std::memory_order_relaxed) >= CaptureSeenTableSize - 1)
+        {
+            return false;
+        }
+        std::size_t idx = (func >> 4) & (CaptureSeenTableSize - 1);
+        for (std::size_t probe = 0; probe < 64; ++probe)
+        {
+            const std::size_t slot = (idx + probe) & (CaptureSeenTableSize - 1);
+            std::uintptr_t expected = g_capture_seen_funcs[slot].load(std::memory_order_relaxed);
+            if (expected == func)
+            {
+                return false;  // already classified
+            }
+            if (expected == 0)
+            {
+                if (g_capture_seen_funcs[slot].compare_exchange_strong(
+                        expected, func, std::memory_order_acq_rel))
+                {
+                    g_capture_seen_func_fill.fetch_add(1, std::memory_order_relaxed);
+                    return true;  // newly inserted — classify it
+                }
+                if (expected == func)
+                {
+                    return false;  // lost race to same pointer
+                }
+                // lost race to a different pointer — fall through to the next slot
+            }
+        }
+        return false;  // probe exhausted — treat as seen to bound cost
+    }
+
+    auto capture_reset_seen_table() -> void
+    {
+        for (std::size_t i = 0; i < CaptureSeenTableSize; ++i)
+        {
+            g_capture_seen_funcs[i].store(0, std::memory_order_relaxed);
+        }
+        g_capture_seen_func_fill.store(0, std::memory_order_relaxed);
+        for (std::size_t i = 0; i < CaptureReasonMaxFuncs; ++i)
+        {
+            g_capture_reason_funcs[i].store(0, std::memory_order_relaxed);
+        }
+        g_capture_reason_func_count.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(g_capture_reason_mutex);
+            g_capture_reason_seen_text.clear();
+        }
+    }
+
+    // Widened capture across EVERY object: proves whether any kick RPC fires
+    // anywhere (not just the 4 local objects) and discovers session/join functions
+    // for auto-rejoin. Each distinct function is resolved once via capture_mark_func_seen.
+    auto anti_kick_capture_probe_global(void* object, void* function) -> void
+    {
+        if (!g_anti_kick_capture_enabled.load() || !object || !function)
+        {
+            return;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        if (!capture_mark_func_seen(func))
+        {
+            return;  // fast path: already classified this function
+        }
+        const auto pool = g_anti_kick_capture_names_pool.load();
+        if (!pool)
+        {
+            return;
+        }
+        const auto fname_index = safe_read<std::uint32_t>(func + OffName, 0);
+        if (!fname_index)
+        {
+            return;
+        }
+        FNameResolver resolver{};
+        resolver.pool = pool;
+        resolver.table_offset = g_anti_kick_capture_names_table_offset.load();
+        resolver.style = g_anti_kick_capture_names_style.load();
+        std::string fname = resolver.resolve(fname_index);
+        if (fname.empty())
+        {
+            return;
+        }
+        const std::string lower = lower_copy(fname);
+        const bool kickish = is_kick_like_function_name(lower);
+        const bool sessionish = !kickish && is_session_join_like_name(lower);
+        if (!kickish && !sessionish)
+        {
+            return;
+        }
+        const auto obj = reinterpret_cast<std::uintptr_t>(object);
+        const auto cls = safe_read<std::uintptr_t>(obj + OffClass);
+        const std::uint32_t cls_name_idx = cls ? safe_read<std::uint32_t>(cls + OffName, 0) : 0;
+        std::string cls_name = cls_name_idx ? resolver.resolve(cls_name_idx) : std::string("?");
+        if (cls_name.empty())
+        {
+            cls_name = "?";
+        }
+        const char* tag = kickish ? "capture-kick" : "capture-session";
+        append_anti_kick_log_file(std::string("[anti-kick][") + tag + "] " + cls_name + "::" + fname + "\n");
+
+        // If this RPC carries a disconnect reason (travel URL / kick text),
+        // remember its pointer so the reason probe can read the param when it fires.
+        if (is_disconnect_reason_function(lower))
+        {
+            capture_register_reason_func(func);
+        }
+    }
+
+    auto anti_kick_capture_probe(void* object, void* function) -> void
+    {
+        if (!g_anti_kick_capture_enabled.load() || !object || !function)
+        {
+            return;
+        }
+        anti_kick_capture_probe_global(object, function);
+        const auto obj = reinterpret_cast<std::uintptr_t>(object);
+        const char* owner = nullptr;
+        if (obj == g_anti_kick_local_controller.load())
+        {
+            owner = "PlayerController";
+        }
+        else if (obj == g_anti_kick_local_player_state.load())
+        {
+            owner = "PlayerState";
+        }
+        else if (obj == g_anti_kick_local_net_connection.load())
+        {
+            owner = "NetConnection";
+        }
+        else if (obj == g_anti_kick_local_pawn.load())
+        {
+            owner = "Pawn";
+        }
+        else
+        {
+            return;  // not one of our local objects — cheap pointer gate
+        }
+
+        const auto pool = g_anti_kick_capture_names_pool.load();
+        if (!pool)
+        {
+            return;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        const auto fname_index = safe_read<std::uint32_t>(func + OffName, 0);
+        if (!fname_index)
+        {
+            return;
+        }
+
+        FNameResolver resolver{};
+        resolver.pool = pool;
+        resolver.table_offset = g_anti_kick_capture_names_table_offset.load();
+        resolver.style = g_anti_kick_capture_names_style.load();
+        std::string fname = resolver.resolve(fname_index);
+        if (fname.empty())
+        {
+            return;
+        }
+
+        std::string key = std::string(owner) + "::" + fname;
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_capture_mutex);
+            if (g_anti_kick_capture_seen.size() > 512 || g_anti_kick_capture_seen.count(key))
+            {
+                return;
+            }
+            g_anti_kick_capture_seen.insert(key);
+        }
+        append_anti_kick_log_file("[anti-kick][capture] ProcessEvent " + key + "\n");
+    }
+
+    // Native diagnostic probe: when a registered disconnect-reason RPC fires, read
+    // its FString URL/reason param — that string is the engine's actual close
+    // reason. Runs on every ProcessEvent but is a cheap pointer scan until such an
+    // RPC is discovered (i.e. right around a kick), so it costs nothing normally.
+    auto anti_kick_capture_reason(void* function, void* params) -> void
+    {
+        if (!g_anti_kick_capture_enabled.load() || !function)
+        {
+            return;
+        }
+        const auto count = g_capture_reason_func_count.load(std::memory_order_acquire);
+        if (count == 0)
+        {
+            return;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        bool matched = false;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (g_capture_reason_funcs[i].load(std::memory_order_relaxed) == func)
+            {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+        {
+            return;
+        }
+
+        char detail[192]{};
+        try_read_fstring_param_preview(params, detail, sizeof(detail));
+
+        std::string fname = "?";
+        const auto pool = g_anti_kick_capture_names_pool.load();
+        if (pool)
+        {
+            const auto fname_index = safe_read<std::uint32_t>(func + OffName, 0);
+            if (fname_index)
+            {
+                FNameResolver resolver{};
+                resolver.pool = pool;
+                resolver.table_offset = g_anti_kick_capture_names_table_offset.load();
+                resolver.style = g_anti_kick_capture_names_style.load();
+                std::string resolved = resolver.resolve(fname_index);
+                if (!resolved.empty())
+                {
+                    fname = resolved;
+                }
+            }
+        }
+
+        std::string reason_text = detail[0] != '\0' ? std::string(detail) : std::string("<no-fstring-param>");
+        std::string dedupe_key = fname + "|" + reason_text;
+        {
+            std::lock_guard<std::mutex> lock(g_capture_reason_mutex);
+            if (g_capture_reason_seen_text.size() > 64
+                || g_capture_reason_seen_text.count(dedupe_key))
+            {
+                return;
+            }
+            g_capture_reason_seen_text.insert(dedupe_key);
+        }
+        append_anti_kick_log_file(
+            "[anti-kick][capture-reason] " + fname + " reason='" + reason_text + "'\n");
+    }
+
+    auto anti_kick_is_global_kick_name(const char* name) -> bool
+    {
+        if (!name)
+        {
+            return false;
+        }
+        const std::string lower = lower_copy(name);
+        // The RPCs chameleonEsp blocks unconditionally. They are kick-specific,
+        // so blocking them on any object is safe — and necessary: the
+        // BP_FirstPersonCharacter_LINK_C::Kick variant runs on a character
+        // pawn, which the local player-state/controller filter would reject.
+        return lower == "kick"
+            || lower == "serverkick"
+            || lower == "clientwaskicked"
+            || lower == "clientreturntomainmenuwithtextreason"
+            || lower == "clientreturntomainmenu";
+    }
+
     auto anti_kick_should_block(void* object, void* function, void* params) -> bool
     {
         if (!g_anti_kick_enabled.load() || !object || !function)
@@ -3083,12 +3581,85 @@ namespace
             const char* func_name = "unknown";
             const char* owner = "local";
             anti_kick_lookup_meta(func, &func_name, &owner);
-            if (!anti_kick_function_targets_local_player(func_name, obj))
+            // Known kick RPCs block regardless of which object they run on
+            // (chameleonEsp behaviour). Only the heuristic scanned functions
+            // keep the local-player filter, since blocking those globally
+            // could swallow unrelated events aimed at other players.
+            if (!anti_kick_is_global_kick_name(func_name)
+                && !anti_kick_function_targets_local_player(func_name, obj))
             {
                 return false;
             }
             g_anti_kick_block_count.fetch_add(1);
             anti_kick_record_block(func, params);
+            return true;
+        }
+        // Pointer miss: the engine recreates BP UFunction objects between
+        // rounds, so a recreated Kick has a new pointer but the same FName.
+        // Match the function's FName comparison index against the recorded
+        // kick names so blocking survives round transitions.
+        const auto name_count = g_anti_kick_blocked_name_count.load();
+        if (name_count > 0)
+        {
+            const auto name_index = safe_read<std::uint32_t>(func + OffName, 0);
+            if (name_index != 0)
+            {
+                for (std::size_t i = 0; i < name_count && i < AntiKickMaxBlockedNames; ++i)
+                {
+                    if (g_anti_kick_blocked_name_indices[i].load() != name_index)
+                    {
+                        continue;
+                    }
+                    g_anti_kick_block_count.fetch_add(1);
+                    anti_kick_record_block(func, params, g_anti_kick_blocked_name_texts[i], "by-name");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    auto god_mode_scrub_pawn(std::uintptr_t pawn) -> void
+    {
+        if (!live_uobject(pawn))
+        {
+            return;
+        }
+        __try
+        {
+            const double max_hp = *reinterpret_cast<double*>(pawn + GodModeOffMaxHealth);
+            if (max_hp > 0.0 && std::isfinite(max_hp))
+            {
+                *reinterpret_cast<double*>(pawn + GodModeOffHealth) = max_hp;
+            }
+            *reinterpret_cast<std::uint8_t*>(pawn + GodModeOffInvincible) = 1;
+            *reinterpret_cast<std::uint8_t*>(pawn + GodModeOffDead) = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    auto god_mode_should_block(void* object, void* function) -> bool
+    {
+        if (!g_god_mode_enabled.load() || !object || !function)
+        {
+            return false;
+        }
+        const auto pawn = g_god_mode_local_pawn.load();
+        if (!pawn || reinterpret_cast<std::uintptr_t>(object) != pawn)
+        {
+            return false;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        const auto count = g_god_mode_blocked_function_count.load();
+        for (std::size_t i = 0; i < count && i < GodModeMaxBlockedFunctions; ++i)
+        {
+            if (g_god_mode_blocked_functions[i].load() != func)
+            {
+                continue;
+            }
+            g_god_mode_block_count.fetch_add(1);
             return true;
         }
         return false;
@@ -4882,6 +5453,634 @@ namespace
         std::string failure{};
         return process_event(object, function, params.data(), failure) &&
                sdk_read_return_rotator_param(ref, function, params.data(), value);
+    }
+
+    // ---- Skeleton ESP (MechaSRC port: GetBoneName + GetSocketLocation) ---------
+    struct FNameLite
+    {
+        std::int32_t ComparisonIndex{0};
+        std::uint32_t Number{0};
+    };
+
+    struct SkelBonePairNames
+    {
+        const char* const* a;
+        std::size_t a_count;
+        const char* const* b;
+        std::size_t b_count;
+    };
+
+    static const char* const kSkelAliasHead[] = {"head", "Head", "neck", "neck_01", "Neck"};
+    static const char* const kSkelAliasNeck[] = {"neck", "neck_01", "Neck"};
+    static const char* const kSkelAliasSpine3[] = {"spine3", "spine_03", "spine_05", "Spine2", "Spine1", "spine"};
+    static const char* const kSkelAliasSpine2[] = {"spine2", "spine_02", "Spine1"};
+    static const char* const kSkelAliasSpine1[] = {"spine1", "spine_01", "spine", "pelvis", "Hips"};
+    static const char* const kSkelAliasPelvis[] = {"pelvis", "Hips", "spine1", "spine_01"};
+    static const char* const kSkelAliasClavL[] = {"shoulder_L", "clavicle_l", "LeftShoulder"};
+    static const char* const kSkelAliasUpperArmL[] = {"upper_arm_L", "upperarm_l", "LeftArm"};
+    static const char* const kSkelAliasLowerArmL[] = {"lower_arm_L", "lowerarm_l", "LeftForeArm"};
+    static const char* const kSkelAliasHandL[] = {"hand_L", "hand_l", "LeftHand"};
+    static const char* const kSkelAliasClavR[] = {"shoulder_R", "clavicle_r", "RightShoulder"};
+    static const char* const kSkelAliasUpperArmR[] = {"upper_arm_R", "upperarm_r", "RightArm"};
+    static const char* const kSkelAliasLowerArmR[] = {"lower_arm_R", "lowerarm_r", "RightForeArm"};
+    static const char* const kSkelAliasHandR[] = {"hand_R", "hand_r", "RightHand"};
+    static const char* const kSkelAliasThighL[] = {"hip_L", "thigh_l", "LeftUpLeg"};
+    static const char* const kSkelAliasCalfL[] = {"lower_leg_L", "calf_l", "LeftLeg"};
+    static const char* const kSkelAliasFootL[] = {"foot_l", "foot_L", "LeftFoot"};
+    static const char* const kSkelAliasThighR[] = {"hip_R", "thigh_r", "RightUpLeg"};
+    static const char* const kSkelAliasCalfR[] = {"lower_leg_R", "calf_r", "RightLeg"};
+    static const char* const kSkelAliasFootR[] = {"foot_r", "foot_R", "RightFoot"};
+
+    static const SkelBonePairNames kSkelConnections[] = {
+        {kSkelAliasHead, 5, kSkelAliasNeck, 3},
+        {kSkelAliasNeck, 3, kSkelAliasSpine3, 6},
+        {kSkelAliasSpine3, 6, kSkelAliasSpine2, 3},
+        {kSkelAliasSpine2, 3, kSkelAliasSpine1, 5},
+        {kSkelAliasClavL, 3, kSkelAliasSpine3, 6},
+        {kSkelAliasUpperArmL, 3, kSkelAliasClavL, 3},
+        {kSkelAliasLowerArmL, 3, kSkelAliasUpperArmL, 3},
+        {kSkelAliasHandL, 3, kSkelAliasLowerArmL, 3},
+        {kSkelAliasClavR, 3, kSkelAliasSpine3, 6},
+        {kSkelAliasUpperArmR, 3, kSkelAliasClavR, 3},
+        {kSkelAliasLowerArmR, 3, kSkelAliasUpperArmR, 3},
+        {kSkelAliasHandR, 3, kSkelAliasLowerArmR, 3},
+        {kSkelAliasThighL, 3, kSkelAliasPelvis, 4},
+        {kSkelAliasThighL, 3, kSkelAliasSpine1, 5},
+        {kSkelAliasCalfL, 3, kSkelAliasThighL, 3},
+        {kSkelAliasFootL, 3, kSkelAliasCalfL, 3},
+        {kSkelAliasThighR, 3, kSkelAliasPelvis, 4},
+        {kSkelAliasThighR, 3, kSkelAliasSpine1, 5},
+        {kSkelAliasCalfR, 3, kSkelAliasThighR, 3},
+        {kSkelAliasFootR, 3, kSkelAliasCalfR, 3},
+    };
+
+    std::mutex g_skel_cache_mutex;
+    std::unordered_map<std::uintptr_t, std::unordered_map<std::string, int>> g_skel_bone_index_cache;
+    std::atomic<std::uintptr_t> g_skel_get_bone_name_fn{0};
+    std::atomic<std::uintptr_t> g_skel_get_socket_location_fn{0};
+
+    struct SkelActorEntry
+    {
+        std::uintptr_t actor{0};
+        std::uintptr_t mesh{0};
+    };
+
+    auto skel_lower_copy(std::string value) -> std::string
+    {
+        for (auto& ch : value)
+        {
+            if (ch >= 'A' && ch <= 'Z')
+            {
+                ch = static_cast<char>(ch + 32);
+            }
+        }
+        return value;
+    }
+
+    auto skel_write_int32_prop(std::uintptr_t prop, std::uint8_t* container, std::int32_t value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        return safe_write<std::int32_t>(reinterpret_cast<std::uintptr_t>(container + offset), value);
+    }
+
+    auto skel_read_fname_prop(std::uintptr_t prop, std::uint8_t* container, FNameLite& out) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        out.ComparisonIndex = safe_read<std::int32_t>(reinterpret_cast<std::uintptr_t>(container + offset));
+        out.Number = safe_read<std::uint32_t>(reinterpret_cast<std::uintptr_t>(container + offset + 4));
+        return out.ComparisonIndex != 0;
+    }
+
+    auto skel_fname_valid(Reflection& ref, const FNameLite& name) -> bool
+    {
+        if (name.ComparisonIndex == 0)
+        {
+            return false;
+        }
+        const auto resolved = ref.names.resolve(static_cast<std::uint32_t>(name.ComparisonIndex));
+        return !resolved.empty() && resolved != "None";
+    }
+
+    auto skel_resolve_functions(Reflection& ref) -> std::pair<std::uintptr_t, std::uintptr_t>
+    {
+        auto bone_fn = g_skel_get_bone_name_fn.load();
+        auto socket_fn = g_skel_get_socket_location_fn.load();
+        if (!bone_fn)
+        {
+            if (const auto cls = ref.find_class("SkinnedMeshComponent"))
+            {
+                bone_fn = ref.find_function_in_class(cls, "GetBoneName");
+            }
+            if (!bone_fn)
+            {
+                if (const auto cls = ref.find_class("SkeletalMeshComponent"))
+                {
+                    bone_fn = ref.find_function_in_class(cls, "GetBoneName");
+                }
+            }
+            if (bone_fn)
+            {
+                g_skel_get_bone_name_fn.store(bone_fn);
+            }
+        }
+        if (!socket_fn)
+        {
+            if (const auto cls = ref.find_class("SceneComponent"))
+            {
+                socket_fn = ref.find_function_in_class(cls, "GetSocketLocation");
+            }
+            if (socket_fn)
+            {
+                g_skel_get_socket_location_fn.store(socket_fn);
+            }
+        }
+        return {bone_fn, socket_fn};
+    }
+
+    auto skel_write_fname_prop(std::uintptr_t prop, std::uint8_t* container, const FNameLite& value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        const auto base = reinterpret_cast<std::uintptr_t>(container + offset);
+        return safe_write<std::int32_t>(base, value.ComparisonIndex) &&
+               safe_write<std::uint32_t>(base + 4, value.Number);
+    }
+
+    auto skel_call_get_bone_name(Reflection& ref,
+                                 std::uintptr_t mesh,
+                                 std::uintptr_t function,
+                                 int bone_index,
+                                 FNameLite& out_name) -> bool
+    {
+        if (!live_uobject(mesh) || !function || bone_index < 0)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = skel_lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "boneindex")
+            {
+                wrote = skel_write_int32_prop(prop, params.data(), bone_index) || wrote;
+            }
+        }
+        if (!wrote)
+        {
+            // MechaSRC / UE layout: int32 BoneIndex @0, FName ReturnValue @8
+            safe_write<std::int32_t>(reinterpret_cast<std::uintptr_t>(params.data()), bone_index);
+            wrote = true;
+        }
+        std::string failure{};
+        if (!process_event(mesh, function, params.data(), failure))
+        {
+            return false;
+        }
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = skel_lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "returnvalue")
+            {
+                if (skel_read_fname_prop(prop, params.data(), out_name) && skel_fname_valid(ref, out_name))
+                {
+                    return true;
+                }
+                break;
+            }
+        }
+        out_name.ComparisonIndex = safe_read<std::int32_t>(reinterpret_cast<std::uintptr_t>(params.data() + 8));
+        out_name.Number = safe_read<std::uint32_t>(reinterpret_cast<std::uintptr_t>(params.data() + 12));
+        return skel_fname_valid(ref, out_name);
+    }
+
+    auto skel_call_get_socket_location(Reflection& ref,
+                                       std::uintptr_t mesh,
+                                       std::uintptr_t function,
+                                       const FNameLite& socket_name,
+                                       sdk::FVector& out_loc) -> bool
+    {
+        if (!live_uobject(mesh) || !function || !skel_fname_valid(ref, socket_name))
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = skel_lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "insocketname" || name == "socketname")
+            {
+                wrote = skel_write_fname_prop(prop, params.data(), socket_name) || wrote;
+            }
+        }
+        if (!wrote)
+        {
+            // MechaSRC / UE layout: FName InSocketName @0, FVector ReturnValue @8
+            safe_write<std::int32_t>(reinterpret_cast<std::uintptr_t>(params.data()),
+                                     socket_name.ComparisonIndex);
+            safe_write<std::uint32_t>(reinterpret_cast<std::uintptr_t>(params.data() + 4), socket_name.Number);
+            wrote = true;
+        }
+        std::string failure{};
+        if (!process_event(mesh, function, params.data(), failure))
+        {
+            return false;
+        }
+        if (sdk_read_return_vector3_param(ref, function, params.data(), out_loc))
+        {
+            return std::isfinite(out_loc.X) && std::isfinite(out_loc.Y) && std::isfinite(out_loc.Z);
+        }
+        out_loc.X = safe_read<double>(reinterpret_cast<std::uintptr_t>(params.data() + 8));
+        out_loc.Y = safe_read<double>(reinterpret_cast<std::uintptr_t>(params.data() + 16));
+        out_loc.Z = safe_read<double>(reinterpret_cast<std::uintptr_t>(params.data() + 24));
+        return std::isfinite(out_loc.X) && std::isfinite(out_loc.Y) && std::isfinite(out_loc.Z);
+    }
+
+    auto skel_resolve_actor_mesh(std::uintptr_t actor) -> std::uintptr_t
+    {
+        if (!live_uobject(actor))
+        {
+            return 0;
+        }
+        for (const std::uintptr_t off : {static_cast<std::uintptr_t>(0x0418),
+                                         static_cast<std::uintptr_t>(0x04C8),
+                                         static_cast<std::uintptr_t>(0x0328),
+                                         static_cast<std::uintptr_t>(0x02B0)})
+        {
+            const auto mesh = safe_read<std::uintptr_t>(actor + off);
+            if (live_uobject(mesh))
+            {
+                return mesh;
+            }
+        }
+        return 0;
+    }
+
+    auto skel_ensure_bone_map(Reflection& ref,
+                              std::uintptr_t mesh,
+                              std::uintptr_t get_bone_name_fn,
+                              std::unordered_map<std::string, int>& out_map) -> bool
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_skel_cache_mutex);
+            const auto it = g_skel_bone_index_cache.find(mesh);
+            if (it != g_skel_bone_index_cache.end() && !it->second.empty())
+            {
+                out_map = it->second;
+                return true;
+            }
+        }
+        out_map.clear();
+        for (int i = 0; i < 300; ++i)
+        {
+            FNameLite bone_name{};
+            if (!skel_call_get_bone_name(ref, mesh, get_bone_name_fn, i, bone_name))
+            {
+                if (i > 5 && !out_map.empty())
+                {
+                    break;
+                }
+                continue;
+            }
+            const std::string resolved = ref.names.resolve(static_cast<std::uint32_t>(bone_name.ComparisonIndex));
+            if (resolved.empty() || resolved == "None")
+            {
+                if (i > 5 && !out_map.empty())
+                {
+                    break;
+                }
+                continue;
+            }
+            out_map[skel_lower_copy(resolved)] = i;
+        }
+        if (out_map.empty())
+        {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(g_skel_cache_mutex);
+        g_skel_bone_index_cache[mesh] = out_map;
+        return true;
+    }
+
+    auto skel_find_bone_index(const std::unordered_map<std::string, int>& bone_map,
+                              const char* const* aliases,
+                              std::size_t alias_count) -> int
+    {
+        for (std::size_t i = 0; i < alias_count; ++i)
+        {
+            const auto it = bone_map.find(skel_lower_copy(aliases[i]));
+            if (it != bone_map.end())
+            {
+                return it->second;
+            }
+        }
+        return -1;
+    }
+
+    auto skel_bone_world_pos(Reflection& ref,
+                             std::uintptr_t mesh,
+                             std::uintptr_t get_bone_name_fn,
+                             std::uintptr_t get_socket_location_fn,
+                             int bone_index,
+                             sdk::FVector& out_loc) -> bool
+    {
+        FNameLite bone_name{};
+        if (!skel_call_get_bone_name(ref, mesh, get_bone_name_fn, bone_index, bone_name))
+        {
+            return false;
+        }
+        return skel_call_get_socket_location(ref, mesh, get_socket_location_fn, bone_name, out_loc);
+    }
+
+    auto skel_build_bones_json(Reflection& ref,
+                               std::uintptr_t mesh,
+                               std::uintptr_t get_bone_name_fn,
+                               std::uintptr_t get_socket_location_fn,
+                               const std::unordered_map<std::string, int>& bone_map,
+                               std::string& bones_json) -> bool
+    {
+        struct AimBoneSpec
+        {
+            const char* key;
+            const char* const* aliases;
+            std::size_t alias_count;
+        };
+        static const AimBoneSpec kAimBones[] = {
+            {"head", kSkelAliasHead, 5},
+            {"neck_01", kSkelAliasNeck, 3},
+            {"spine_03", kSkelAliasSpine3, 6},
+            {"spine_02", kSkelAliasSpine2, 3},
+            {"spine_01", kSkelAliasSpine1, 5},
+            {"pelvis", kSkelAliasPelvis, 4},
+            {"clavicle_l", kSkelAliasClavL, 3},
+            {"upperarm_l", kSkelAliasUpperArmL, 3},
+            {"lowerarm_l", kSkelAliasLowerArmL, 3},
+            {"hand_l", kSkelAliasHandL, 3},
+            {"clavicle_r", kSkelAliasClavR, 3},
+            {"upperarm_r", kSkelAliasUpperArmR, 3},
+            {"lowerarm_r", kSkelAliasLowerArmR, 3},
+            {"hand_r", kSkelAliasHandR, 3},
+            {"thigh_l", kSkelAliasThighL, 3},
+            {"calf_l", kSkelAliasCalfL, 3},
+            {"foot_l", kSkelAliasFootL, 3},
+            {"thigh_r", kSkelAliasThighR, 3},
+            {"calf_r", kSkelAliasCalfR, 3},
+            {"foot_r", kSkelAliasFootR, 3},
+        };
+        bool any = false;
+        bones_json.clear();
+        for (const auto& spec : kAimBones)
+        {
+            const int idx = skel_find_bone_index(bone_map, spec.aliases, spec.alias_count);
+            if (idx < 0)
+            {
+                continue;
+            }
+            sdk::FVector pos{};
+            if (!skel_bone_world_pos(ref, mesh, get_bone_name_fn, get_socket_location_fn, idx, pos))
+            {
+                continue;
+            }
+            if (!std::isfinite(pos.X) || !std::isfinite(pos.Y) || !std::isfinite(pos.Z))
+            {
+                continue;
+            }
+            if (any)
+            {
+                bones_json += ",";
+            }
+            any = true;
+            bones_json += "\"" + std::string(spec.key) + "\":[" + std::to_string(pos.X) + "," +
+                          std::to_string(pos.Y) + "," + std::to_string(pos.Z) + "]";
+        }
+        return any;
+    }
+
+    auto skel_build_for_actor(Reflection& ref,
+                              std::uintptr_t actor,
+                              std::uintptr_t mesh_override,
+                              std::string& segments_json,
+                              std::string& bones_json,
+                              bool bones_only) -> bool
+    {
+        const auto mesh = mesh_override ? mesh_override : skel_resolve_actor_mesh(actor);
+        if (!mesh)
+        {
+            return false;
+        }
+        const auto [get_bone_name_fn, get_socket_location_fn] = skel_resolve_functions(ref);
+        if (!get_bone_name_fn || !get_socket_location_fn)
+        {
+            return false;
+        }
+        std::unordered_map<std::string, int> bone_map{};
+        if (!skel_ensure_bone_map(ref, mesh, get_bone_name_fn, bone_map))
+        {
+            return false;
+        }
+        bool any = false;
+        segments_json.clear();
+        if (!bones_only)
+        {
+            for (const auto& conn : kSkelConnections)
+            {
+                const int idx_a = skel_find_bone_index(bone_map, conn.a, conn.a_count);
+                const int idx_b = skel_find_bone_index(bone_map, conn.b, conn.b_count);
+                if (idx_a < 0 || idx_b < 0)
+                {
+                    continue;
+                }
+                sdk::FVector a{};
+                sdk::FVector b{};
+                if (!skel_bone_world_pos(ref, mesh, get_bone_name_fn, get_socket_location_fn, idx_a, a) ||
+                    !skel_bone_world_pos(ref, mesh, get_bone_name_fn, get_socket_location_fn, idx_b, b))
+                {
+                    continue;
+                }
+                if (!std::isfinite(a.X) || !std::isfinite(a.Y) || !std::isfinite(a.Z) ||
+                    !std::isfinite(b.X) || !std::isfinite(b.Y) || !std::isfinite(b.Z))
+                {
+                    continue;
+                }
+                if (!any)
+                {
+                    any = true;
+                }
+                else
+                {
+                    segments_json += ",";
+                }
+                segments_json += "[" + std::to_string(a.X) + "," + std::to_string(a.Y) + "," + std::to_string(a.Z) +
+                                 "," + std::to_string(b.X) + "," + std::to_string(b.Y) + "," + std::to_string(b.Z) + "]";
+            }
+        }
+        const bool bones_ok = skel_build_bones_json(ref, mesh, get_bone_name_fn, get_socket_location_fn, bone_map, bones_json);
+        return any || bones_ok;
+    }
+
+    auto skel_parse_actor_entries(const std::string& payload) -> std::vector<SkelActorEntry>
+    {
+        std::vector<SkelActorEntry> entries{};
+        const std::string actor_list = json_extract_string(payload, "actors");
+        const std::string mesh_list = json_extract_string(payload, "meshes");
+        if (!actor_list.empty())
+        {
+            std::vector<std::uintptr_t> meshes{};
+            if (!mesh_list.empty())
+            {
+                std::size_t start = 0;
+                while (start < mesh_list.size())
+                {
+                    const auto comma = mesh_list.find(',', start);
+                    const auto token = mesh_list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                    meshes.push_back(parse_hex_address(token));
+                    if (comma == std::string::npos)
+                    {
+                        break;
+                    }
+                    start = comma + 1;
+                }
+            }
+            std::size_t start = 0;
+            std::size_t mesh_idx = 0;
+            while (start < actor_list.size())
+            {
+                const auto comma = actor_list.find(',', start);
+                const auto token = actor_list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                const auto addr = parse_hex_address(token);
+                if (addr)
+                {
+                    SkelActorEntry entry{};
+                    entry.actor = addr;
+                    if (mesh_idx < meshes.size())
+                    {
+                        entry.mesh = meshes[mesh_idx];
+                    }
+                    entries.push_back(entry);
+                }
+                ++mesh_idx;
+                if (comma == std::string::npos)
+                {
+                    break;
+                }
+                start = comma + 1;
+            }
+            return entries;
+        }
+        const auto single = json_extract_string(payload, "actor");
+        if (!single.empty())
+        {
+            SkelActorEntry entry{};
+            entry.actor = parse_hex_address(single);
+            const auto single_mesh = json_extract_string(payload, "mesh");
+            if (!single_mesh.empty())
+            {
+                entry.mesh = parse_hex_address(single_mesh);
+            }
+            if (entry.actor)
+            {
+                entries.push_back(entry);
+            }
+            return entries;
+        }
+        const double one = json_extract_double(payload, "actor");
+        if (one > 0)
+        {
+            SkelActorEntry entry{};
+            entry.actor = static_cast<std::uintptr_t>(one);
+            const double mesh_val = json_extract_double(payload, "mesh");
+            if (mesh_val > 0)
+            {
+                entry.mesh = static_cast<std::uintptr_t>(mesh_val);
+            }
+            entries.push_back(entry);
+        }
+        return entries;
+    }
+
+    auto skel_parse_actor_list(const std::string& payload) -> std::vector<std::uintptr_t>
+    {
+        std::vector<std::uintptr_t> actors{};
+        for (const auto& entry : skel_parse_actor_entries(payload))
+        {
+            if (entry.actor)
+            {
+                actors.push_back(entry.actor);
+            }
+        }
+        return actors;
+    }
+
+    auto handle_game_get_skeleton(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        (void)ctx;
+        std::string hook_failure{};
+        if (!install_process_event_hook(hook_failure))
+        {
+            return response_json(false, "skeleton_hook_failed", 0, 1, hook_failure);
+        }
+        const auto entries = skel_parse_actor_entries(payload);
+        if (entries.empty())
+        {
+            return response_json(false, "actors_unavailable", 0, 1, "no actor pointers supplied");
+        }
+        const std::string bones_only_text = json_extract_string(payload, "bones_only");
+        const bool bones_only = bones_only_text == "true" || bones_only_text == "1";
+        std::string results = "\"results\":[";
+        bool first_actor = true;
+        int ok_count = 0;
+        for (const auto& entry : entries)
+        {
+            if (!first_actor)
+            {
+                results += ",";
+            }
+            first_actor = false;
+            std::string segments = "[]";
+            std::string bones = "{}";
+            std::string bones_body{};
+            const bool ok = skel_build_for_actor(ref, entry.actor, entry.mesh, segments, bones_body, bones_only);
+            if (ok)
+            {
+                ++ok_count;
+            }
+            if (!bones_body.empty())
+            {
+                bones = "{" + bones_body + "}";
+            }
+            results += "{\"actor\":\"" + hex_address(entry.actor) + "\",\"mesh\":\"" + hex_address(entry.mesh) +
+                       "\",\"segments\":[" + segments + "],\"bones\":" + bones + "}";
+        }
+        results += "]";
+        const std::string meta = results + ",\"ok_count\":" + std::to_string(ok_count) +
+                                 ",\"method\":\"GetBoneName+GetSocketLocation\"";
+        return response_json(true, "get_skeleton", ok_count, static_cast<int>(entries.size()) - ok_count,
+                             ok_count > 0 ? "skeleton data collected" : "skeleton data empty", meta);
     }
 
     auto sdk_write_object_property_by_name(Reflection& ref, std::uintptr_t object, const char* name, std::uintptr_t value) -> bool
@@ -8075,7 +9274,13 @@ namespace
 
     void __fastcall hooked_process_event(void* object, void* function, void* params)
     {
+        anti_kick_capture_probe(object, function);
+        anti_kick_capture_reason(function, params);
         if (anti_kick_should_block(object, function, params))
+        {
+            return;
+        }
+        if (god_mode_should_block(object, function))
         {
             return;
         }
@@ -8377,16 +9582,197 @@ namespace
         return response_json(false, "kill_failed", 0, 1, "all kill strategies failed");
     }
 
+    // SEH-safe hex dump of a memory window (byte-by-byte, never faults).
+    auto netconn_hex_window(std::uintptr_t addr, std::size_t count) -> std::string
+    {
+        std::string out;
+        out.reserve(count * 2);
+        char buf[3];
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const std::uint8_t b = safe_read<std::uint8_t>(addr + i, 0);
+            std::snprintf(buf, sizeof(buf), "%02x", b);
+            out += buf;
+        }
+        return out;
+    }
+
+    auto netconn_resolve_from_context(const SdkContext& ctx) -> std::uintptr_t
+    {
+        std::uintptr_t conn = 0;
+        if (live_uobject(ctx.local_player))
+        {
+            conn = safe_read<std::uintptr_t>(ctx.local_player + OffUPlayerConnection);
+        }
+        if (!live_uobject(conn))
+        {
+            conn = anti_kick_resolve_local_net_connection();
+        }
+        return conn;
+    }
+
+    auto netconn_watch_loop() -> void
+    {
+        g_netconn_watch_thread_alive.store(true);
+        const auto conn = g_netconn_watch_conn.load();
+        const auto local_player = g_netconn_watch_local_player.load();
+        const auto start = GetTickCount64();
+
+        // Baseline: connection pointer, its vtable, and a memory window that
+        // should span EConnectionState + close/disconnect bookkeeping fields.
+        constexpr std::size_t WindowBytes = 0x80;
+        const auto baseline_vtable = safe_read<std::uintptr_t>(conn);
+        append_anti_kick_log_file(
+            "[netconn-watch] armed conn=" + hex_address(conn) +
+            " local_player=" + hex_address(local_player) +
+            " vtable=" + hex_address(baseline_vtable) +
+            " window[0x00..0x80]=" + netconn_hex_window(conn, WindowBytes) + "\n");
+
+        bool reported = false;
+        while (g_netconn_watch_enabled.load())
+        {
+            Sleep(100);
+            const auto elapsed = GetTickCount64() - start;
+
+            // The local player's Connection pointer being nulled/swapped is the
+            // cleanest "you were disconnected" signal.
+            std::uintptr_t cur_conn = conn;
+            if (live_uobject(local_player))
+            {
+                cur_conn = safe_read<std::uintptr_t>(local_player + OffUPlayerConnection);
+            }
+
+            const bool ptr_changed = live_uobject(local_player) && cur_conn != conn;
+            const bool obj_invalid = !live_uobject(conn);
+
+            if (ptr_changed || obj_invalid)
+            {
+                std::string reason = ptr_changed ? "local_player.Connection changed"
+                                                 : "connection object became invalid";
+                append_anti_kick_log_file(
+                    "[netconn-watch] CLOSED after +" + std::to_string(elapsed) + "ms — " + reason +
+                    " old_conn=" + hex_address(conn) +
+                    " new_conn=" + hex_address(cur_conn) +
+                    " vtable_now=" + hex_address(safe_read<std::uintptr_t>(conn)) +
+                    " window[0x00..0x80]=" + netconn_hex_window(conn, WindowBytes) + "\n");
+                reported = true;
+                break;
+            }
+        }
+        if (!reported)
+        {
+            append_anti_kick_log_file("[netconn-watch] stopped (no close observed)\n");
+        }
+        g_netconn_watch_thread_alive.store(false);
+    }
+
+    auto handle_game_set_netconn_watch(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        (void)ref;
+        const bool enabled = json_extract_bool(payload, "enabled");
+        if (!enabled)
+        {
+            g_netconn_watch_enabled.store(false);
+            return response_json(true, "set_netconn_watch", 0, 0, "netconn watch disabled",
+                                 "\"enabled\":false");
+        }
+        if (g_netconn_watch_thread_alive.load())
+        {
+            return response_json(true, "set_netconn_watch", 0, 0, "netconn watch already running",
+                                 "\"enabled\":true,\"already_running\":true");
+        }
+        const auto conn = netconn_resolve_from_context(ctx);
+        if (!live_uobject(conn))
+        {
+            return response_json(false, "net_connection_unavailable", 0, 1,
+                                 "local NetConnection not resolvable — join a match first");
+        }
+        g_netconn_watch_conn.store(conn);
+        g_netconn_watch_local_player.store(ctx.local_player);
+        g_netconn_watch_enabled.store(true);
+        std::thread(netconn_watch_loop).detach();
+        return response_json(true, "set_netconn_watch", 0, 0, "netconn watch armed",
+                             "\"enabled\":true,\"net_connection\":\"" + hex_address(conn) + "\"");
+    }
+
+    auto handle_game_dump_netconn_vtable(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        (void)ref;
+        const std::size_t slots = std::min<std::size_t>(
+            static_cast<std::size_t>(std::max(0.0, json_extract_double(payload, "slots"))), 256);
+        const std::size_t slot_count = slots ? slots : 128;
+        const auto conn = netconn_resolve_from_context(ctx);
+        if (!live_uobject(conn))
+        {
+            return response_json(false, "net_connection_unavailable", 0, 1,
+                                 "local NetConnection not resolvable — join a match first");
+        }
+        const auto vtable = safe_read<std::uintptr_t>(conn);
+        if (!vtable)
+        {
+            return response_json(false, "vtable_unavailable", 0, 1, "NetConnection vtable pointer null");
+        }
+        const auto module = main_module_range();
+        const auto cls = safe_read<std::uintptr_t>(conn + OffClass);
+        const std::uint32_t cls_name_idx = cls ? safe_read<std::uint32_t>(cls + OffName, 0) : 0;
+        const std::string cls_name = cls_name_idx ? ref.names.resolve(cls_name_idx) : std::string("?");
+        append_anti_kick_log_file(
+            "[netconn-vtable] class=" + cls_name +
+            " conn=" + hex_address(conn) +
+            " vtable=" + hex_address(vtable) +
+            " module_base=" + hex_address(module.base) +
+            " slots=" + std::to_string(slot_count) + "\n");
+        std::size_t in_module = 0;
+        for (std::size_t i = 0; i < slot_count; ++i)
+        {
+            const auto fn = safe_read<std::uintptr_t>(vtable + i * sizeof(std::uintptr_t));
+            if (!fn)
+            {
+                continue;
+            }
+            const bool in_mod = address_in_main_module(fn);
+            std::string line = "[netconn-vtable] slot " + std::to_string(i) +
+                               " (0x" + early_hex_address(i * sizeof(std::uintptr_t)).substr(2) + ")" +
+                               " = " + hex_address(fn);
+            if (in_mod)
+            {
+                ++in_module;
+                line += " rva=" + hex_address(fn - module.base);
+            }
+            else
+            {
+                line += " (off-module)";
+            }
+            append_anti_kick_log_file(line + "\n");
+        }
+        const std::string meta =
+            "\"class\":\"" + json_escape(cls_name) + "\"" +
+            ",\"net_connection\":\"" + hex_address(conn) + "\"" +
+            ",\"vtable\":\"" + hex_address(vtable) + "\"" +
+            ",\"module_base\":\"" + hex_address(module.base) + "\"" +
+            ",\"slots\":" + std::to_string(slot_count) +
+            ",\"in_module\":" + std::to_string(in_module);
+        return response_json(true, "dump_netconn_vtable", 0, 0,
+                             "vtable dumped to anti_kick.log", meta);
+    }
+
     auto handle_game_set_anti_kick(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
     {
         const bool enabled = json_extract_bool(payload, "enabled");
         if (!enabled)
         {
             g_anti_kick_enabled.store(false);
+            g_anti_kick_capture_enabled.store(false);
             g_anti_kick_local_controller.store(0);
             g_anti_kick_local_player.store(0);
             g_anti_kick_local_player_state.store(0);
             g_anti_kick_local_net_connection.store(0);
+            g_anti_kick_local_pawn.store(0);
+            {
+                std::lock_guard<std::mutex> lock(g_anti_kick_capture_mutex);
+                g_anti_kick_capture_seen.clear();
+            }
+            capture_reset_seen_table();
             g_anti_kick_blocked_function_count.store(0);
             g_anti_kick_last_logged_blocked_count = static_cast<std::size_t>(-1);
             g_anti_kick_last_logged_net_connection = 0;
@@ -8395,6 +9781,11 @@ namespace
             for (std::size_t i = 0; i < AntiKickMaxBlockedFunctions; ++i)
             {
                 g_anti_kick_blocked_functions[i].store(0);
+            }
+            g_anti_kick_blocked_name_count.store(0);
+            for (std::size_t i = 0; i < AntiKickMaxBlockedNames; ++i)
+            {
+                g_anti_kick_blocked_name_indices[i].store(0);
             }
             g_anti_kick_session = {};
             {
@@ -8493,9 +9884,35 @@ namespace
             }
         };
 
+        auto add_class_named = [&](const char* class_name_text, const char* owner, const char* function_name) {
+            const auto cls = ref.find_class_any(class_name_text);
+            if (!cls)
+            {
+                append_anti_kick_log_file(std::string("[anti-kick] class not found: ") + class_name_text + "\n");
+                return;
+            }
+            const auto function = ref.find_function_in_class(cls, function_name);
+            if (function)
+            {
+                remember_blocked(function, owner, function_name);
+            }
+            else
+            {
+                append_anti_kick_log_file(std::string("[anti-kick] function not found: ") + class_name_text + "." + function_name + "\n");
+            }
+        };
+
         add_named(ctx.controller, "PlayerController", "ClientWasKicked");
         add_named(ctx.controller, "PlayerController", "ClientReturnToMainMenuWithTextReason");
         add_named(ctx.controller, "PlayerController", "ClientReturnToMainMenu");
+
+        // The kick RPCs this game actually uses (ported from chameleonEsp):
+        // Kick on the online PlayerState and on the LINK character. Resolve
+        // them from the classes themselves — instance-based lookup misses the
+        // LINK variant entirely, and the local PlayerState pointer can be
+        // stale/null at enable time.
+        add_class_named("BP_FirstPersonPlayerState_Online_C", "PlayerStateOnline", "Kick");
+        add_class_named("BP_FirstPersonCharacter_LINK_C", "CharacterLINK", "Kick");
 
         std::uintptr_t player_state = safe_read<std::uintptr_t>(ctx.controller + OffPlayerControllerPlayerState);
         if (!live_uobject(player_state) && live_uobject(ctx.pawn))
@@ -8517,10 +9934,26 @@ namespace
             net_connection = g_anti_kick_local_net_connection.load();
         }
 
-        // Controller RPCs only — PlayerState/NetConnection ProcessEvent never passes through
-        // the local controller vtable hook; listing them caused false coverage and refresh crashes.
         const std::function<void(std::uintptr_t, const char*, const char*)> remember_fn = remember_blocked;
         scan_kick_functions_on_object(ref, ctx.controller, "PlayerController", remember_fn);
+        // Also register PlayerState / NetConnection kick+close RPCs. These are
+        // caught by the global inline ProcessEvent hook (installed below), which
+        // sees calls on every object, so they no longer depend on the controller
+        // vtable. add_named resolves the well-known ones explicitly; the scan
+        // picks up any class-specific variants.
+        if (live_uobject(player_state))
+        {
+            add_named(player_state, "PlayerState", "Kick");
+            add_named(player_state, "PlayerState", "ServerKick");
+            scan_kick_functions_on_object(ref, player_state, "PlayerState", remember_fn);
+        }
+        if (live_uobject(net_connection))
+        {
+            add_named(net_connection, "NetConnection", "Close");
+            add_named(net_connection, "NetConnection", "ConditionalCleanUp");
+            add_named(net_connection, "NetConnection", "CleanUp");
+            scan_kick_functions_on_object(ref, net_connection, "NetConnection", remember_fn);
+        }
 
         if (blocked_count == 0)
         {
@@ -8545,6 +9978,19 @@ namespace
         {
             return response_json(false, "anti_kick_hook_failed", 0, 1, "anti_kick_vtable_hook_missing");
         }
+        // Install the global inline ProcessEvent hook too. The controller vtable
+        // hook only sees RPCs dispatched on the local controller; kick paths that
+        // run on PlayerState or NetConnection (e.g. host-initiated Kick / Close)
+        // only pass through the engine-wide ProcessEvent. This is the same hook
+        // paint uses, so it is already crash-tested on this build.
+        std::string pe_hook_failure{};
+        if (!install_process_event_hook(pe_hook_failure))
+        {
+            // Non-fatal: fall back to controller vtable coverage only.
+            append_anti_kick_log_file(
+                "[anti-kick] warning: global ProcessEvent hook unavailable (" +
+                pe_hook_failure + ") — coverage limited to controller RPCs\n");
+        }
         if (!g_original_process_event.load() || !is_executable_code(g_original_process_event.load()))
         {
             return response_json(false, "anti_kick_hook_failed", 0, 1, "process_event_original_unavailable");
@@ -8554,10 +10000,60 @@ namespace
         g_anti_kick_local_player.store(ctx.local_player);
         g_anti_kick_local_player_state.store(player_state);
         g_anti_kick_local_net_connection.store(net_connection);
+        g_anti_kick_local_pawn.store(ctx.pawn);
+        // Arm capture mode: log distinct UFunctions dispatched on our local
+        // objects so a host kick's real call path becomes visible in the log.
+        g_anti_kick_capture_names_pool.store(ref.names.pool);
+        g_anti_kick_capture_names_table_offset.store(ref.names.table_offset);
+        g_anti_kick_capture_names_style.store(ref.names.style);
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_capture_mutex);
+            g_anti_kick_capture_seen.clear();
+        }
+        capture_reset_seen_table();
+        g_anti_kick_capture_enabled.store(true);
         g_anti_kick_blocked_function_count.store(blocked_count);
         for (std::size_t i = 0; i < AntiKickMaxBlockedFunctions; ++i)
         {
             g_anti_kick_blocked_functions[i].store(i < blocked_count ? blocked[i] : 0);
+        }
+        // Record the FName comparison indices of the well-known kick RPC names
+        // so the by-name fallback keeps blocking after the engine recreates the
+        // Blueprint UFunction objects on a round transition.
+        {
+            std::size_t name_count = 0;
+            std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+            for (std::size_t i = 0; i < g_anti_kick_func_meta_count && name_count < AntiKickMaxBlockedNames; ++i)
+            {
+                if (!anti_kick_is_global_kick_name(g_anti_kick_func_meta[i].name))
+                {
+                    continue;
+                }
+                const auto name_index = safe_read<std::uint32_t>(g_anti_kick_func_meta[i].func + OffName, 0);
+                if (!name_index)
+                {
+                    continue;
+                }
+                bool duplicate = false;
+                for (std::size_t j = 0; j < name_count; ++j)
+                {
+                    if (g_anti_kick_blocked_name_indices[j].load() == name_index)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate)
+                {
+                    continue;
+                }
+                std::snprintf(g_anti_kick_blocked_name_texts[name_count],
+                              sizeof(g_anti_kick_blocked_name_texts[name_count]),
+                              "%s", g_anti_kick_func_meta[i].name);
+                g_anti_kick_blocked_name_indices[name_count].store(name_index);
+                ++name_count;
+            }
+            g_anti_kick_blocked_name_count.store(name_count);
         }
         g_anti_kick_enabled.store(true);
 
@@ -8606,6 +10102,104 @@ namespace
                            ",\"net_connection\":\"" + hex_address(net_connection) + "\"" +
                            ",\"blocks_so_far\":" + std::to_string(g_anti_kick_block_count.load()) + "," + monitored;
         return response_json(true, "set_anti_kick", 0, 0, "anti-kick enabled", meta);
+    }
+
+    auto handle_game_set_god_mode(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        const bool enabled = json_extract_bool(payload, "enabled");
+        if (!enabled)
+        {
+            g_god_mode_enabled.store(false);
+            g_god_mode_local_pawn.store(0);
+            g_god_mode_blocked_function_count.store(0);
+            for (std::size_t i = 0; i < GodModeMaxBlockedFunctions; ++i)
+            {
+                g_god_mode_blocked_functions[i].store(0);
+            }
+            append_anti_kick_log_file("[god-mode] disabled\n");
+            return response_json(true, "set_god_mode", 0, 0, "god mode disabled",
+                                "\"enabled\":false,\"blocked_functions\":0");
+        }
+
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1,
+                                "wait until spawned in as survivor before enabling god mode");
+        }
+
+        std::uintptr_t blocked[GodModeMaxBlockedFunctions]{};
+        std::size_t blocked_count = 0;
+        auto remember_blocked = [&](std::uintptr_t function) {
+            if (!function || blocked_count >= GodModeMaxBlockedFunctions)
+            {
+                return;
+            }
+            for (std::size_t i = 0; i < blocked_count; ++i)
+            {
+                if (blocked[i] == function)
+                {
+                    return;
+                }
+            }
+            blocked[blocked_count++] = function;
+        };
+        auto add_class_named = [&](const char* class_name_text, const char* function_name) {
+            const auto cls = ref.find_class_any(class_name_text);
+            if (!cls)
+            {
+                append_anti_kick_log_file(std::string("[god-mode] class not found: ") + class_name_text + "\n");
+                return;
+            }
+            const auto function = ref.find_function_in_class(cls, function_name);
+            if (function)
+            {
+                remember_blocked(function);
+            }
+            else
+            {
+                append_anti_kick_log_file(
+                    std::string("[god-mode] function not found: ") + class_name_text + "." + function_name + "\n");
+            }
+        };
+
+        add_class_named("BP_FirstPersonCharacter_Main_C", "Damage");
+        add_class_named("BP_FirstPersonCharacter_LINK_C", "Damage");
+        add_class_named("BP_FirstPersonCharacter_cLeon_Character_C", "DeathPlayer");
+        add_class_named("BP_FirstPersonCharacter_cLeon_Character_Hunter_C", "KillPlayer");
+
+        if (blocked_count == 0)
+        {
+            return response_json(false, "god_mode_functions_unavailable", 0, 1,
+                                "could not resolve Damage/DeathPlayer/KillPlayer UFunctions");
+        }
+
+        std::string pe_hook_failure{};
+        if (!install_process_event_hook(pe_hook_failure))
+        {
+            return response_json(false, "god_mode_hook_failed", 0, 1, pe_hook_failure);
+        }
+        if (!g_original_process_event.load() || !is_executable_code(g_original_process_event.load()))
+        {
+            return response_json(false, "god_mode_hook_failed", 0, 1, "process_event_original_unavailable");
+        }
+
+        g_god_mode_local_pawn.store(ctx.pawn);
+        g_god_mode_blocked_function_count.store(blocked_count);
+        for (std::size_t i = 0; i < GodModeMaxBlockedFunctions; ++i)
+        {
+            g_god_mode_blocked_functions[i].store(i < blocked_count ? blocked[i] : 0);
+        }
+        god_mode_scrub_pawn(ctx.pawn);
+        g_god_mode_enabled.store(true);
+
+        append_anti_kick_log_file(
+            "[god-mode] enabled — blocking " + std::to_string(blocked_count) +
+            " UFunction(s) on pawn " + hex_address(ctx.pawn) + "\n");
+
+        std::string meta = "\"enabled\":true,\"blocked_functions\":" + std::to_string(blocked_count) +
+                           ",\"pawn\":\"" + hex_address(ctx.pawn) + "\"" +
+                           ",\"blocks_so_far\":" + std::to_string(g_god_mode_block_count.load());
+        return response_json(true, "set_god_mode", 0, 0, "god mode enabled", meta);
     }
 
     auto handle_get_anti_kick_log(const std::string& payload) -> std::string
@@ -9059,6 +10653,22 @@ namespace
         {
             return handle_game_set_anti_kick(payload, ref, ctx);
         }
+        if (request.find("\"type\":\"set_god_mode\"") != std::string::npos)
+        {
+            return handle_game_set_god_mode(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"get_skeleton\"") != std::string::npos)
+        {
+            return handle_game_get_skeleton(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"set_netconn_watch\"") != std::string::npos)
+        {
+            return handle_game_set_netconn_watch(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"dump_netconn_vtable\"") != std::string::npos)
+        {
+            return handle_game_dump_netconn_vtable(payload, ref, ctx);
+        }
         if (request.find("\"type\":\"set_player_name\"") != std::string::npos)
         {
             return handle_game_set_player_name(payload, ref, ctx);
@@ -9148,7 +10758,7 @@ namespace
         {
             return "{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,"
                    "\"message\":\"ok\",\"timing_ms\":{},"
-                   "\"metadata\":{\"commands\":[\"ping\",\"capabilities\",\"sdk_probe\",\"sdk_deep_probe\",\"paint_full_route\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"rotate\",\"set_anti_kick\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\"],"
+                   "\"metadata\":{\"commands\":[\"ping\",\"capabilities\",\"sdk_probe\",\"sdk_deep_probe\",\"paint_full_route\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"rotate\",\"set_anti_kick\",\"set_god_mode\",\"get_skeleton\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\",\"set_netconn_watch\",\"dump_netconn_vtable\"],"
                    "\"sdk\":\"runtime_dynamic_reflection_min\","
                    "\"paint_full_route\":\"template_brush_paint\","
                    "\"paint_full_route_fields\":[\"camera_yaw_offset\",\"camera_rotation_absolute\",\"camera_settle_ms\"],"
@@ -9161,6 +10771,10 @@ namespace
         if (line.find("\"type\":\"shutdown\"") != std::string::npos)
         {
             g_anti_kick_enabled.store(false);
+            g_god_mode_enabled.store(false);
+            g_god_mode_local_pawn.store(0);
+            g_god_mode_blocked_function_count.store(0);
+            g_netconn_watch_enabled.store(false);
             uninstall_anti_kick_vtable_hooks();
             uninstall_process_event_inline_hook();
             uninstall_process_event_hook();
@@ -9192,6 +10806,22 @@ namespace
             return execute_game_command_on_game_thread(line);
         }
         if (line.find("\"type\":\"set_anti_kick\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_god_mode\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"get_skeleton\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_netconn_watch\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"dump_netconn_vtable\"") != std::string::npos)
         {
             return execute_game_command_on_game_thread(line);
         }

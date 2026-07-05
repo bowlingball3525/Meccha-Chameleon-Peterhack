@@ -25,6 +25,7 @@ from meccha_chameleon_tools.core import (
     read_array, OFFSETS,
 )
 from meccha_chameleon_tools.config import Config, save_config
+from meccha_chameleon_tools.log_util import set_log_config
 from meccha_chameleon_tools.blocklist import (
     load_blocklist, save_blocklist, add_blocked_player, remove_blocked_player, blocklist_ids,
 )
@@ -368,10 +369,47 @@ def draw_corner_box(painter, pos, camera, screen_w, screen_h,
     painter.drawLine(max_x, max_y, max_x, max_y - corner)
 
 
-def draw_skeleton(painter, bone_positions, camera, screen_w, screen_h, color):
-    """Draw skeleton lines connecting bones."""
+def draw_skeleton(painter, bone_data, camera, screen_w, screen_h, color):
+    """Draw skeleton lines — MechaSRC segment lists or legacy bone-name dict."""
     from meccha_chameleon_tools.core import MecchaESP
 
+    segments = None
+    if isinstance(bone_data, dict):
+        segments = bone_data.get("segments")
+        bone_positions = {k: v for k, v in bone_data.items() if k != "segments"}
+    elif isinstance(bone_data, list):
+        segments = bone_data
+        bone_positions = None
+    else:
+        bone_positions = None
+
+    painter.save()
+    painter.setPen(QPen(QColor(*color), 2))
+    painter.setBrush(Qt.NoBrush)
+
+    if segments:
+        for seg in segments:
+            if not seg:
+                continue
+            if len(seg) >= 6:
+                p1, p2 = seg[:3], seg[3:6]
+            elif len(seg) == 2:
+                p1, p2 = seg[0], seg[1]
+            else:
+                continue
+            sx1, sy1, on1 = w2s(p1, camera, screen_w, screen_h)
+            sx2, sy2, on2 = w2s(p2, camera, screen_w, screen_h)
+            if not (on1 or on2):
+                continue
+            if not (math.isfinite(sx1) and math.isfinite(sy1) and math.isfinite(sx2) and math.isfinite(sy2)):
+                continue
+            x1, y1 = clamp_screen(sx1, sy1, screen_w, screen_h)
+            x2, y2 = clamp_screen(sx2, sy2, screen_w, screen_h)
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        painter.restore()
+        return
+
+    bone_positions = bone_positions or {}
     bone_screen = {}
     for name, pos in bone_positions.items():
         sx, sy, on_screen = w2s(pos, camera, screen_w, screen_h)
@@ -380,9 +418,6 @@ def draw_skeleton(painter, bone_positions, camera, screen_w, screen_h, color):
         cx, cy = clamp_screen(sx, sy, screen_w, screen_h)
         bone_screen[name] = (cx, cy)
     connections = MecchaESP.BONE_CONNECTIONS
-    painter.save()
-    painter.setPen(QPen(QColor(*color), 2))
-    painter.setBrush(Qt.NoBrush)
     for a, b in connections:
         if a in bone_screen and b in bone_screen:
             x1, y1 = bone_screen[a]
@@ -563,6 +598,7 @@ class Menu(QWidget):
         self.config = config
         self.esp = esp
         self.esp.config = config
+        set_log_config(config)
         self.esp._esp_bone_indices = getattr(config, "bone_indices", None) or {}
         self.setWindowTitle("Peterhack | Meccha Chameleon")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
@@ -1241,14 +1277,14 @@ class Menu(QWidget):
             QScrollBar:vertical {{ width: 0px; }}
             QScrollBar:horizontal {{ height: 0px; }}
         """)
-        self.tab_list.addItems(["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG"])
+        self.tab_list.addItems(["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG","DEBUGGING"])
         self.tab_list.currentRowChanged.connect(self._switch_tab)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background: transparent;")
 
         self._pages = {}
-        for tab_name in ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG"]:
+        for tab_name in ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG","DEBUGGING"]:
             page = QWidget()
             page.setStyleSheet("background: transparent;")
             self._pages[tab_name] = page
@@ -1305,9 +1341,10 @@ class Menu(QWidget):
         self._build_camouflage_tab()
         self._build_misc_tab()
         self._build_changelog_tab()
+        self._build_debugging_tab()
 
     def _switch_tab(self, idx):
-        names = ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG"]
+        names = ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG","DEBUGGING"]
         if 0 <= idx < len(names):
             self.stack.setCurrentIndex(idx)
             # Defer timer/tab work so stack layout cannot re-enter the event loop mid-switch.
@@ -1339,10 +1376,12 @@ class Menu(QWidget):
         self.cb_box = self._chk("2D Box","box_esp")
         self.cb_corner = self._chk("Corner Box","corner_box")
         self.cb_skeleton = self._chk("Skeleton","skeleton_esp")
+        self.cb_clone = self._chk("Clone ESP","clone_esp")
         row.addWidget(self.cb_dot)
         row.addWidget(self.cb_box)
         row.addWidget(self.cb_corner)
         row.addWidget(self.cb_skeleton)
+        row.addWidget(self.cb_clone)
         lo.addLayout(row)
         for cfg, label in [("show_local","Show Local Player"), ("show_names","Show Names"),
                            ("show_steam_id","Show Steam ID"), ("show_distance","Show Distance"),
@@ -1761,8 +1800,6 @@ class Menu(QWidget):
 
     def _on_trainer_rename_text_changed(self, text):
         self.config.trainer_rename_text = text.strip()
-        if hasattr(self.esp, "_trainer_auto_rename_queued_for"):
-            self.esp._trainer_auto_rename_queued_for = None
         if hasattr(self.esp, "_trainer_rename_pending_name"):
             self.esp._trainer_rename_pending_name = None
 
@@ -1810,6 +1847,28 @@ class Menu(QWidget):
         kr.addWidget(self.lbl_aim_key)
         kr.addWidget(self.btn_record_key)
         lo.addLayout(kr)
+        br = QHBoxLayout()
+        br.addWidget(QLabel("Lock Bone:"))
+        self.cmb_aim_bone = QComboBox()
+        for label, key in (
+            ("Head", "head"),
+            ("Neck", "neck_01"),
+            ("Chest", "chest"),
+            ("Spine", "spine_02"),
+            ("Pelvis", "pelvis"),
+        ):
+            self.cmb_aim_bone.addItem(label, key)
+        cur = self.cmb_aim_bone.findData(getattr(self.config, "aimbot_bone", "head"))
+        self.cmb_aim_bone.setCurrentIndex(cur if cur >= 0 else 0)
+        self.cmb_aim_bone.currentIndexChanged.connect(
+            lambda _i: setattr(self.config, "aimbot_bone", self.cmb_aim_bone.currentData())
+        )
+        self.cmb_aim_bone.setToolTip(
+            "Bone the aimbot locks onto — read live from game memory\n"
+            "every frame while the aim key is held."
+        )
+        br.addWidget(self.cmb_aim_bone)
+        lo.addLayout(br)
         fr = QHBoxLayout()
         fr.addWidget(QLabel("FOV Radius:"))
         self.spn_aim_fov = QSpinBox()
@@ -1848,15 +1907,12 @@ class Menu(QWidget):
         lo.addWidget(hdr)
 
         hint = QLabel(
-            "Logs go to C:\\peterhack\\logs\\latest.log when Debug Logging is on.\n"
-            "Toggles apply live memory writes via resolved SDK offsets."
+            "Memory writes via resolved SDK offsets. Use the DEBUGGING tab to control log output."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
         lo.addWidget(hint)
 
-        self.cb_trainer_debug = self._chk("Debug Logging", "trainer_debug")
-        lo.addWidget(self.cb_trainer_debug)
         lo.addWidget(self._chk("No Gun Cooldown (Hunter)", "trainer_no_gun_cooldown"))
         lo.addWidget(self._chk("No Recoil", "trainer_no_recoil"))
         lo.addWidget(self._chk("No Decoy Cooldown", "trainer_no_decoy_cooldown"))
@@ -1865,6 +1921,12 @@ class Menu(QWidget):
             "Clears OverlapCheckCapsules each tick so buried survivors are not revealed as \"Too Buried\"."
         )
         lo.addWidget(cb_anti_detect)
+        cb_god_mode = self._chk("God Mode (Survivor)", "trainer_god_mode")
+        cb_god_mode.setToolTip(
+            "MechaSRC god mode: bridge blocks Damage/DeathPlayer/KillPlayer ProcessEvent on your pawn\n"
+            "and keeps Health/Invincible/Dead scrubbed. Survivor/hider only — host kills may still apply server-side."
+        )
+        lo.addWidget(cb_god_mode)
         lo.addWidget(self._chk("Infinite Bullets (Hunter)", "trainer_infinite_bullets"))
         lo.addWidget(self._chk("Set Decoy Num", "trainer_set_decoy_num"))
 
@@ -1920,8 +1982,6 @@ class Menu(QWidget):
         self.lbl_return_lobby_status.setStyleSheet("color: #6a8a5a; font-size: 10px;")
         lo.addWidget(self.lbl_return_lobby_status)
 
-        lo.addWidget(self._chk("Auto-Rename", "trainer_auto_rename"))
-
         rr = QHBoxLayout()
         rr.addWidget(QLabel("Rename to:"))
         self.txt_trainer_rename = QLineEdit(self.config.trainer_rename_text)
@@ -1936,7 +1996,7 @@ class Menu(QWidget):
         self.btn_trainer_rename = QPushButton("Rename")
         self.btn_trainer_rename.setToolTip(
             "Send SetName(Server) once via bridge.\n"
-            "Works in lobby without Auto-Rename enabled."
+            "Works in lobby and in-match."
         )
         self.btn_trainer_rename.clicked.connect(self._run_trainer_rename)
         rr.addWidget(self.btn_trainer_rename)
@@ -2031,6 +2091,8 @@ class Menu(QWidget):
         self.btn_enemy_color.clicked.connect(lambda: self._pick_color("enemy_color"))
         self.btn_skeleton_color = QPushButton("Skeleton Color")
         self.btn_skeleton_color.clicked.connect(lambda: self._pick_color("skeleton_color"))
+        self.btn_clone_color = QPushButton("Clone ESP Color")
+        self.btn_clone_color.clicked.connect(lambda: self._pick_color("clone_color"))
         self.btn_visible_color = QPushButton("Visible (Enemy Only mode)")
         self.btn_visible_color.clicked.connect(lambda: self._pick_color("visible_color"))
         self.btn_not_visible_color = QPushButton("Not Visible (Enemy Only mode)")
@@ -2040,6 +2102,7 @@ class Menu(QWidget):
         lo.addWidget(self.btn_survivor_color)
         lo.addWidget(self.btn_enemy_color)
         lo.addWidget(self.btn_skeleton_color)
+        lo.addWidget(self.btn_clone_color)
         lo.addWidget(self.btn_visible_color)
         lo.addWidget(self.btn_not_visible_color)
         lo.addStretch()
@@ -2829,6 +2892,67 @@ class Menu(QWidget):
         )
         lo.addWidget(txt, 1)
 
+    def _build_debugging_tab(self):
+        p = self._pages["DEBUGGING"]
+        lo = QVBoxLayout(p)
+        lo.setContentsMargins(4, 4, 4, 4)
+        lo.setSpacing(6)
+
+        hdr = QLabel("Console / log filters")
+        hdr.setStyleSheet(
+            "color: #7ec850; font-size: 13px; font-weight: bold; padding-bottom: 2px;"
+        )
+        lo.addWidget(hdr)
+
+        hint = QLabel(
+            "Controls what is written to C:\\peterhack\\logs\\latest.log and the console.\n"
+            "Lines are matched by [TAG] prefix — e.g. [TRAINER:ANTI-KICK], [CAMO], [PAINT].\n"
+            "Timestamped session headers always go to the log file."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
+        lo.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_all_on = QPushButton("Enable all")
+        btn_all_off = QPushButton("Disable all")
+        btn_all_on.clicked.connect(lambda: self._set_log_toggles(True))
+        btn_all_off.clicked.connect(lambda: self._set_log_toggles(False))
+        btn_row.addWidget(btn_all_on)
+        btn_row.addWidget(btn_all_off)
+        btn_row.addStretch()
+        lo.addLayout(btn_row)
+
+        self._log_toggle_boxes = []
+        log_specs = [
+            ("Enable logging (master switch)", "log_master"),
+            ("Session startup / paths ([LOG])", "log_session"),
+            ("Trainer / exploits ([TRAINER:*])", "log_trainer"),
+            ("Anti-kick & freecam ([TRAINER:ANTI-KICK])", "log_anti_kick"),
+            ("Camouflage & bridge ([CAMO*])", "log_camo"),
+            ("Paint pipeline ([PAINT], [PRESET], [DIAG])", "log_paint"),
+            ("ESP snapshot ([ESP])", "log_esp"),
+            ("Aimbot ([AIMBOT])", "log_aimbot"),
+            ("Bone / skeleton bridge ([BONES])", "log_bones"),
+            ("Overlay / UI ([UI])", "log_ui"),
+            ("Game process / remote inject ([GAME], [REMOTE])", "log_game"),
+            ("Other / untagged messages", "log_misc"),
+        ]
+        for label, attr in log_specs:
+            cb = self._chk(label, attr)
+            self._log_toggle_boxes.append((attr, cb))
+            lo.addWidget(cb)
+
+        lo.addStretch()
+
+    def _set_log_toggles(self, enabled: bool):
+        for _label, attr in getattr(self, "_log_toggle_boxes", []):
+            setattr(self.config, attr, enabled)
+        for attr, cb in getattr(self, "_log_toggle_boxes", []):
+            cb.blockSignals(True)
+            cb.setChecked(enabled)
+            cb.blockSignals(False)
+
     def _browse_paint_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -3253,6 +3377,7 @@ class Overlay(QWidget):
     fps_apply_requested = pyqtSignal(int)
     # Keep the menu event loop responsive while it is on screen.
     MENU_OPEN_OVERLAY_FPS_CAP = 30
+    FREECAM_OVERLAY_FPS_CAP = 60
 
     def __init__(self, esp: MecchaESP, config: Config, menu=None):
         super().__init__()
@@ -3333,6 +3458,7 @@ class Overlay(QWidget):
             self.config.survivor_color,
             self.config.enemy_color,
             self.config.skeleton_color,
+            self.config.clone_color,
             self.config.box_color,
             self.config.radar_color,
             (255, 255, 255),
@@ -3508,6 +3634,8 @@ class Overlay(QWidget):
         target = max(1, min(240, int(getattr(self, "_target_overlay_fps", 60))))
         if self._menu_is_open():
             return min(target, self.MENU_OPEN_OVERLAY_FPS_CAP)
+        if hasattr(self.esp, "_is_freecam_or_spectating") and self.esp._is_freecam_or_spectating():
+            return min(target, self.FREECAM_OVERLAY_FPS_CAP)
         return target
 
     def _sync_overlay_timer_interval(self):
@@ -3529,14 +3657,22 @@ class Overlay(QWidget):
         if not timer.isActive():
             timer.start()
         target = int(getattr(self, "_target_overlay_fps", effective))
-        menu = getattr(self, "menu", None)
-        menu_open = effective < target
-        if menu_open:
+        menu_open = self._menu_is_open()
+        freecam = (
+            hasattr(self.esp, "_is_freecam_or_spectating")
+            and self.esp._is_freecam_or_spectating()
+        )
+        if menu_open and effective < target:
             print(
                 f"[UI] overlay timer {effective} FPS ({ms} ms) — menu open (saved {target} FPS)",
                 flush=True,
             )
-        else:
+        elif freecam and effective < target:
+            print(
+                f"[UI] overlay timer {effective} FPS ({ms} ms) — freecam/spectate (saved {target} FPS)",
+                flush=True,
+            )
+        elif prev_ms != ms:
             print(f"[UI] overlay timer {effective} FPS ({ms} ms)", flush=True)
 
     def set_ui_overlay_fps(self, fps: int):
@@ -4433,7 +4569,11 @@ class Overlay(QWidget):
         if not getattr(self.esp, "_menu_ui_active", False):
             import time as _time
             now = _time.monotonic()
-            if now - getattr(self, "_paint_cam_ts", 0.0) >= (1.0 / 90.0):
+            cam_hz = 30.0 if (
+                hasattr(self.esp, "_is_freecam_or_spectating")
+                and self.esp._is_freecam_or_spectating()
+            ) else 90.0
+            if now - getattr(self, "_paint_cam_ts", 0.0) >= (1.0 / cam_hz):
                 try:
                     self._paint_cam_cache = self.esp.get_camera()
                     self._paint_cam_ts = now
@@ -4450,6 +4590,16 @@ class Overlay(QWidget):
             painter.setPen(QPen(QColor(255, 255, 255)))
             painter.drawText(10, 20, "NO CAMERA")
             return
+
+        # Re-sync overlay timer when entering/leaving freecam (caps 240→60 FPS).
+        relaxed = (
+            hasattr(self.esp, "_is_freecam_or_spectating")
+            and self.esp._is_freecam_or_spectating()
+        )
+        prev_relaxed = getattr(self, "_overlay_relaxed_mode", None)
+        if prev_relaxed != relaxed:
+            self._overlay_relaxed_mode = relaxed
+            self._sync_overlay_timer_interval()
 
         steam_active = self._overlay_steam_features_active()
         self.esp.set_steam_features_active(steam_active)
@@ -4476,12 +4626,8 @@ class Overlay(QWidget):
                     scale = self.config.scale_reference_dist / d
                     scale = max(0.3, min(scale, 3.0))
 
-                # Dot: chest bone world position → screen (no pixel offset — that drifts with distance).
+                # Dot: chest position from snapshot (avoid per-frame bone reads).
                 dot_pos = pos
-                if actor:
-                    live_chest = self.esp.get_esp_world_pos(actor, self.config)
-                    if live_chest:
-                        dot_pos = live_chest
                 dot_sx, dot_sy, dot_on = w2s(dot_pos, cam, w, h)
                 dot_x, dot_y = dot_sx, dot_sy
                 if dot_on:
@@ -4583,7 +4729,7 @@ class Overlay(QWidget):
                                     self.config.box_height_world, hw, rot, color, scale)
 
                 # Skeleton ESP — isolated so bone-read failures never affect dot/box/labels
-                if self.config.skeleton_esp and actor and not is_local:
+                if self.config.skeleton_esp and actor and (not is_local or self.config.show_local):
                     try:
                         bones = pdata.get("bones")
                         if bones:
@@ -4616,13 +4762,9 @@ class Overlay(QWidget):
                     if is_local:
                         label_parts.append("YOU")
                     else:
-                        is_hunter   = pdata.get("is_hunter")
                         player_name = pdata.get("player_name", "").strip()
-                        team_str    = "Hunter" if is_hunter is True else ("Survivor" if is_hunter is False else "Player")
                         if player_name:
-                            label_parts.append(f"[{team_str}] {player_name}" if not self.config.show_roles else player_name)
-                        elif not self.config.show_roles:
-                            label_parts.append(f"[{team_str}]")
+                            label_parts.append(player_name)
                 steam_id = (pdata.get("steam_id") or "").strip()
                 if not is_local and self.esp.is_blocked_steam_id(steam_id):
                     label_parts.append("[BLOCKED]")
@@ -4665,6 +4807,46 @@ class Overlay(QWidget):
                            radar_x, radar_y,
                            self.config.radar_size, self.config.radar_range,
                            self.config.radar_color, self.config.radar_opacity)
+
+        # Clone / decoy ESP — dot on stomach + owner name (standard ESP colors)
+        if self.config.clone_esp:
+            for cdata in list((snap or {}).get("clones") or []):
+                try:
+                    cpos = cdata.get("pos")
+                    if not cpos:
+                        continue
+                    csx, csy, con = w2s(cpos, cam, w, h)
+                    if not con:
+                        continue
+                    cx, cy = clamp_screen(csx, csy, w, h)
+                    cd = dist(cpos, cam["loc"])
+                    cscale = 1.0
+                    if self.config.distance_scaling and cd > 0:
+                        cscale = self.config.scale_reference_dist / cd
+                        cscale = max(0.3, min(cscale, 3.0))
+                    owner_is_hunter = cdata.get("owner_is_hunter")
+                    if owner_is_hunter is True:
+                        color = self.config.hunter_color
+                    elif owner_is_hunter is False:
+                        color = self.config.survivor_color
+                    else:
+                        color = self.config.enemy_color
+                    radius = max(2, int(self.config.dot_radius * cscale))
+                    self._draw_dot(painter, cx, cy, radius, color)
+                    owner_name = (cdata.get("owner_name") or "").strip()
+                    if owner_name:
+                        fm = painter.fontMetrics()
+                        tw = fm.horizontalAdvance(owner_name)
+                        th = fm.height()
+                        _draw_label(
+                            painter,
+                            int(cx - tw / 2),
+                            int(cy - th - 4),
+                            owner_name,
+                            QColor(*color),
+                        )
+                except Exception:
+                    pass
 
         # FPS counters — effective cap + measured paint rate + in-game FPS
         target_fps = int(getattr(self, "_target_overlay_fps", 0) or getattr(self.config, "ui_overlay_fps", 60))
@@ -4724,9 +4906,21 @@ class Overlay(QWidget):
                     self.config.aimbot_fov * 2,
                     self.config.aimbot_fov * 2,
                 )
-            best_target = aim_target
-            if best_target and self._aim_key_held():
-                self._aim_at(best_target, cam)
+            if self._aim_key_held():
+                best_target = aim_target
+                # Re-read the locked bone straight from game memory every frame
+                # so the lock tracks the moving player, not a stale snapshot.
+                aim_actor = snap.get("aim_actor") if snap else None
+                if aim_actor:
+                    live_bone = self.esp.get_cached_aim_bone_world_pos(aim_actor, self.config)
+                    if live_bone:
+                        best_target = live_bone
+                    elif snap.get("aim_target"):
+                        best_target = snap.get("aim_target")
+                    else:
+                        best_target = None
+                if best_target:
+                    self._aim_at(best_target, cam)
 
     def _draw_dot(self, painter, cx, cy, r, color):
         painter.setPen(Qt.NoPen)
@@ -4743,10 +4937,18 @@ class Overlay(QWidget):
     def _find_best_target(self, camera, screen_w, screen_h):
         snap = self.esp.get_esp_paint_snapshot() if hasattr(self.esp, "get_esp_paint_snapshot") else None
         if snap and snap.get("aim_target") is not None:
+            aim_actor = snap.get("aim_actor")
+            if aim_actor:
+                live_bone = self.esp.get_cached_aim_bone_world_pos(aim_actor, self.config)
+                if live_bone:
+                    return live_bone
             return snap.get("aim_target")
         world = self.esp._get_world()
         local_pc = self.esp._get_local_controller(world) if world else 0
-        local_pawn = rp(self.esp.pm, local_pc + self.esp.offsets["APlayerController::AcknowledgedPawn"]) if local_pc else 0
+        local_pawn = self.esp._find_local_pawn() if hasattr(self.esp, "_find_local_pawn") else (
+            rp(self.esp.pm, local_pc + self.esp.offsets["APlayerController::AcknowledgedPawn"]) if local_pc else 0
+        )
+        local_is_hunter = self.esp._local_team_is_hunter() if hasattr(self.esp, "_local_team_is_hunter") else None
         local_pos = self.esp.get_actor_root_pos(local_pawn) if local_pawn else None
 
         cx, cy = screen_w / 2, screen_h / 2
@@ -4761,6 +4963,9 @@ class Overlay(QWidget):
             actor = pdata.get("actor")
             if not actor or actor == local_pawn or pdata.get("is_local"):
                 continue
+            if hasattr(self.esp, "_is_aimbot_valid_target"):
+                if not self.esp._is_aimbot_valid_target(pdata, local_is_hunter):
+                    continue
             if self.config.aimbot_visible_check and not self.esp._is_visible(actor):
                 continue
             pos = pdata["pos"]
@@ -4783,34 +4988,19 @@ class Overlay(QWidget):
         return best_target
 
     def _get_aim_point(self, pdata):
-        """World position to aim at — always targets the chest."""
+        """World position to aim at — the bone selected in the AIMBOT tab."""
+        bridge_bones = pdata.get("bridge_bones")
+        if bridge_bones:
+            bone = getattr(self.config, "aimbot_bone", "head") or "head"
+            pos = self.esp._pick_aim_bone_from_bridge_map(bridge_bones, bone, self.config)
+            if pos:
+                return pos
         actor = pdata.get("actor")
         if actor:
-            try:
-                bi = self.config.bone_indices
-                chest_bones = {
-                    "spine_02": bi.get("spine_02", 36),
-                    "spine_03": bi.get("spine_03", 52),
-                }
-                bones = self.esp.get_skeleton_positions_by_indices(actor, chest_bones)
-                if bones:
-                    # Prefer mid-chest (spine_02); average both if available for stability.
-                    if "spine_02" in bones and "spine_03" in bones:
-                        a, b = bones["spine_02"], bones["spine_03"]
-                        return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2)
-                    if "spine_02" in bones:
-                        return bones["spine_02"]
-                    if "spine_03" in bones:
-                        return bones["spine_03"]
-            except Exception:
-                pass
-        pos = pdata.get("pos")
-        if not pos:
-            return None
-        off = self.config.aimbot_target_offset
-        if abs(off) < 1.0:
-            off = 60.0   # chest height fallback when bone read fails
-        return (pos[0], pos[1], pos[2] + off)
+            bone_pos = self.esp.get_cached_aim_bone_world_pos(actor, self.config)
+            if bone_pos:
+                return bone_pos
+        return None
 
     @staticmethod
     def _look_at_rotation(from_pos, to_pos):

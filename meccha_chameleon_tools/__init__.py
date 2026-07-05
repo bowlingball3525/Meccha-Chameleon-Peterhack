@@ -207,6 +207,8 @@ def main():
 
     config = load_config()
     config = _enable_camouflage(config)
+    from meccha_chameleon_tools.log_util import set_log_config
+    set_log_config(config)
 
     from meccha_chameleon_tools.webhook import notify_peterhack_launch
     notify_peterhack_launch(config)

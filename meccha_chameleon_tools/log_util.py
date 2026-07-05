@@ -16,6 +16,91 @@ _original_stdout = None
 _original_stderr = None
 _original_excepthook = None
 _lock = threading.Lock()
+_log_config = None
+
+# Prefixes mapped to Config.log_* fields (see config.py DEBUGGING tab).
+_LOG_PREFIX_TO_CATEGORY = {
+    "LOG": "log_session",
+    "ESP": "log_esp",
+    "AIMBOT": "log_aimbot",
+    "BONES": "log_bones",
+    "UI": "log_ui",
+    "GAME": "log_game",
+    "REMOTE": "log_game",
+    "PAINT": "log_paint",
+    "PRESET": "log_paint",
+    "DIAG": "log_paint",
+    "CAMO": "log_camo",
+    "CAMO-CAP": "log_camo",
+    "CAMO-SAMPLE": "log_camo",
+    "CAMO-SS": "log_camo",
+    "CAMO-HIDE": "log_camo",
+    "CAMO-DIAG": "log_camo",
+}
+
+
+def set_log_config(config):
+    """Attach live Config so stdout filtering respects DEBUGGING tab toggles."""
+    global _log_config
+    _log_config = config
+
+
+def get_log_config():
+    return _log_config
+
+
+def _extract_log_tag(line: str):
+    """Return the first [TAG] token from a log line, or None."""
+    text = line.lstrip()
+    if not text.startswith("["):
+        return None
+    end = text.find("]")
+    if end <= 1:
+        return None
+    return text[1:end]
+
+
+def _classify_log_tag(tag: str):
+    if tag.startswith("TRAINER:"):
+        sub = tag.split(":", 1)[1]
+        if sub == "ANTI-KICK":
+            return "log_anti_kick"
+        return "log_trainer"
+    if tag in _LOG_PREFIX_TO_CATEGORY:
+        return _LOG_PREFIX_TO_CATEGORY[tag]
+    for prefix, category in _LOG_PREFIX_TO_CATEGORY.items():
+        if tag.startswith(prefix + "-") or tag.startswith(prefix + ":"):
+            return category
+    return "log_misc"
+
+
+def line_log_allowed(line: str, config=None) -> bool:
+    """True when a stdout/stderr line should be emitted per DEBUGGING toggles."""
+    cfg = config if config is not None else _log_config
+    if not line or not line.strip():
+        return True
+    if cfg is None:
+        return True
+    if not getattr(cfg, "log_master", True):
+        return False
+    tag = _extract_log_tag(line)
+    if tag is None:
+        return bool(getattr(cfg, "log_misc", True))
+    category = _classify_log_tag(tag)
+    return bool(getattr(cfg, category, False))
+
+
+def is_trainer_log_enabled(config, tag, level="info") -> bool:
+    """Gate trainer prints before formatting (avoids throttle work when disabled)."""
+    if config is None:
+        return True
+    if not getattr(config, "log_master", True):
+        return False
+    if tag == "ANTI-KICK":
+        return bool(getattr(config, "log_anti_kick", False))
+    if not getattr(config, "log_trainer", False):
+        return level == "error"
+    return True
 
 
 class _TeeStream:
@@ -27,19 +112,25 @@ class _TeeStream:
     def write(self, data):
         if not data:
             return 0
+        written = 0
         with _lock:
-            for fh in _log_files:
+            for line in data.splitlines(keepends=True):
+                if not line_log_allowed(line):
+                    written += len(line)
+                    continue
+                for fh in _log_files:
+                    try:
+                        fh.write(line)
+                        fh.flush()
+                    except Exception:
+                        pass
                 try:
-                    fh.write(data)
-                    fh.flush()
+                    self._stream.write(line)
+                    self._stream.flush()
                 except Exception:
                     pass
-            try:
-                self._stream.write(data)
-                self._stream.flush()
-            except Exception:
-                pass
-        return len(data)
+                written += len(line)
+        return written if written else len(data)
 
     def flush(self):
         with _lock:

@@ -562,6 +562,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     ESP_FRESH_MISS_LIMIT = 60       # frames to keep a player missing from a partial read
     ESP_POS_MISS_LIMIT = 30         # frames before dropping a cached player (pos miss)
     ESP_DEAD_STREAK_LIMIT = 4       # consecutive dead reads before hiding a player
+    ESP_TELEPORT_CLEAR_DIST = 2500.0  # local pawn jumps this far → lobby→match, clear cache
 
     GUOBJECT_SIG = bytes([
         0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00,
@@ -706,6 +707,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._health_offsets = None
         self._shield_offsets = None
         self._bone_cache = {}
+        self._bone_array_layout = None          # (mesh_comp_offset, stride) validated globally
+        self._bone_array_offset_by_mesh = {}    # mesh -> (offset, stride)
+        self._bone_array_logged_meshes = set()
+        self._local_owned_pawn_sticky = 0
+        self._local_owned_pawn_sticky_ps = 0
         self._paint_screen_worker_rva = None   # cached native PaintAtScreenPosition worker
         self._hittest_screen_worker_rva = None
         self._paint_at_uv_worker_rva = None    # cached PaintAtUV deep native worker
@@ -992,6 +998,38 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             bi.update(user)
         return bi
 
+    def _effective_bone_index_map(self, mesh_comp, config, count):
+        """Bone name -> index valid for THIS runtime array (len=count).
+
+        Dumped/config indices describe the asset's full reference skeleton,
+        but the runtime ComponentSpaceTransforms array can be a reduced
+        skeleton (28 bones on Chameleon characters). Per bone, prefer the
+        mesh-resolved index, then config, then the legacy runtime map — but
+        only if the index actually fits the array.
+        """
+        legacy = self._CHAMELEON_BONE_INDICES
+        cfg = {}
+        if config:
+            cfg = getattr(config, "bone_indices", None) or {}
+        if not cfg:
+            cfg = getattr(self, "_esp_bone_indices", None) or {}
+        resolved = self._resolve_bone_indices(mesh_comp) if mesh_comp else {}
+        # A reduced runtime skeleton (few bones) uses the legacy layout —
+        # reference-skeleton indices don't apply to it at all.
+        reduced = count <= 40
+        out = {}
+        names = set(legacy) | set(cfg) | set(resolved or {})
+        for name in names:
+            if reduced:
+                candidates = (legacy.get(name), resolved.get(name), cfg.get(name))
+            else:
+                candidates = (resolved.get(name), cfg.get(name), legacy.get(name))
+            for idx in candidates:
+                if idx is not None and 0 <= int(idx) < count:
+                    out[name] = int(idx)
+                    break
+        return out
+
     @staticmethod
     def _chest_world_pos_from_bones(bones):
         """Lower sternum from spine bones — avoid spine_03/neck (reads too high)."""
@@ -1027,19 +1065,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             config = getattr(self, "config", None)
         chest = None
         try:
-            bi = self._esp_bone_index_map(config)
-            mesh_comp = self.get_skeletal_mesh(actor)
-            if mesh_comp:
-                name_map = self._resolve_bone_indices(mesh_comp)
-                for bname in self.COMMON_BONE_NAMES:
-                    idx = name_map.get(bname)
-                    if idx is not None:
-                        bi[bname] = idx
-            chest_keys = ("pelvis", "spine_01", "spine_02")
-            chest_bones = {k: bi[k] for k in chest_keys if k in bi}
-            if chest_bones:
-                bones = self.get_skeleton_positions_by_indices(actor, chest_bones)
-                chest = self._chest_world_pos_from_bones(bones)
+            bones, _count, _mesh = self._read_actor_bones(
+                actor, ("pelvis", "spine_01", "spine_02"), config,
+            )
+            chest = self._chest_world_pos_from_bones(bones)
         except Exception:
             pass
         if chest and self._is_valid_world_loc(chest):
@@ -1175,8 +1204,18 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     # UE5.6 skeleton offsets (build 44394996)
     _SCENE_COMPONENT_TO_WORLD = 0x1E0          # FTransform (96B) at end of USceneComponent (0x240)
     _CACHED_COMPONENT_SPACE_TRANSFORMS = 0x09B8
-    _FTRANSFORM_STRIDE = 0x60                  # FTransform = 96 bytes in this build
-    _MESH_OFFSETS = (0x0418, 0x0328)           # BP_FirstPersonCharacter_Main_C::Mesh, ACharacter::Mesh
+    _FTRANSFORM_STRIDE = 0x60                  # FTransform (96B) — also try 0x50 (FTransform3d)
+    _FTRANSFORM_STRIDES = (0x50, 0x60)
+    # Dump offset ± double-buffer sibling; never scan 0x600/0x928 (false-positive TArrays).
+    _BONE_ARRAY_PROBE_OFFSETS = (
+        0x09B8, 0x09C8, 0x09A8, 0x09D8, 0x0998, 0x09E8,
+    )
+    _MESH_OFFSETS = (0x0418, 0x04C8, 0x0328, 0x02B0)  # Mesh, FirstPersonMesh, ACharacter::Mesh, decoy
+    OFF_RUNTIME_PAINTABLE = 0x0B68
+    OFF_SPAWNED_DECOY_ACTORS = 0x02D0   # URuntimePaintableComponent::SpawnedDecoyActors
+    # BP_cLeonDecoy_Base_C::RuntimePaintCopy + URuntimePaintCopyComponent::ReplicatedSourceActor
+    _DECOY_COPY_COMP_OFF = 0x02B8
+    _COPY_SOURCE_ACTOR_OFF = 0x0140
 
     def _resolve_health(self, actor, ps):
         """Resolve health/shield offsets on the pawn class once, cache them."""
@@ -1518,19 +1557,33 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         """Return the USkeletalMeshComponent pointer for the actor.
 
         Tries BP_FirstPersonCharacter_Main_C::Mesh @ 0x0418 first (this game),
-        then ACharacter::Mesh @ 0x0328, then OwnedComponents walk.
+        then FirstPersonMesh, ACharacter::Mesh, decoy PoseableMesh, then component walk.
+        Prefers a component whose bone array looks populated.
         """
+        candidates = []
+        seen = set()
+
+        def _consider(mesh):
+            if not mesh or mesh in seen:
+                return
+            cn = self.objects.class_name(mesh) or ""
+            if "SkeletalMesh" in cn or "SkinnedMesh" in cn or "PoseableMesh" in cn:
+                seen.add(mesh)
+                candidates.append(mesh)
+
         for off in self._MESH_OFFSETS:
-            mesh = rp(self.pm, actor + off)
-            if mesh:
-                cn = self.objects.class_name(mesh)
-                if "SkeletalMesh" in cn or "SkinnedMesh" in cn:
-                    return mesh
-        for pattern in ("SkeletalMeshComponent", "SkinnedMeshComponent"):
+            _consider(rp(self.pm, actor + off))
+        for pattern in ("SkeletalMeshComponent", "SkinnedMeshComponent", "PoseableMeshComponent"):
             comp = self.find_component_by_class_partial(actor, pattern)
-            if comp:
-                return comp
-        return 0
+            _consider(comp)
+
+        if not candidates:
+            return 0
+        for mesh in candidates:
+            bone_data, count, _ = self._bones_array_info(mesh)
+            if bone_data and count >= 7:
+                return mesh
+        return candidates[0]
 
     def get_bone_transforms(self, mesh_comp):
         """Read CachedComponentSpaceTransforms from USkeletalMeshComponent.
@@ -1544,16 +1597,16 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         """
         if not mesh_comp:
             return None
-        data, count = read_tarray_ptr(self.pm, mesh_comp + 0x09B8)
+        data, count, stride = self._bones_array_info(mesh_comp)
         if not data or count == 0 or count > 1024:
             return None
         bones = []
         try:
-            raw_all = self.pm.read_bytes(data, count * self._FTRANSFORM_STRIDE)
+            raw_all = self.pm.read_bytes(data, count * stride)
         except Exception:
             return None
         for i in range(count):
-            base = i * self._FTRANSFORM_STRIDE
+            base = i * stride
             try:
                 qx, qy, qz, qw = struct.unpack_from("<dddd", raw_all, base)
                 tx, ty, tz     = struct.unpack_from("<ddd",  raw_all, base + 32)
@@ -1562,27 +1615,175 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 bones.append(None)
         return bones
 
-    def _bones_array_info(self, mesh_comp):
-        """Return (data_ptr, count) for CachedComponentSpaceTransforms."""
-        if not mesh_comp:
-            return 0, 0
-        data, count = read_tarray_ptr(self.pm, mesh_comp + self._CACHED_COMPONENT_SPACE_TRANSFORMS)
-        if not data or count <= 0 or count > 512:
-            return 0, 0
-        return data, count
+    def _tarray_is_valid_bone_array(self, data, count):
+        """Heuristic: does (data, count) look like a populated FTransform array?"""
+        if not data or count < 8 or count > 512:
+            return False
+        try:
+            # Sample first, middle, and last transforms — a real bone array has
+            # finite translations at every slot; random TArrays often fail mid-array.
+            for idx in (0, count // 2, count - 1):
+                ok = False
+                for stride in self._FTRANSFORM_STRIDES:
+                    raw = self.pm.read_bytes(data + idx * stride + 32, 24)
+                    tx, ty, tz = struct.unpack("<ddd", raw)
+                    if all(math.isfinite(v) for v in (tx, ty, tz)) and max(abs(tx), abs(ty), abs(tz)) <= 1e7:
+                        ok = True
+                        break
+                if not ok:
+                    return False
+            # Rotation quat of first element should be roughly unit-length.
+            qraw = self.pm.read_bytes(data, 32)
+            qx, qy, qz, qw = struct.unpack("<dddd", qraw)
+            qlen = qx * qx + qy * qy + qz * qz + qw * qw
+            if not math.isfinite(qlen) or qlen < 0.5 or qlen > 1.5:
+                return False
+            return True
+        except Exception:
+            return False
 
-    def _bone_local_position(self, bone_data, count, idx):
-        """Read translation from one FTransform in the bone array."""
+    def _bone_local_position_at_stride(self, bone_data, count, idx, stride):
+        """Read translation from one FTransform in the bone array at a given stride."""
         if idx < 0 or idx >= count:
             return None
         try:
-            raw = self.pm.read_bytes(bone_data + idx * self._FTRANSFORM_STRIDE + 32, 24)
+            raw = self.pm.read_bytes(bone_data + idx * stride + 32, 24)
             tx, ty, tz = struct.unpack("<ddd", raw)
             if not all(math.isfinite(v) for v in (tx, ty, tz)):
                 return None
             return tx, ty, tz
         except Exception:
             return None
+
+    def _validate_runtime_bone_content(self, bone_data, count, stride):
+        """True when pelvis/head indices look like a standing humanoid skeleton."""
+        if not bone_data or count < 7:
+            return False
+        pairs = ((1, 6), (0, 5), (2, 7))
+        for pelvis_idx, head_idx in pairs:
+            if head_idx >= count:
+                continue
+            pelvis = self._bone_local_position_at_stride(bone_data, count, pelvis_idx, stride)
+            head = self._bone_local_position_at_stride(bone_data, count, head_idx, stride)
+            if not pelvis or not head:
+                continue
+            # UE world uses Z-up; component-space bones usually follow the same axis.
+            if head[2] <= pelvis[2] + 5.0:
+                continue
+            dist = math.sqrt(
+                (head[0] - pelvis[0]) ** 2
+                + (head[1] - pelvis[1]) ** 2
+                + (head[2] - pelvis[2]) ** 2
+            )
+            if 35.0 <= dist <= 280.0:
+                return True
+        return False
+
+    def _probe_bone_array_at(self, mesh_comp, off, stride_hint=None):
+        """Return (data, count, stride) for mesh_comp+off if TArray + skeleton check pass."""
+        data, count = read_tarray_ptr(self.pm, mesh_comp + off)
+        if not self._tarray_is_valid_bone_array(data, count):
+            return 0, 0, None
+        strides = (stride_hint,) if stride_hint else self._FTRANSFORM_STRIDES
+        for stride in strides:
+            if stride and self._validate_runtime_bone_content(data, count, stride):
+                return data, count, stride
+        return 0, 0, None
+
+    def _normalize_bone_layout(self, layout):
+        """Return (offset, stride) from cache entry (supports legacy int offsets)."""
+        if layout is None:
+            return None
+        if isinstance(layout, int):
+            return layout, self._FTRANSFORM_STRIDE
+        if isinstance(layout, (tuple, list)) and len(layout) >= 2:
+            return int(layout[0]), int(layout[1])
+        return None
+
+    def _bone_layout_probe_offsets(self, base_off):
+        """Offsets to try for one cached/dump base (double-buffered TArrays are 0x10 apart)."""
+        seen = set()
+        for delta in (0, 0x10, -0x10):
+            off = base_off + delta
+            if off > 0 and off not in seen:
+                seen.add(off)
+                yield off
+
+    def _remember_bone_layout(self, mesh_comp, off, stride):
+        layout = (off, stride)
+        self._bone_array_offset_by_mesh[mesh_comp] = layout
+        if self._bone_array_layout is None:
+            self._bone_array_layout = layout
+        logged = getattr(self, "_bone_array_logged_meshes", None)
+        if logged is None:
+            self._bone_array_logged_meshes = set()
+            logged = self._bone_array_logged_meshes
+        if mesh_comp not in logged:
+            logged.add(mesh_comp)
+            print(
+                f"[BONES] mesh 0x{mesh_comp:X} ComponentSpaceTransforms @ 0x{off:X} "
+                f"({stride}B stride)",
+                flush=True,
+            )
+
+    def _bones_array_info(self, mesh_comp):
+        """Return (data_ptr, count, stride) for the populated bone-transform array.
+
+        Only probes the dump region (0x9B8 ± siblings) — wide scans produced false
+        positives at 0x600/0x928. Runs on any thread (cheap TArray probes only).
+        """
+        if not mesh_comp:
+            return 0, 0, self._FTRANSFORM_STRIDE
+
+        by_mesh = self._bone_array_offset_by_mesh
+        cached = self._normalize_bone_layout(by_mesh.get(mesh_comp))
+        if cached:
+            off, stride = cached
+            for try_off in self._bone_layout_probe_offsets(off):
+                data, count, got_stride = self._probe_bone_array_at(mesh_comp, try_off, stride)
+                if data:
+                    if (try_off, got_stride) != cached:
+                        self._remember_bone_layout(mesh_comp, try_off, got_stride)
+                    return data, count, got_stride
+
+        global_layout = self._normalize_bone_layout(self._bone_array_layout)
+        if global_layout:
+            off, stride = global_layout
+            for try_off in self._bone_layout_probe_offsets(off):
+                data, count, got_stride = self._probe_bone_array_at(mesh_comp, try_off, stride)
+                if data:
+                    self._remember_bone_layout(mesh_comp, try_off, got_stride)
+                    return data, count, got_stride
+
+        dump = self._CACHED_COMPONENT_SPACE_TRANSFORMS
+        candidates = list(self._BONE_ARRAY_PROBE_OFFSETS)
+        for off in self._bone_layout_probe_offsets(dump):
+            if off not in candidates:
+                candidates.append(off)
+        for off in candidates:
+            data, count, stride = self._probe_bone_array_at(mesh_comp, off)
+            if data:
+                self._remember_bone_layout(mesh_comp, off, stride)
+                return data, count, stride
+
+        # Last resort: narrow scan near dump (snapshot thread only — still validated).
+        if threading.current_thread().name == "esp-snapshot":
+            base = self._CACHED_COMPONENT_SPACE_TRANSFORMS
+            for off in range(base - 0x80, base + 0x81, 0x08):
+                if off in candidates:
+                    continue
+                data, count, stride = self._probe_bone_array_at(mesh_comp, off)
+                if data:
+                    self._remember_bone_layout(mesh_comp, off, stride)
+                    return data, count, stride
+
+        return 0, 0, self._FTRANSFORM_STRIDE
+
+    def _bone_local_position(self, bone_data, count, idx, stride=None):
+        """Read translation from one FTransform in the bone array."""
+        if stride is None:
+            stride = self._FTRANSFORM_STRIDE
+        return self._bone_local_position_at_stride(bone_data, count, idx, stride)
 
     def _bone_to_world(self, mesh_world_pos, mesh_world_quat, local_pos):
         rotated = self._quat_rotate(mesh_world_quat, local_pos)
@@ -1610,12 +1811,12 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 return ref_pos, self._euler_to_quat(*rot)
         return None, None
 
-    def _bones_indices_to_world(self, index_map, bone_data, count, mesh_world_pos, mesh_world_quat):
+    def _bones_indices_to_world(self, index_map, bone_data, count, mesh_world_pos, mesh_world_quat, stride=None):
         result = {}
         for name, idx in index_map.items():
             if idx is None or idx < 0 or idx >= count:
                 continue
-            local_pos = self._bone_local_position(bone_data, count, idx)
+            local_pos = self._bone_local_position(bone_data, count, idx, stride)
             if local_pos is None:
                 continue
             world = self._bone_to_world(mesh_world_pos, mesh_world_quat, local_pos)
@@ -1631,17 +1832,12 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         mesh_world_pos, mesh_world_quat = self._get_mesh_world_transform(actor, mesh_comp)
         if mesh_world_pos is None:
             return None
-        bone_data, count = self._bones_array_info(mesh_comp)
+        bone_data, count, stride = self._bones_array_info(mesh_comp)
         if not bone_data or count < 7:
             return None
-        name_map = self._resolve_bone_indices(mesh_comp)
-        index_map = dict(self._CHAMELEON_BONE_INDICES)
-        for bname in self.COMMON_BONE_NAMES:
-            idx = name_map.get(bname)
-            if idx is not None:
-                index_map[bname] = idx
+        index_map = self._effective_bone_index_map(mesh_comp, getattr(self, "config", None), count)
         return self._bones_indices_to_world(
-            index_map, bone_data, count, mesh_world_pos, mesh_world_quat,
+            index_map, bone_data, count, mesh_world_pos, mesh_world_quat, stride,
         )
 
     def get_skeleton_positions_by_indices(self, actor, bone_indices):
@@ -1652,11 +1848,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         mesh_world_pos, mesh_world_quat = self._get_mesh_world_transform(actor, mesh_comp)
         if mesh_world_pos is None:
             return None
-        bone_data, count = self._bones_array_info(mesh_comp)
+        bone_data, count, stride = self._bones_array_info(mesh_comp)
         if not bone_data:
             return None
         return self._bones_indices_to_world(
-            bone_indices, bone_data, count, mesh_world_pos, mesh_world_quat,
+            bone_indices, bone_data, count, mesh_world_pos, mesh_world_quat, stride,
         )
 
     # -----------------------------------------------------------------------
@@ -1734,6 +1930,22 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return True
         return False
 
+    def _local_team_is_hunter(self):
+        """Hunter/Survivor role for the local player (stable through freecam)."""
+        pawn = self._find_local_pawn()
+        if not pawn:
+            return None
+        return self._read_is_hunter(pawn)
+
+    def _is_aimbot_valid_target(self, pdata, local_is_hunter):
+        """Aimbot always skips same-team players."""
+        if pdata.get("is_local"):
+            return False
+        target_is_hunter = pdata.get("is_hunter")
+        if local_is_hunter is None or target_is_hunter is None:
+            return False
+        return self._is_player_enemy(local_is_hunter, target_is_hunter)
+
     def _is_visible(self, actor):
         """Approximate visibility — component hidden flag + actor bHidden."""
         if not actor:
@@ -1766,11 +1978,183 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return False
         if "Decoy" in cls_name and "Character" in cls_name:
             return False
+        if cls_name.startswith("BP_cLeonDecoy_"):
+            return False
         if "BP_FirstPersonCharacter" in cls_name:
             return True
         if "cLeon" in cls_name and "Character" in cls_name:
             return True
         return False
+
+    @staticmethod
+    def _is_clone_class(cls_name):
+        """True for paint decoy / clone actors (shooting them kills the owner)."""
+        if not cls_name:
+            return False
+        if cls_name.startswith("BP_cLeonDecoy_"):
+            return True
+        if "Decoy" in cls_name and "Character" not in cls_name:
+            return True
+        return False
+
+    def _get_clone_owner_actor(self, decoy_actor):
+        """Resolve the real player pawn that owns a decoy copy."""
+        if not decoy_actor:
+            return 0
+        copy_comp = rp(self.pm, decoy_actor + self._DECOY_COPY_COMP_OFF)
+        if not copy_comp:
+            copy_comp = self.find_component_by_class_partial(decoy_actor, "RuntimePaintCopy")
+        if not copy_comp:
+            return 0
+        owner = rp(self.pm, copy_comp + self._COPY_SOURCE_ACTOR_OFF)
+        if owner and owner != decoy_actor:
+            return owner
+        return 0
+
+    def _resolve_clone_owner_label(self, owner_actor):
+        if not owner_actor:
+            return ""
+        ps = rp(self.pm, owner_actor + self.offsets.get("APawn::PlayerState", 0x2C0))
+        if ps:
+            name = self.get_player_name(ps)
+            if name:
+                return name
+        return ""
+
+    def _paintable_component(self, pawn):
+        if not pawn:
+            return 0
+        comp = rp(self.pm, pawn + self.OFF_RUNTIME_PAINTABLE)
+        if comp:
+            return comp
+        return self.find_component_by_class_partial(pawn, "RuntimePaintable")
+
+    def _read_spawned_decoy_actor_ptrs(self, paint_comp):
+        """Read replicated SpawnedDecoyActors TArray on RuntimePaintableComponent."""
+        if not paint_comp:
+            return []
+        data, count, _ = read_array(self.pm, paint_comp + self.OFF_SPAWNED_DECOY_ACTORS)
+        if not data or count <= 0 or count > 64:
+            return []
+        out = []
+        for i in range(count):
+            actor = rp(self.pm, data + i * 8)
+            if actor:
+                out.append(actor)
+        return out
+
+    def _get_clone_dot_world_pos(self, decoy_actor, config=None):
+        """Stomach/chest world point for clone ESP dot."""
+        if config is None:
+            config = getattr(self, "config", None)
+        pos = self.get_esp_world_pos(decoy_actor, config)
+        if pos:
+            return pos
+        try:
+            bones, _count, _mesh = self._read_actor_bones(
+                decoy_actor, ("pelvis", "spine_01", "spine_02"), config,
+            )
+            chest = self._chest_world_pos_from_bones(bones)
+            if chest and self._is_valid_world_loc(chest):
+                return chest
+        except Exception:
+            pass
+        root = self.get_actor_root_pos(decoy_actor)
+        if root:
+            return (root[0], root[1], root[2] + 85.0)
+        return None
+
+    def _clone_entry_from_actor(self, decoy_actor, owner_pawn=0, config=None):
+        cls_name = self.objects.class_name(decoy_actor) or ""
+        pos = self._get_clone_dot_world_pos(decoy_actor, config)
+        if not pos:
+            return None
+        owner = self._get_clone_owner_actor(decoy_actor) or owner_pawn or 0
+        return {
+            "actor": decoy_actor,
+            "pos": pos,
+            "owner_actor": owner,
+            "owner_name": self._resolve_clone_owner_label(owner),
+            "owner_is_hunter": self._read_is_hunter(owner) if owner else None,
+            "class_name": cls_name,
+        }
+
+    def get_clone_decoys(self, max_count=32, config=None):
+        """Collect paint decoy copies from SpawnedDecoyActors + level scan fallback."""
+        if config is None:
+            config = getattr(self, "config", None)
+        import time as _time
+        now = _time.monotonic()
+        last_ts = getattr(self, "_clone_scan_ts", 0.0)
+        scan_interval = 0.35 if self._esp_perf_relaxed() else 0.15
+        if now - last_ts < scan_interval:
+            return list(getattr(self, "_clone_cache", []) or [])
+        self._clone_scan_ts = now
+
+        clones = []
+        seen = set()
+
+        def _add_decoy(decoy_actor, owner_pawn=0):
+            if not decoy_actor or decoy_actor in seen or len(clones) >= max_count:
+                return
+            entry = self._clone_entry_from_actor(decoy_actor, owner_pawn=owner_pawn, config=config)
+            if not entry:
+                return
+            seen.add(decoy_actor)
+            clones.append(entry)
+
+        # Primary: replicated SpawnedDecoyActors on every known player pawn.
+        pawns = []
+        local = self._find_local_pawn()
+        if local:
+            pawns.append(local)
+        try:
+            for pdata in self.get_players(include_local=True):
+                actor = pdata.get("actor")
+                if actor and actor not in pawns:
+                    pawns.append(actor)
+        except Exception:
+            pass
+        for pawn in pawns:
+            comp = self._paintable_component(pawn)
+            if not comp:
+                continue
+            for decoy in self._read_spawned_decoy_actor_ptrs(comp):
+                _add_decoy(decoy, owner_pawn=pawn)
+
+        # Fallback: scan level actors (catches decoys before TArray replicates).
+        if len(clones) < max_count:
+            world = self._get_world()
+            if world:
+                persistent_level_off = self.resolver.resolve("World", "PersistentLevel") \
+                    if hasattr(self, "resolver") else None
+                if persistent_level_off is None:
+                    persistent_level_off = 0x30
+                level = rp(self.pm, world + persistent_level_off)
+                if level:
+                    actors_off = self.resolver.resolve("Level", "Actors") \
+                        if hasattr(self, "resolver") else None
+                    if actors_off is None:
+                        actors_off = 0x98
+                    actors_data, actors_count, _ = read_array(self.pm, level + actors_off)
+                    if actors_data and actors_count > 0:
+                        cap = min(actors_count, 4096)
+                        for i in range(cap):
+                            if len(clones) >= max_count:
+                                break
+                            actor = rp(self.pm, actors_data + i * 8)
+                            if not actor:
+                                continue
+                            cls_name = self.objects.class_name(actor) or ""
+                            if not self._is_clone_class(cls_name):
+                                continue
+                            _add_decoy(actor)
+
+        if clones and not getattr(self, "_clone_esp_ok_logged", False):
+            print(f"[ESP] clone scan ok — {len(clones)} decoy(s)", flush=True)
+            self._clone_esp_ok_logged = True
+        self._clone_cache = clones
+        return list(clones)
 
     def clear_players_cache(self, reason=""):
         if self._players_cache:
@@ -1783,6 +2167,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._steam_id_cache.clear()
         self._ps_pc_cache.clear()
         self._ps_pc_cache_ts = 0.0
+        self._local_owned_pawn_sticky = 0
+        self._local_owned_pawn_sticky_ps = 0
 
     def set_blocked_steam_ids(self, ids):
         """Cache blocklist Steam IDs for ESP highlighting."""
@@ -2464,12 +2850,19 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     def _merge_players_cache(self, fresh, cap):
         """Merge a partial fresh read with cache — never drop players on one bad frame."""
         fresh_actors = set()
+        fresh_ps_to_actor = {}
+        for p in fresh:
+            ps = p.get("player_state") or 0
+            actor = p.get("actor")
+            if ps and actor:
+                fresh_ps_to_actor[ps] = actor
+            if actor:
+                fresh_actors.add(actor)
         merged = []
         for p in fresh:
             actor = p.get("actor")
             if not actor:
                 continue
-            fresh_actors.add(actor)
             entry = dict(p)
             entry["_fresh_miss"] = 0
             entry["_pos_miss"] = 0
@@ -2486,6 +2879,9 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             if not actor or actor in fresh_actors:
                 continue
             ps = p.get("player_state", 0)
+            # Same PlayerState respawned with a new pawn — drop the old lobby pawn.
+            if ps and ps in fresh_ps_to_actor and fresh_ps_to_actor[ps] != actor:
+                continue
             if not self._pawn_alive_for_esp(actor, ps):
                 continue
             miss = int(p.get("_fresh_miss", 0)) + 1
@@ -2521,6 +2917,28 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._players_cache = updated
         return self._players_cache[:cap]
 
+    def _maybe_clear_players_on_teleport(self):
+        """Lobby→match teleports the local pawn — stale lobby pawns must not linger."""
+        world = self._get_world()
+        if not world:
+            return
+        pc = self._get_local_controller(world)
+        if not pc:
+            return
+        # Owned pawn stays put during freecam/spectate; AcknowledgedPawn jumps to spectated actors.
+        pawn = self._find_local_pawn()
+        if not pawn:
+            return
+        pos = self.get_actor_root_pos(pawn)
+        if not pos:
+            return
+        last = getattr(self, "_esp_last_local_pos", None)
+        self._esp_last_local_pos = pos
+        if last and dist(pos, last) >= self.ESP_TELEPORT_CLEAR_DIST:
+            if self._players_cache:
+                self.clear_players_cache("local pawn teleported (lobby→match)")
+            # Bone TArray offsets are per mesh component, not world position — keep them.
+
     def get_players(self, include_local=False, team_filter=False, enemy_only=False):
         """Return up to MAX_ESP_PLAYERS entries.
 
@@ -2530,6 +2948,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         if not self._tick_esp_session():
             return self._players_cache[: self.MAX_ESP_PLAYERS]
 
+        self._maybe_clear_players_on_teleport()
         self._maybe_notify_discord_session()
 
         cap = self.MAX_ESP_PLAYERS
@@ -2555,10 +2974,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             return
         gamestate = rp(self.pm, world + self.offsets["UWorld::GameState"])
         pc = self._get_local_controller(world)
-        local_pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"]) if pc else 0
         local_ps   = rp(self.pm, pc + self.offsets["AController::PlayerState"]) if pc else 0
-        local_is_hunter = self._read_is_hunter(local_pawn) if local_pawn else None
-        local_pawn_cls = self.objects.class_name(local_pawn) if local_pawn else ""
+        owned_pawn = self._resolve_owned_pawn(local_ps, sticky=True) if local_ps else 0
+        local_pawn = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"]) if pc else 0
+        local_is_hunter = self._read_is_hunter(owned_pawn) if owned_pawn else None
+        local_pawn_cls = self.objects.class_name(owned_pawn) if owned_pawn else ""
         # If the acknowledged pawn is not a real playable character (e.g. the user
         # is dead and controlling a spectator/ragdoll) treat their class as unknown
         # so team_filter does not mistakenly remove living players of the same class.
@@ -2568,21 +2988,23 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         # Tracks every pawn address already yielded so the same actor is never
         # drawn twice (happens when multiple PlayerState entries share one PawnPrivate).
         seen_pawns = set()
-        if local_pawn and self._is_player_class(local_pawn_cls):
-            seen_pawns.add(local_pawn)
+        if owned_pawn and self._is_player_class(local_pawn_cls):
+            seen_pawns.add(owned_pawn)
 
         total = 0
-        if include_local and local_pawn:
-            pos = self.get_esp_world_pos(local_pawn)
+        pa_count = 0
+        pa_player_states = set()
+        if include_local and owned_pawn:
+            pos = self.get_esp_world_pos(owned_pawn)
             if pos:
                 total += 1
                 yield {
                     "is_local": True,
                     "pos": pos,
                     "idx": 0,
-                    "actor": local_pawn,
+                    "actor": owned_pawn,
                     "player_state": local_ps,
-                    "is_hunter": self._read_is_hunter(local_pawn),
+                    "is_hunter": self._read_is_hunter(owned_pawn),
                     "player_name": self.get_player_name(local_ps),
                     "steam_id": self._esp_steam_id(local_ps),
                 }
@@ -2601,6 +3023,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     ps = rp(self.pm, pa_data + i * 8)
                     if not ps or ps == local_ps:
                         continue
+                    pa_player_states.add(ps)
                     pawn = rp(self.pm, ps + self.offsets["APlayerState::PawnPrivate"])
                     if not pawn or pawn in seen_pawns:
                         continue
@@ -2635,6 +3058,13 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     }
 
         if total >= self.MAX_ESP_PLAYERS:
+            return
+
+        # Skip supplemental scan when PlayerArray is populated — it picks up stale
+        # lobby pawns still in the level actor list during lobby→match transitions.
+        if pa_count >= 2:
+            return
+        if pa_count >= 1 and total > 0:
             return
 
         # Supplemental actor scan — throttled fallback (was every frame, caused lag).
@@ -2737,41 +3167,188 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     PAWN_OFF_IS_PAINT_MODE = 0x0B79
     PAWN_OFF_IS_BRUSHING = 0x0BF8
 
-    def _find_local_pawn(self):
-        """Resolve the local playable pawn (AcknowledgedPawn, then fallbacks)."""
-        world = self._get_world()
+    LOCAL_OWNED_PAWN_STICKY_SEC = 45.0
+    OFF_CAMERA_VIEW_TARGET = 0x0340  # APlayerCameraManager::ViewTarget (FTViewTarget)
+
+    def _local_net_connection(self, world=None, pc=None):
+        """Resolve UNetConnection* via LocalPlayers (same path the bridge uses)."""
+        if not world:
+            world = self._get_world()
         if not world:
             return 0
-        pc = self._get_local_controller(world)
+        if not pc:
+            pc = self._get_local_controller(world)
+        gi = rp(self.pm, world + self.offsets.get("UWorld::OwningGameInstance", 0x1D8))
+        if gi:
+            lp_off = self.offsets.get("UGameInstance::LocalPlayers", 0x38)
+            lp_data = rp(self.pm, gi + lp_off)
+            lp_count = ru32(self.pm, gi + lp_off + 8)
+            if lp_data and lp_count > 0:
+                local_player = rp(self.pm, lp_data)
+                if local_player:
+                    conn = rp(self.pm, local_player + 0x28)
+                    if conn > 0x100000:
+                        return conn
+        if pc:
+            player = rp(self.pm, pc + self.offsets.get("APlayerController::Player", 0x0348))
+            if player:
+                conn = rp(self.pm, player + 0x28)
+                if conn > 0x100000:
+                    return conn
+        return 0
+
+    def _read_view_target_actor(self, pc):
+        """AActor* the camera is currently viewing (FTViewTarget.Target)."""
         if not pc:
             return 0
+        cam_mgr = rp(self.pm, pc + self.offsets.get("APlayerController::PlayerCameraManager", 0x0350))
+        if not cam_mgr:
+            return 0
+        target = rp(self.pm, cam_mgr + self.OFF_CAMERA_VIEW_TARGET)
+        return target if target > 0x100000 else 0
 
-        ack = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"])
-        if ack and ack > 0x100000:
-            cls = self.objects.class_name(ack)
-            if self._is_player_class(cls):
-                return ack
-
-        local_ps = rp(self.pm, pc + self.offsets["AController::PlayerState"])
-        if local_ps:
-            priv = rp(self.pm, local_ps + self.offsets["APlayerState::PawnPrivate"])
-            if priv and priv > 0x100000:
-                cls = self.objects.class_name(priv)
-                if self._is_player_class(cls):
-                    return priv
-
-        try:
-            for p in self.iter_players(include_local=True):
-                if p.get("is_local"):
-                    actor = p.get("actor", 0)
-                    if actor:
-                        cls = self.objects.class_name(actor)
-                        if self._is_player_class(cls):
-                            return actor
-        except Exception:
-            pass
-
+    def _resolve_owned_pawn(self, ps, sticky=True):
+        """Best-effort owned character — PawnPrivate with freecam/spectate sticky cache."""
+        owned = 0
+        if ps:
+            owned = rp(self.pm, ps + self.offsets.get("APlayerState::PawnPrivate", 0x0308))
+        if owned and ps:
+            cls = self.objects.class_name(owned) or ""
+            if self._is_player_class(cls) and self._is_pawn_alive(owned, ps):
+                self._local_owned_pawn_sticky = owned
+                self._local_owned_pawn_sticky_ps = ps
+                return owned
+        if not sticky:
+            return 0
+        sticky_pawn = getattr(self, "_local_owned_pawn_sticky", 0)
+        sticky_ps = getattr(self, "_local_owned_pawn_sticky_ps", 0)
+        if sticky_pawn and sticky_ps == ps and ps:
+            cls = self.objects.class_name(sticky_pawn) or ""
+            if self._is_player_class(cls) and self._is_pawn_alive(sticky_pawn, ps):
+                return sticky_pawn
+        if not owned:
+            self._local_owned_pawn_sticky = 0
+            self._local_owned_pawn_sticky_ps = 0
         return 0
+
+    def _classify_local_session_mode(self, pc, ps, ack, owned, view_target, conn, world):
+        """Classify what the local client is doing — avoids false 'pawn lost' on freecam."""
+        if not world:
+            return "disconnected"
+        if not pc:
+            return "loading"
+        owned_alive = bool(owned and ps and self._is_pawn_alive(owned, ps))
+        ack_cls = self.objects.class_name(ack) or "" if ack else ""
+        ack_playable = bool(ack and self._is_player_class(ack_cls) and self._is_pawn_alive(ack, ps))
+
+        if owned_alive:
+            if view_target and view_target not in (ack, owned):
+                vt_cls = self.objects.class_name(view_target) or ""
+                if view_target != pc and (
+                    self._is_player_class(vt_cls)
+                    or "Character" in vt_cls
+                    or "Pawn" in vt_cls
+                ):
+                    return "spectating"
+                if view_target != owned:
+                    return "freecam"
+            if not ack_playable or ack != owned:
+                return "freecam"
+            return "in_match"
+
+        if owned and ps and not self._is_pawn_alive(owned, ps):
+            return "dead"
+
+        if conn and ps:
+            return "unpossessed"
+
+        if not conn and ps:
+            return "session_drop"
+
+        return "unknown"
+
+    def _local_pawn_context(self):
+        """Snapshot of local player state for trainer / anti-kick diagnostics."""
+        world = self._get_world()
+        pc = self._get_local_controller(world) if world else 0
+        ps = rp(self.pm, pc + self.offsets.get("AController::PlayerState", 0x2B0)) if pc else 0
+        ack = rp(self.pm, pc + self.offsets["APlayerController::AcknowledgedPawn"]) if pc else 0
+        owned = self._resolve_owned_pawn(ps, sticky=True)
+        view_target = self._read_view_target_actor(pc) if pc else 0
+        conn = self._local_net_connection(world, pc) if world else 0
+
+        resolved = owned
+        if not resolved and ack:
+            ack_cls = self.objects.class_name(ack) or ""
+            if self._is_player_class(ack_cls) and self._is_pawn_alive(ack, ps):
+                resolved = ack
+
+        if not resolved:
+            try:
+                for p in self.iter_players(include_local=True):
+                    if p.get("is_local"):
+                        actor = p.get("actor", 0)
+                        if actor:
+                            cls = self.objects.class_name(actor) or ""
+                            if self._is_player_class(cls):
+                                resolved = actor
+                                if not owned:
+                                    owned = actor
+                                break
+            except Exception:
+                pass
+
+        mode = self._classify_local_session_mode(pc, ps, ack, owned, view_target, conn, world)
+        playable = bool(resolved and self._is_player_class(self.objects.class_name(resolved) or ""))
+
+        return {
+            "world": world or 0,
+            "pc": pc or 0,
+            "ps": ps or 0,
+            "conn": conn or 0,
+            "ack_pawn": ack or 0,
+            "owned_pawn": owned or 0,
+            "view_target": view_target or 0,
+            "resolved_pawn": resolved or 0,
+            "playable": playable,
+            "mode": mode,
+        }
+
+    def _find_local_pawn(self):
+        """Resolve the local playable pawn — stable through freecam/spectate."""
+        import time as _time
+        now = _time.monotonic()
+        cache_ts = getattr(self, "_local_pawn_ctx_ts", 0.0)
+        cached = getattr(self, "_local_pawn_ctx_cache", None)
+        if cached and (now - cache_ts) < 0.08:
+            return cached.get("resolved_pawn") or 0
+        ctx = self._local_pawn_context()
+        self._local_pawn_ctx_cache = ctx
+        self._local_pawn_ctx_ts = now
+        return ctx.get("resolved_pawn") or 0
+
+    def _local_session_mode(self):
+        """Cached session mode — freecam/spectating/in_match/etc."""
+        import time as _time
+        now = _time.monotonic()
+        if (now - getattr(self, "_session_mode_ts", 0.0)) < 0.1:
+            return getattr(self, "_session_mode_cached", "unknown")
+        ctx = getattr(self, "_local_pawn_ctx_cache", None)
+        if ctx is None or (now - getattr(self, "_local_pawn_ctx_ts", 0.0)) >= 0.08:
+            ctx = self._local_pawn_context()
+            self._local_pawn_ctx_cache = ctx
+            self._local_pawn_ctx_ts = now
+        mode = ctx.get("mode", "unknown")
+        self._session_mode_cached = mode
+        self._session_mode_ts = now
+        return mode
+
+    def _is_freecam_or_spectating(self):
+        return self._local_session_mode() in ("freecam", "spectating")
+
+    def _esp_perf_relaxed(self):
+        """True when we should cut overlay/snapshot work to protect game FPS."""
+        return self._is_freecam_or_spectating() or bool(getattr(self, "_menu_ui_active", False))
 
     def _get_local_pawn(self):
         return self._find_local_pawn()
@@ -3458,8 +4035,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                 snap = {
                     "cam": cam,
                     "players": [],
+                    "clones": [],
                     "local_pos": None,
                     "aim_target": None,
+                    "aim_actor": None,
                 }
             self._esp_paint_snapshot = snap
 
@@ -3474,7 +4053,6 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             import time as _time
 
             last_full_snap = 0.0
-            PLAYER_SNAP_INTERVAL = 0.033  # ~30 Hz player positions
 
             try:
                 self._refresh_esp_snapshot_camera_only()
@@ -3493,8 +4071,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     1,
                     min(240, int(getattr(cfg, "ui_overlay_fps", 60) if cfg else 60)),
                 )
+                relaxed = self._esp_perf_relaxed()
                 if menu_open:
                     wait_s = 1.0 / min(target_fps, 30)
+                elif relaxed:
+                    wait_s = 1.0 / min(target_fps, 60)
                 else:
                     wait_s = 1.0 / min(target_fps, 144)
 
@@ -3502,21 +4083,26 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     self._refresh_esp_snapshot_camera_only()
 
                     now = _time.monotonic()
+                    snap_interval = 0.12 if relaxed else 0.05
                     if not menu_open and cfg is not None:
-                        if (now - last_full_snap) >= PLAYER_SNAP_INTERVAL:
+                        if (now - last_full_snap) >= snap_interval:
                             last_full_snap = now
-                            need_players = bool(
+                            need_snap = bool(
                                 getattr(cfg, "enabled", False)
                                 or getattr(cfg, "aimbot_enabled", False)
+                                or getattr(cfg, "skeleton_esp", False)
+                                or getattr(cfg, "clone_esp", False)
                             )
-                            if need_players:
+                            if need_snap:
                                 snap = self._build_esp_paint_snapshot(cfg)
                             else:
                                 snap = {
                                     "cam": self.get_camera(),
                                     "players": [],
+                                    "clones": [],
                                     "local_pos": None,
                                     "aim_target": None,
+                                    "aim_actor": None,
                                 }
                             with self._esp_snapshot_lock:
                                 self._esp_paint_snapshot = snap
@@ -3541,49 +4127,314 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         with self._esp_snapshot_lock:
             return self._esp_paint_snapshot
 
+    # If the selected bone can't be read, try nearby bones before giving up.
+    _AIM_BONE_FALLBACKS = {
+        "head": ("head", "neck_01", "spine_03"),
+        "neck_01": ("neck_01", "head", "spine_03"),
+        "spine_02": ("spine_02", "spine_01"),
+        "pelvis": ("pelvis", "spine_01"),
+    }
+
+    def _read_actor_bones(self, actor, names, config=None):
+        """Read world positions for the named bones using indices that fit
+        the actor's actual runtime bone array. Returns dict or None."""
+        mesh_comp = self.get_skeletal_mesh(actor)
+        if not mesh_comp:
+            return None, 0, None
+        bone_data, count, stride = self._bones_array_info(mesh_comp)
+        if not bone_data or count <= 0:
+            return None, 0, mesh_comp
+        mesh_world_pos, mesh_world_quat = self._get_mesh_world_transform(actor, mesh_comp)
+        if mesh_world_pos is None:
+            return None, count, mesh_comp
+        bi = self._effective_bone_index_map(mesh_comp, config, count)
+        want = {n: bi[n] for n in names if n in bi}
+        if not want:
+            return None, count, mesh_comp
+        bones = self._bones_indices_to_world(
+            want, bone_data, count, mesh_world_pos, mesh_world_quat, stride,
+        )
+        return bones, count, mesh_comp
+
+    def _pick_aim_bone_from_bridge_map(self, bones, bone, config=None):
+        """Resolve aim position from bridge bone dict {name: [x,y,z]}."""
+        if not bones:
+            return None
+        if bone == "chest":
+            chest_bones = {}
+            for key in ("pelvis", "spine_01", "spine_02"):
+                val = bones.get(key)
+                if val and len(val) >= 3:
+                    chest_bones[key] = (float(val[0]), float(val[1]), float(val[2]))
+            pos = self._chest_world_pos_from_bones(chest_bones)
+            if pos and self._is_valid_world_loc(pos):
+                return pos
+            return None
+        candidates = self._AIM_BONE_FALLBACKS.get(bone, (bone,))
+        for name in candidates:
+            val = bones.get(name)
+            if not val or len(val) < 3:
+                continue
+            pos = (float(val[0]), float(val[1]), float(val[2]))
+            if self._is_valid_world_loc(pos):
+                return pos
+        return None
+
+    def _log_bones_bridge_fail(self, detail):
+        import time as _time
+        now = _time.monotonic()
+        if now - getattr(self, "_bones_bridge_fail_ts", 0.0) < 5.0:
+            return
+        self._bones_bridge_fail_ts = now
+        print(f"[BONES] bridge failed — {detail}", flush=True)
+
+    _BRIDGE_BONES_INTERVAL = 0.15    # ~6.7 Hz — ProcessEvent bone reads are expensive
+    _BRIDGE_SKELETON_INTERVAL = 0.12  # ~8 Hz when skeleton ESP needs segment lines
+    _BRIDGE_SKELETON_INTERVAL_RELAXED = 0.30  # freecam/spectate — protect render thread
+
+    def _bridge_batch_due(self, want_skeleton):
+        import time as _time
+        now = _time.monotonic()
+        key = "skeleton" if want_skeleton else "bones"
+        if want_skeleton and self._esp_perf_relaxed():
+            interval = self._BRIDGE_SKELETON_INTERVAL_RELAXED
+        else:
+            interval = self._BRIDGE_SKELETON_INTERVAL if want_skeleton else self._BRIDGE_BONES_INTERVAL
+        last = getattr(self, "_bridge_batch_last_ts", None)
+        if last is None:
+            last = {}
+            self._bridge_batch_last_ts = last
+        if now - last.get(key, 0.0) < interval:
+            return False
+        last[key] = now
+        return True
+
+    def _cached_bridge_entry(self, actor):
+        cache = getattr(self, "_bridge_bones_by_actor", {})
+        return cache.get(actor)
+
+    def get_cached_aim_bone_world_pos(self, actor, config=None):
+        """Aim bone from bridge cache only — safe on the UI thread (no bridge I/O)."""
+        if not actor:
+            return None
+        bone = (getattr(config, "aimbot_bone", "head") or "head") if config else "head"
+        entry = self._cached_bridge_entry(actor)
+        if not entry:
+            return None
+        return self._pick_aim_bone_from_bridge_map(entry.get("bones") or {}, bone, config)
+
+    @staticmethod
+    def _segments_from_named_bones(bones_dict):
+        """Build drawable segment list [[x1,y1,z1,x2,y2,z2], ...] from named positions."""
+        if not bones_dict:
+            return None
+        segments = []
+        for a, b in MecchaESP.BONE_CONNECTIONS:
+            pa = bones_dict.get(a)
+            pb = bones_dict.get(b)
+            if not pa or not pb:
+                continue
+            if len(pa) < 3 or len(pb) < 3:
+                continue
+            segments.append([
+                float(pa[0]), float(pa[1]), float(pa[2]),
+                float(pb[0]), float(pb[1]), float(pb[2]),
+            ])
+        return segments or None
+
+    def _merge_bridge_cache_entry(self, cache, actor, entry, bones_only):
+        """Merge bridge results without letting aimbot bones-only reads wipe skeleton segments."""
+        if cache is None:
+            cache = {}
+        existing = cache.get(actor)
+        if bones_only and existing:
+            merged = dict(existing)
+            new_bones = entry.get("bones")
+            if new_bones:
+                merged["bones"] = new_bones
+            if not merged.get("segments") and entry.get("segments"):
+                merged["segments"] = entry["segments"]
+            cache[actor] = merged
+        else:
+            cache[actor] = entry
+        return cache
+
+    def _fetch_bridge_skeleton_batch(self, actor_mesh_pairs, bones_only=False):
+        """Batch skeleton + named bone positions via bridge (MechaSRC path)."""
+        if not actor_mesh_pairs or not hasattr(self, "_bridge_request"):
+            return {}
+        pairs = [(a, m) for a, m in actor_mesh_pairs if a]
+        if not pairs:
+            return {}
+        payload = {
+            "actors": ",".join(f"0x{int(a):X}" for a, _ in pairs),
+            "meshes": ",".join(f"0x{int(m):X}" if m else "0" for _, m in pairs),
+        }
+        if bones_only:
+            payload["bones_only"] = "true"
+        try:
+            resp = self._bridge_request("get_skeleton", payload, timeout=8)
+        except Exception as exc:
+            self._log_bones_bridge_fail(str(exc))
+            return {}
+        if not resp or not resp.get("success"):
+            msg = (resp or {}).get("message") or "no response"
+            self._log_bones_bridge_fail(msg)
+            return {}
+        meta = resp.get("metadata") or {}
+        ok_count = int(meta.get("ok_count") or 0)
+        if ok_count <= 0:
+            self._log_bones_bridge_fail(f"ok_count=0 for {len(pairs)} actor(s)")
+        elif not getattr(self, "_bones_bridge_ok_logged", False):
+            print(f"[BONES] bridge ok — {ok_count} actor(s) via GetBoneName+GetSocketLocation", flush=True)
+            self._bones_bridge_ok_logged = True
+        out = {}
+        for item in meta.get("results") or []:
+            actor_hex = item.get("actor") or ""
+            try:
+                actor_ptr = int(str(actor_hex), 16) if str(actor_hex).lower().startswith("0x") else int(actor_hex)
+            except Exception:
+                continue
+            segments = item.get("segments") or []
+            bones_raw = item.get("bones") or {}
+            bones = {}
+            if isinstance(bones_raw, dict):
+                for name, coords in bones_raw.items():
+                    if isinstance(coords, (list, tuple)) and len(coords) >= 3:
+                        bones[str(name)] = [float(coords[0]), float(coords[1]), float(coords[2])]
+            if segments or bones:
+                out[actor_ptr] = {"segments": segments, "bones": bones}
+        return out
+
+    def _bridge_fetch_bones_throttled(self, actor):
+        """Refresh bridge bone cache for one actor (snapshot thread only)."""
+        import time as _time
+        if not actor:
+            return
+        now = _time.monotonic()
+        last = getattr(self, "_bridge_bones_fetch_ts", None)
+        if last is None:
+            last = {}
+            self._bridge_bones_fetch_ts = last
+        if now - last.get(actor, 0.0) < self._BRIDGE_BONES_INTERVAL:
+            return
+        mesh = self.get_skeletal_mesh(actor)
+        batch = self._fetch_bridge_skeleton_batch([(actor, mesh)], bones_only=True)
+        cache = getattr(self, "_bridge_bones_by_actor", None)
+        if cache is None:
+            cache = {}
+            self._bridge_bones_by_actor = cache
+        for actor_ptr, entry in batch.items():
+            self._merge_bridge_cache_entry(cache, actor_ptr, entry, bones_only=True)
+        last[actor] = now
+
+    def _aim_bone_from_bridge_cache(self, actor, bone, config=None, allow_fetch=False):
+        cache = getattr(self, "_bridge_bones_by_actor", {})
+        entry = cache.get(actor)
+        if not entry and allow_fetch:
+            self._bridge_fetch_bones_throttled(actor)
+            entry = getattr(self, "_bridge_bones_by_actor", {}).get(actor)
+        if not entry:
+            return None
+        return self._pick_aim_bone_from_bridge_map(entry.get("bones") or {}, bone, config)
+
+    def get_aim_bone_world_pos(self, actor, config=None, allow_bridge_fetch=False):
+        """World position of the configured aimbot bone — bridge first, memory fallback."""
+        if not actor:
+            return None
+        bone = (getattr(config, "aimbot_bone", "head") or "head") if config else "head"
+        try:
+            bridge_pos = self._aim_bone_from_bridge_cache(
+                actor, bone, config, allow_fetch=allow_bridge_fetch,
+            )
+            if bridge_pos:
+                return bridge_pos
+            if bone == "chest":
+                names = ("pelvis", "spine_01", "spine_02")
+                bones, count, mesh = self._read_actor_bones(actor, names, config)
+                pos = self._chest_world_pos_from_bones(bones)
+                if pos and self._is_valid_world_loc(pos):
+                    return pos
+                self._log_aim_bone_miss(bone, actor=actor, mesh=mesh,
+                                        want={"count": count}, got=bones, source="memory")
+                return None
+            candidates = self._AIM_BONE_FALLBACKS.get(bone, (bone,))
+            bones, count, mesh = self._read_actor_bones(actor, candidates, config)
+            if bones:
+                for b in candidates:
+                    pos = bones.get(b)
+                    if pos and self._is_valid_world_loc(pos):
+                        if b != bone:
+                            self._log_aim_bone_miss(bone, used=b)
+                        return pos
+            self._log_aim_bone_miss(bone, actor=actor, mesh=mesh,
+                                    want={"count": count}, got=bones, source="memory+bridge")
+        except Exception as exc:
+            self._log_aim_bone_miss(bone, error=exc)
+        return None
+
+    def _log_aim_bone_miss(self, bone, used=None, actor=None, mesh=None,
+                           want=None, got=None, error=None, source=None):
+        """Throttled debug line when the aim bone read fails or falls back."""
+        import time as _time
+        now = _time.monotonic()
+        if now - getattr(self, "_aim_bone_miss_ts", 0.0) < 5.0:
+            return
+        self._aim_bone_miss_ts = now
+        if used:
+            print(f"[AIMBOT] bone '{bone}' unreadable — using '{used}' instead", flush=True)
+            return
+        if error is not None:
+            print(f"[AIMBOT] bone '{bone}' read error: {error}", flush=True)
+            return
+        # Detailed one-shot diagnostics so we can see exactly where the read fails.
+        count = 0
+        try:
+            if mesh:
+                _bd, count, _stride = self._bones_array_info(mesh)
+        except Exception:
+            count = -1
+        got_keys = list(got.keys()) if isinstance(got, dict) else got
+        src = f", source={source}" if source else ""
+        print(
+            f"[AIMBOT] bone '{bone}' unreadable — aim skipped "
+            f"(mesh={'yes' if mesh else 'no'}, bone_count={count}, "
+            f"want={want}, got={got_keys}{src})",
+            flush=True,
+        )
+
     def _snapshot_aim_point(self, pdata, config):
-        """World position for aimbot — chest bones with height fallback."""
+        """World position for aimbot — selected bone only (no ESP-dot fallback)."""
         actor = pdata.get("actor")
         if actor:
-            try:
-                bi = self._esp_bone_index_map(config)
-                chest_bones = {
-                    k: bi[k]
-                    for k in ("pelvis", "spine_01", "spine_02")
-                    if k in bi
-                }
-                bones = self.get_skeleton_positions_by_indices(actor, chest_bones)
-                chest = self._chest_world_pos_from_bones(bones)
-                if chest:
-                    return chest
-            except Exception:
-                pass
-        pos = pdata.get("pos")
-        if not pos:
-            return None
-        off = getattr(config, "aimbot_target_offset", 0.0)
-        if abs(off) < 1.0:
-            off = 60.0
-        return (pos[0], pos[1], pos[2] + off)
+            bridge_bones = pdata.get("bridge_bones")
+            if bridge_bones:
+                bone = getattr(config, "aimbot_bone", "head") or "head"
+                pos = self._pick_aim_bone_from_bridge_map(bridge_bones, bone, config)
+                if pos:
+                    return pos
+            bone_pos = self.get_aim_bone_world_pos(actor, config, allow_bridge_fetch=False)
+            if bone_pos:
+                return bone_pos
+        return None
 
     def _compute_aimbot_target(self, config, cam, players, screen_w, screen_h):
         if not getattr(config, "aimbot_enabled", False) or not cam or screen_w <= 0 or screen_h <= 0:
-            return None
-        world = self._get_world()
-        local_pc = self._get_local_controller(world) if world else 0
-        local_pawn = (
-            rp(self.pm, local_pc + self.offsets["APlayerController::AcknowledgedPawn"])
-            if local_pc else 0
-        )
+            return None, None
+        local_pawn = self._find_local_pawn()
+        local_is_hunter = self._local_team_is_hunter()
         local_pos = self.get_actor_root_pos(local_pawn) if local_pawn else None
         cx, cy = screen_w / 2.0, screen_h / 2.0
         cam_loc = cam["loc"]
         best_dist = float("inf")
         best_target = None
+        best_actor = None
         fov_px = getattr(config, "aimbot_fov", 120)
         for pdata in players:
             actor = pdata.get("actor")
             if not actor or actor == local_pawn or pdata.get("is_local"):
+                continue
+            if not self._is_aimbot_valid_target(pdata, local_is_hunter):
                 continue
             if getattr(config, "aimbot_visible_check", False):
                 vis = pdata.get("visible")
@@ -3610,12 +4461,28 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             if d <= fov_px and d < best_dist:
                 best_dist = d
                 best_target = aim_pos
-        return best_target
+                best_actor = actor
+        return best_target, best_actor
+
+    def get_skeleton_segments_bridge(self, actors, bones_only=False):
+        """Fetch skeleton segments via bridge (MechaSRC: GetBoneName + GetSocketLocation)."""
+        if not actors:
+            return {}
+        pairs = []
+        for actor in actors:
+            if actor:
+                pairs.append((actor, self.get_skeletal_mesh(actor)))
+        return self._fetch_bridge_skeleton_batch(pairs, bones_only=bones_only)
 
     def _build_esp_paint_snapshot(self, config):
         """Collect camera, players, and draw helpers off the UI thread."""
         cam = self.get_camera()
-        need_players = bool(getattr(config, "enabled", False) or getattr(config, "aimbot_enabled", False))
+        need_players = bool(
+            getattr(config, "enabled", False)
+            or getattr(config, "aimbot_enabled", False)
+            or getattr(config, "skeleton_esp", False)
+            or getattr(config, "clone_esp", False)
+        )
         all_players = []
         local_pos = None
         if need_players:
@@ -3637,6 +4504,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         enriched = []
         want_boxes = bool(getattr(config, "box_esp", False) or getattr(config, "corner_box", False))
         want_skeleton = bool(getattr(config, "skeleton_esp", False))
+        want_aim_bones = bool(getattr(config, "aimbot_enabled", False))
         want_health = bool(
             getattr(config, "health_bar", False)
             or getattr(config, "shield_bar", False)
@@ -3644,6 +4512,64 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         )
         enemy_only = bool(getattr(config, "enemy_only", False))
         bone_indices = getattr(config, "bone_indices", None) or {}
+        local_is_hunter = self._local_team_is_hunter()
+
+        skeleton_actors = []
+        if want_skeleton or want_aim_bones:
+            for pdata in all_players:
+                actor = pdata.get("actor")
+                if not actor or pdata.get("is_local"):
+                    continue
+                if want_aim_bones and not self._is_aimbot_valid_target(pdata, local_is_hunter):
+                    continue
+                if want_skeleton and enemy_only and not self._is_aimbot_valid_target(pdata, local_is_hunter):
+                    continue
+                skeleton_actors.append(actor)
+
+        if want_skeleton and getattr(config, "show_local", False):
+            local_pawn = self._find_local_pawn()
+            if local_pawn and local_pawn not in skeleton_actors:
+                skeleton_actors.append(local_pawn)
+
+        skeleton_by_actor = {}
+        if want_skeleton and skeleton_actors:
+            sk_cache = getattr(self, "_bridge_skeleton_by_actor", None)
+            if sk_cache is None:
+                sk_cache = {}
+                self._bridge_skeleton_by_actor = sk_cache
+            if self._bridge_batch_due(True):
+                fresh = self.get_skeleton_segments_bridge(skeleton_actors, bones_only=False)
+                if fresh:
+                    sk_cache.update(fresh)
+                    skeleton_by_actor.update(fresh)
+                elif not getattr(self, "_skeleton_bridge_empty_logged", False):
+                    print("[BONES] skeleton bridge returned no segments", flush=True)
+                    self._skeleton_bridge_empty_logged = True
+            for actor in skeleton_actors:
+                if actor not in skeleton_by_actor and actor in sk_cache:
+                    skeleton_by_actor[actor] = sk_cache[actor]
+
+        if want_aim_bones and skeleton_actors:
+            aim_cache = getattr(self, "_bridge_bones_by_actor", None)
+            if aim_cache is None:
+                aim_cache = {}
+                self._bridge_bones_by_actor = aim_cache
+            if self._bridge_batch_due(False):
+                aim_fetch = self.get_skeleton_segments_bridge(
+                    skeleton_actors,
+                    bones_only=not want_skeleton,
+                )
+                for actor_ptr, entry in aim_fetch.items():
+                    self._merge_bridge_cache_entry(aim_cache, actor_ptr, entry, bones_only=True)
+            for actor in skeleton_actors:
+                if want_skeleton and actor in skeleton_by_actor:
+                    entry = skeleton_by_actor[actor]
+                    if entry.get("bones"):
+                        self._merge_bridge_cache_entry(
+                            aim_cache, actor, {"bones": entry["bones"]}, bones_only=True,
+                        )
+
+        relaxed = self._esp_perf_relaxed()
 
         for pdata in all_players:
             entry = dict(pdata)
@@ -3651,29 +4577,64 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             ps = pdata.get("player_state")
             is_local = pdata.get("is_local")
             if actor:
-                chest = self.get_esp_world_pos(actor, config)
-                if chest:
-                    entry["pos"] = chest
+                if relaxed and pdata.get("pos"):
+                    entry["pos"] = pdata["pos"]
+                else:
+                    chest = self.get_esp_world_pos(actor, config)
+                    if chest:
+                        entry["pos"] = chest
+            bridge_entry = skeleton_by_actor.get(actor) if actor else None
+            if bridge_entry:
+                entry["bridge_bones"] = bridge_entry.get("bones") or {}
             if want_boxes and actor:
                 entry["rot"] = self.get_actor_root_rotation(actor)
-            if want_skeleton and actor and not is_local:
-                bones = self.get_skeleton_positions(actor)
-                if not bones:
-                    bones = self.get_skeleton_positions_by_indices(actor, bone_indices)
-                entry["bones"] = bones
+            if want_skeleton and actor and (not is_local or getattr(config, "show_local", False)):
+                segments = (bridge_entry or {}).get("segments")
+                bridge_bones = (bridge_entry or {}).get("bones") or {}
+                if segments:
+                    entry["bones"] = {"segments": segments}
+                elif bridge_bones:
+                    built = self._segments_from_named_bones(bridge_bones)
+                    if built:
+                        entry["bones"] = {"segments": built}
+                    else:
+                        entry["bones"] = bridge_bones
+                else:
+                    if not relaxed:
+                        bones = self.get_skeleton_positions(actor)
+                        if not bones:
+                            bones = self.get_skeleton_positions_by_indices(actor, bone_indices)
+                        if bones:
+                            built = self._segments_from_named_bones(bones)
+                            entry["bones"] = {"segments": built} if built else bones
             if want_health and actor:
                 entry["health_info"] = self.get_health(actor, ps)
             if enemy_only and actor and not is_local:
                 entry["visible"] = self._is_visible(actor)
             enriched.append(entry)
 
+        clones = []
+        if getattr(config, "clone_esp", False):
+            clones = self.get_clone_decoys(config=config)
+
         sw, sh = getattr(self, "_overlay_screen_geom", (1920, 1080))
-        aim_target = self._compute_aimbot_target(config, cam, enriched, sw, sh) if cam else None
+        aim_target, aim_actor = None, None
+        if cam:
+            try:
+                result = self._compute_aimbot_target(config, cam, enriched, sw, sh)
+                if isinstance(result, tuple) and len(result) == 2:
+                    aim_target, aim_actor = result
+                elif result:
+                    aim_target = result
+            except Exception as exc:
+                print(f"[AIMBOT] target compute error: {exc}", flush=True)
         return {
             "cam": cam,
             "players": enriched,
+            "clones": clones,
             "local_pos": local_pos,
             "aim_target": aim_target,
+            "aim_actor": aim_actor,
         }
 
     def throttle_game_process(self, on: bool, quality: int = 3):

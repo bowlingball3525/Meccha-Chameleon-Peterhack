@@ -21,6 +21,8 @@ BRIDGE_QUICK_PING_TIMEOUT = 0.6
 BRIDGE_PING_RETRIES = 3
 BRIDGE_PORT_TRUST_SEC = 20.0
 BRIDGE_FIXED_PORT = 47654
+# How many ports above the fixed port to probe when the listener isn't on 47654.
+BRIDGE_PORT_SCAN_RANGE = 16
 
 
 class CamoBridgeMixin:
@@ -186,6 +188,12 @@ class CamoBridgeMixin:
         for path in sidecars[:6]:
             add(self._read_port_file(path))
 
+        # Fallback: scan a small range above the fixed port. The DLL normally
+        # binds BRIDGE_FIXED_PORT, but if that port was taken at inject time it
+        # may have landed on a neighbour — probe those before giving up.
+        for offset in range(1, BRIDGE_PORT_SCAN_RANGE + 1):
+            add(BRIDGE_FIXED_PORT + offset)
+
         return ports
 
     @staticmethod
@@ -310,12 +318,15 @@ class CamoBridgeMixin:
             self._bridge_proc = None
 
     def camo_cleanup(self):
-        """Stop bridge EXE on application exit."""
-        try:
-            if self._resolve_bridge_port():
-                self._bridge_request("shutdown", {}, timeout=3)
-        except Exception:
-            pass
+        """Clean up external helpers on exit.
+
+        Deliberately does NOT send "shutdown" to the in-game bridge: that stops
+        the DLL's TCP listener while the DLL stays loaded in the game, which
+        bricks reconnection when Peterhack is restarted mid-match (the listener
+        is dead and re-injecting can't restart the thread). Leaving the bridge
+        running lets a restarted Peterhack reconnect on the same port instantly.
+        The bridge dies naturally when the game process closes.
+        """
         self.cleanup()
         self._stop_legacy_camo_controller()
 
@@ -1533,6 +1544,21 @@ class CamoBridgeMixin:
         """Fetch kick RPC blocks logged by the bridge anti-kick hook."""
         resp = self._bridge_request("get_anti_kick_log", {"since_seq": int(since_seq)}, timeout=10)
         return resp if resp and resp.get("success") else None
+
+    def bridge_set_netconn_watch(self, enabled=True):
+        """Arm/disarm the diagnostic NetConnection close watcher (logs to anti_kick.log)."""
+        state = "on" if enabled else "off"
+        print(f"[CAMO] set_netconn_watch {state}...", flush=True)
+        resp = self._bridge_request("set_netconn_watch", {"enabled": bool(enabled)}, timeout=20)
+        print(f"[CAMO] set_netconn_watch: {resp}", flush=True)
+        return resp
+
+    def bridge_dump_netconn_vtable(self, slots=128):
+        """Dump the local UNetConnection vtable to anti_kick.log (diagnostic)."""
+        print(f"[CAMO] dump_netconn_vtable slots={slots}...", flush=True)
+        resp = self._bridge_request("dump_netconn_vtable", {"slots": int(slots)}, timeout=30)
+        print(f"[CAMO] dump_netconn_vtable: {resp}", flush=True)
+        return resp
 
     def bridge_set_player_name(self, name):
         """Replicated rename via SetName(Server) on the game thread."""

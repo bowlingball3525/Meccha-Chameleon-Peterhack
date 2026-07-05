@@ -16,6 +16,7 @@ class Config:
     box_esp: bool = False
     corner_box: bool = False
     skeleton_esp: bool = False
+    clone_esp: bool = False
     show_local: bool = True
     show_names: bool = True
     show_steam_id: bool = False
@@ -35,6 +36,7 @@ class Config:
     hunter_color: Tuple[int, int, int] = (255, 0, 0)
     survivor_color: Tuple[int, int, int] = (0, 255, 0)
     skeleton_color: Tuple[int, int, int] = (0, 255, 255)
+    clone_color: Tuple[int, int, int] = (255, 100, 255)
     box_color: Tuple[int, int, int] = (255, 255, 255)
     radar_color: Tuple[int, int, int] = (255, 255, 255)
     visible_color: Tuple[int, int, int] = (0, 255, 0)
@@ -56,14 +58,30 @@ class Config:
     # Aimbot
     aimbot_enabled: bool = False
     aimbot_key: str = "MB5"
+    # Bone the aimbot locks onto: head | neck_01 | chest | spine_02 | pelvis
+    aimbot_bone: str = "head"
     aimbot_fov: int = 150
     aimbot_smooth: float = 0.30
     aimbot_target_offset: float = 60.0
     aimbot_show_fov: bool = True
     aimbot_visible_check: bool = False
 
+    # Console / file logging (DEBUGGING tab) — filters [TAG] lines in latest.log
+    log_master: bool = True
+    log_session: bool = True
+    log_trainer: bool = False
+    log_anti_kick: bool = False
+    log_camo: bool = False
+    log_paint: bool = False
+    log_esp: bool = False
+    log_aimbot: bool = False
+    log_bones: bool = True
+    log_ui: bool = False
+    log_game: bool = False
+    log_misc: bool = True
+
     # Exploits / trainer toggles
-    trainer_debug: bool = True
+    trainer_debug: bool = False  # legacy alias — migrated to log_trainer on load
     trainer_no_gun_cooldown: bool = False
     trainer_no_recoil: bool = False
     trainer_no_decoy_cooldown: bool = False
@@ -72,9 +90,9 @@ class Config:
     trainer_anti_clipping: bool = False
     trainer_anti_detection: bool = False
     trainer_infinite_bullets: bool = False
+    trainer_god_mode: bool = False
     trainer_magnet_key: str = "G"
     trainer_anti_kick: bool = False
-    trainer_auto_rename: bool = False
     trainer_rename_text: str = "Player"
     autokick_enabled: bool = False
     autokick_leave_on_block: bool = True
@@ -125,7 +143,7 @@ class Config:
 
 
 _COLOR_KEYS = ("enemy_color", "local_color", "hunter_color", "survivor_color",
-               "skeleton_color", "box_color", "radar_color",
+               "skeleton_color", "clone_color", "box_color", "radar_color",
                "visible_color", "not_visible_color")
 
 
@@ -145,6 +163,8 @@ def config_from_dict(d: dict) -> Config:
     if "bone_indices" in d and isinstance(d["bone_indices"], list):
         d["bone_indices"] = {k: v for k, v in d["bone_indices"]}
     # Migrate renamed ESP fields from older configs.
+    if "trainer_debug" in d and "log_trainer" not in d:
+        d["log_trainer"] = bool(d.get("trainer_debug"))
     # Strip unknown keys so stale JSON fields never crash the dataclass constructor.
     valid = {f.name for f in dataclasses.fields(Config)}
     d = {k: v for k, v in d.items() if k in valid}
