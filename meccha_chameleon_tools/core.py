@@ -14,7 +14,7 @@ import pymem
 from contextlib import contextmanager
 
 from meccha_chameleon_tools.camo_bridge import CamoBridgeMixin
-from meccha_chameleon_tools.trainer import TrainerMixin
+from meccha_chameleon_tools.exploits import ExploitsMixin
 
 PAINT_PRESETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paint_presets")
 PAINT_FILE_MAGIC = b"MECHPAINT\x00"
@@ -466,7 +466,7 @@ class OffsetResolver:
 # ---------------------------------------------------------------------------
 # Game reader
 # ---------------------------------------------------------------------------
-class MecchaESP(CamoBridgeMixin, TrainerMixin):
+class MecchaESP(CamoBridgeMixin, ExploitsMixin):
     MAX_ESP_PLAYERS = 24
     PAINT_UV_BATCH_SIZE = 128    # default stamps per remote call (frozen apply)
     PAINT_UV_BATCH_FAST = 256    # larger batches when game is frozen
@@ -730,6 +730,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._world_last_good = 0
         self._world_last_good_time = 0.0
         self._esp_dead_streak = {}             # pawn -> consecutive dead reads
+        self._esp_world_pos_cache = {}         # actor -> (monotonic_ts, pos)
+        self._esp_visibility_cache = {}        # actor -> (monotonic_ts, visible)
         self._discord_session_notified = False
         self._steam_id_cache = {}
         self._blocked_steam_ids = set()
@@ -773,7 +775,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         self._esp_snapshot_started = False
         self._menu_ui_active = False
         self._overlay_screen_geom = (1920, 1080)
-        self._init_trainer_state()
+        self._init_exploits_state()
 
     def _scan_guobject_array(self):
         scanner = PatternScanner(self.pm, self.MODULE_NAME)
@@ -1061,6 +1063,15 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         """World point for dot ESP — chest height (uses config bone_indices, not legacy 1–6 map)."""
         if not actor:
             return None
+        import time as _time
+        now = _time.monotonic()
+        cache = getattr(self, "_esp_world_pos_cache", None)
+        if cache is None:
+            cache = {}
+            self._esp_world_pos_cache = cache
+        hit = cache.get(actor)
+        if hit and (now - hit[0]) < 0.066:
+            return hit[1]
         if config is None:
             config = getattr(self, "config", None)
         chest = None
@@ -1072,12 +1083,16 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         except Exception:
             pass
         if chest and self._is_valid_world_loc(chest):
+            cache[actor] = (now, chest)
             return chest
         root = self.get_actor_root_pos(actor)
         if not root:
+            cache[actor] = (now, None)
             return None
         # Root is at feet — approximate sternum height for this game.
-        return (root[0], root[1], root[2] + 85.0)
+        pos = (root[0], root[1], root[2] + 85.0)
+        cache[actor] = (now, pos)
+        return pos
 
     def get_viewport_size(self):
         """Return game client width/height in pixels."""
@@ -2164,6 +2179,8 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             print(msg, flush=True)
         self._players_cache = []
         self._esp_dead_streak.clear()
+        self._esp_world_pos_cache.clear()
+        self._esp_visibility_cache.clear()
         self._steam_id_cache.clear()
         self._ps_pc_cache.clear()
         self._ps_pc_cache_ts = 0.0
@@ -2903,7 +2920,11 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             ps = p.get("player_state", 0)
             if not self._pawn_alive_for_esp(actor, ps):
                 continue
-            pos = self.get_esp_world_pos(actor)
+            root = self.get_actor_root_pos(actor)
+            if root:
+                pos = (root[0], root[1], root[2] + 85.0)
+            else:
+                pos = p.get("pos")
             entry = dict(p)
             if pos:
                 entry["pos"] = pos
@@ -3268,7 +3289,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
         return "unknown"
 
     def _local_pawn_context(self):
-        """Snapshot of local player state for trainer / anti-kick diagnostics."""
+        """Snapshot of local player state for exploits / anti-kick diagnostics."""
         world = self._get_world()
         pc = self._get_local_controller(world) if world else 0
         ps = rp(self.pm, pc + self.offsets.get("AController::PlayerState", 0x2B0)) if pc else 0
@@ -3349,6 +3370,50 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
     def _esp_perf_relaxed(self):
         """True when we should cut overlay/snapshot work to protect game FPS."""
         return self._is_freecam_or_spectating() or bool(getattr(self, "_menu_ui_active", False))
+
+    def _esp_snapshot_heavy(self, config):
+        """True when a snapshot pass needs extra throttling (bones, clones, vis checks)."""
+        if not config:
+            return False
+        return bool(
+            getattr(config, "skeleton_esp", False)
+            or getattr(config, "clone_esp", False)
+            or (
+                getattr(config, "enemy_only", False)
+                and getattr(config, "enabled", False)
+            )
+        )
+
+    def _esp_visibility_cached(self, actor):
+        """Line-of-sight checks are expensive — reuse for ~200 ms per actor."""
+        import time as _time
+        if not actor:
+            return None
+        now = _time.monotonic()
+        cache = getattr(self, "_esp_visibility_cache", None)
+        if cache is None:
+            cache = {}
+            self._esp_visibility_cache = cache
+        hit = cache.get(actor)
+        if hit and (now - hit[0]) < 0.2:
+            return hit[1]
+        visible = self._is_visible(actor)
+        cache[actor] = (now, visible)
+        return visible
+
+    def _memory_skeleton_due(self, actor):
+        import time as _time
+        if not actor:
+            return False
+        now = _time.monotonic()
+        last = getattr(self, "_memory_skeleton_ts", None)
+        if last is None:
+            last = {}
+            self._memory_skeleton_ts = last
+        if now - last.get(actor, 0.0) < 0.35:
+            return False
+        last[actor] = now
+        return True
 
     def _get_local_pawn(self):
         return self._find_local_pawn()
@@ -4067,23 +4132,28 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     cfg = None
                 if cfg is not None:
                     self._esp_bone_indices = getattr(cfg, "bone_indices", None) or {}
-                target_fps = max(
-                    1,
-                    min(240, int(getattr(cfg, "ui_overlay_fps", 60) if cfg else 60)),
-                )
                 relaxed = self._esp_perf_relaxed()
+                heavy = self._esp_snapshot_heavy(cfg)
+                # Snapshot loop is decoupled from overlay FPS — high overlay caps must not
+                # drive 144+ Hz memory reads (that was starving the game and Qt).
                 if menu_open:
-                    wait_s = 1.0 / min(target_fps, 30)
+                    loop_hz = 20
+                    snap_interval = 0.25
                 elif relaxed:
-                    wait_s = 1.0 / min(target_fps, 60)
+                    loop_hz = 25
+                    snap_interval = 0.15
+                elif heavy:
+                    loop_hz = 35
+                    snap_interval = 0.12
                 else:
-                    wait_s = 1.0 / min(target_fps, 144)
+                    loop_hz = 45
+                    snap_interval = 0.066
+                wait_s = 1.0 / loop_hz
 
                 try:
                     self._refresh_esp_snapshot_camera_only()
 
                     now = _time.monotonic()
-                    snap_interval = 0.12 if relaxed else 0.05
                     if not menu_open and cfg is not None:
                         if (now - last_full_snap) >= snap_interval:
                             last_full_snap = now
@@ -4577,9 +4647,10 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             ps = pdata.get("player_state")
             is_local = pdata.get("is_local")
             if actor:
-                if relaxed and pdata.get("pos"):
+                # get_players() already resolved chest/root pos — avoid duplicate bone reads.
+                if pdata.get("pos"):
                     entry["pos"] = pdata["pos"]
-                else:
+                elif not relaxed:
                     chest = self.get_esp_world_pos(actor, config)
                     if chest:
                         entry["pos"] = chest
@@ -4600,7 +4671,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
                     else:
                         entry["bones"] = bridge_bones
                 else:
-                    if not relaxed:
+                    if not relaxed and self._memory_skeleton_due(actor):
                         bones = self.get_skeleton_positions(actor)
                         if not bones:
                             bones = self.get_skeleton_positions_by_indices(actor, bone_indices)
@@ -4610,7 +4681,7 @@ class MecchaESP(CamoBridgeMixin, TrainerMixin):
             if want_health and actor:
                 entry["health_info"] = self.get_health(actor, ps)
             if enemy_only and actor and not is_local:
-                entry["visible"] = self._is_visible(actor)
+                entry["visible"] = self._esp_visibility_cached(actor)
             enriched.append(entry)
 
         clones = []

@@ -7,6 +7,8 @@ from typing import Tuple, List
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "esp_config.json")
 
+MAX_OVERLAY_FPS = 100
+
 
 @dataclass
 class Config:
@@ -69,7 +71,7 @@ class Config:
     # Console / file logging (DEBUGGING tab) — filters [TAG] lines in latest.log
     log_master: bool = True
     log_session: bool = True
-    log_trainer: bool = False
+    log_exploits: bool = False
     log_anti_kick: bool = False
     log_camo: bool = False
     log_paint: bool = False
@@ -80,25 +82,24 @@ class Config:
     log_game: bool = False
     log_misc: bool = True
 
-    # Exploits / trainer toggles
-    trainer_debug: bool = False  # legacy alias — migrated to log_trainer on load
-    trainer_no_gun_cooldown: bool = False
-    trainer_no_recoil: bool = False
-    trainer_no_decoy_cooldown: bool = False
-    trainer_set_decoy_num: bool = False
-    trainer_decoy_count: int = 5
-    trainer_anti_clipping: bool = False
-    trainer_anti_detection: bool = False
-    trainer_infinite_bullets: bool = False
-    trainer_god_mode: bool = False
-    trainer_magnet_key: str = "G"
-    trainer_anti_kick: bool = False
-    trainer_rename_text: str = "Player"
+    # Exploits toggles
+    exploits_no_gun_cooldown: bool = False
+    exploits_no_recoil: bool = False
+    exploits_no_decoy_cooldown: bool = False
+    exploits_set_decoy_num: bool = False
+    exploits_decoy_count: int = 5
+    exploits_anti_clipping: bool = False
+    exploits_anti_detection: bool = False
+    exploits_infinite_bullets: bool = False
+    exploits_god_mode: bool = False
+    exploits_magnet_key: str = "G"
+    exploits_anti_kick: bool = False
+    exploits_rename_text: str = "Player"
     autokick_enabled: bool = False
     autokick_leave_on_block: bool = True
 
     # UI / overlay
-    ui_overlay_fps: int = 60  # overlay refresh cap (1–240); menu open throttles lower
+    ui_overlay_fps: int = 60  # overlay refresh cap (1–MAX_OVERLAY_FPS); menu open throttles lower
 
     # Radar
     radar_enabled: bool = False
@@ -162,9 +163,22 @@ def config_from_dict(d: dict) -> Config:
     # Flatten bone_indices if stored as list of pairs
     if "bone_indices" in d and isinstance(d["bone_indices"], list):
         d["bone_indices"] = {k: v for k, v in d["bone_indices"]}
-    # Migrate renamed ESP fields from older configs.
-    if "trainer_debug" in d and "log_trainer" not in d:
-        d["log_trainer"] = bool(d.get("trainer_debug"))
+    # Migrate renamed config keys from older saves.
+    for old_key, val in list(d.items()):
+        if old_key.startswith("trainer_"):
+            new_key = "exploits_" + old_key[len("trainer_"):]
+            if new_key not in d:
+                d[new_key] = val
+    if "log_trainer" in d and "log_exploits" not in d:
+        d["log_exploits"] = d["log_trainer"]
+    for legacy_debug in ("trainer_debug", "exploits_debug"):
+        if legacy_debug in d and "log_exploits" not in d:
+            d["log_exploits"] = bool(d.get(legacy_debug))
+    if "ui_overlay_fps" in d:
+        try:
+            d["ui_overlay_fps"] = max(1, min(MAX_OVERLAY_FPS, int(d["ui_overlay_fps"])))
+        except (TypeError, ValueError):
+            d["ui_overlay_fps"] = 60
     # Strip unknown keys so stale JSON fields never crash the dataclass constructor.
     valid = {f.name for f in dataclasses.fields(Config)}
     d = {k: v for k, v in d.items() if k in valid}

@@ -61,11 +61,11 @@ def _extract_log_tag(line: str):
 
 
 def _classify_log_tag(tag: str):
-    if tag.startswith("TRAINER:"):
+    if tag.startswith("EXPLOITS:") or tag.startswith("TRAINER:"):
         sub = tag.split(":", 1)[1]
         if sub == "ANTI-KICK":
             return "log_anti_kick"
-        return "log_trainer"
+        return "log_exploits"
     if tag in _LOG_PREFIX_TO_CATEGORY:
         return _LOG_PREFIX_TO_CATEGORY[tag]
     for prefix, category in _LOG_PREFIX_TO_CATEGORY.items():
@@ -90,17 +90,21 @@ def line_log_allowed(line: str, config=None) -> bool:
     return bool(getattr(cfg, category, False))
 
 
-def is_trainer_log_enabled(config, tag, level="info") -> bool:
-    """Gate trainer prints before formatting (avoids throttle work when disabled)."""
+def is_exploits_log_enabled(config, tag, level="info") -> bool:
+    """Gate exploits prints before formatting (avoids throttle work when disabled)."""
     if config is None:
         return True
     if not getattr(config, "log_master", True):
         return False
     if tag == "ANTI-KICK":
         return bool(getattr(config, "log_anti_kick", False))
-    if not getattr(config, "log_trainer", False):
+    if not getattr(config, "log_exploits", False):
         return level == "error"
     return True
+
+
+# Backward compat after trainer → exploits rename (external scripts / old logs).
+is_trainer_log_enabled = is_exploits_log_enabled
 
 
 class _TeeStream:

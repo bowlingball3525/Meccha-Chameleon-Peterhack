@@ -472,7 +472,7 @@ class CamoBridgeMixin:
         mods = ", ".join(module_names) if module_names else "meccha-xenos-bridge.dll"
         return (
             f"Bridge loaded but TCP not responding ({mods}). "
-            "ESP and memory trainer features work without the bridge. "
+            "ESP and memory exploit features work without the bridge. "
             "Paint and Anti-Kick need the bridge — fully quit the game once to clear "
             "a stuck DLL (after a bridge crash or DLL update only; not required for "
             "Python-only Peterhack changes)."
@@ -1252,28 +1252,28 @@ class CamoBridgeMixin:
 
     def _camo_set_collision_free(self, enable, label=""):
         """Disable pawn collision (noclip) — used on front pass only."""
-        if not hasattr(self, "_trainer_anti_clipping") or not hasattr(self, "_find_local_pawn"):
+        if not hasattr(self, "_exploits_anti_clipping") or not hasattr(self, "_find_local_pawn"):
             return
         pawn = self._find_local_pawn()
         cfg = getattr(self, "config", None)
         if not pawn or not cfg:
             return
-        user_noclip = bool(getattr(cfg, "trainer_anti_clipping", False))
+        user_noclip = bool(getattr(cfg, "exploits_anti_clipping", False))
         note = f" ({label})" if label else ""
         if enable:
             if user_noclip:
                 self._camo_noclip_owned = False
                 self._camo_noclip_hold = True
-                print(f"[CAMO] noclip already on (trainer toggle){note}", flush=True)
+                print(f"[CAMO] noclip already on (exploits toggle){note}", flush=True)
                 return
-            self._trainer_anti_clipping(pawn, cfg, True)
+            self._exploits_anti_clipping(pawn, cfg, True)
             self._camo_noclip_owned = True
             self._camo_noclip_hold = True
             print(f"[CAMO] noclip on for front pass (held through paint){note}", flush=True)
         elif getattr(self, "_camo_noclip_owned", False) or getattr(self, "_camo_noclip_hold", False):
             self._camo_noclip_hold = False
             if getattr(self, "_camo_noclip_owned", False):
-                self._trainer_anti_clipping(pawn, cfg, False)
+                self._exploits_anti_clipping(pawn, cfg, False)
                 self._camo_noclip_owned = False
             print(f"[CAMO] noclip restored after front pass{note}", flush=True)
 

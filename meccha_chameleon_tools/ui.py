@@ -24,7 +24,7 @@ from meccha_chameleon_tools.core import (
     MecchaESP, rp, ru32, rfloat, wfloat, wvec3, rvec3, rvec3_f, dist,
     read_array, OFFSETS,
 )
-from meccha_chameleon_tools.config import Config, save_config
+from meccha_chameleon_tools.config import Config, save_config, MAX_OVERLAY_FPS
 from meccha_chameleon_tools.log_util import set_log_config
 from meccha_chameleon_tools.blocklist import (
     load_blocklist, save_blocklist, add_blocked_player, remove_blocked_player, blocklist_ids,
@@ -528,7 +528,7 @@ class Menu(QWidget):
     paint_job_progress = pyqtSignal(int, int)
     camo_job_finished = pyqtSignal(bool)
     bridge_exploit_finished = pyqtSignal(bool, str)
-    trainer_rename_finished = pyqtSignal(bool, str)
+    exploits_rename_finished = pyqtSignal(bool, str)
     update_check_failed = pyqtSignal(str)
     players_steam_resolved = pyqtSignal(int, str)
     stop_camo_finished = pyqtSignal(bool)
@@ -613,7 +613,7 @@ class Menu(QWidget):
         self.paint_job_progress.connect(self._on_paint_job_progress, _queued)
         self.camo_job_finished.connect(self._camo_menu_done, _queued)
         self.bridge_exploit_finished.connect(self._bridge_exploit_done, _queued)
-        self.trainer_rename_finished.connect(self._trainer_rename_done, _queued)
+        self.exploits_rename_finished.connect(self._exploits_rename_done, _queued)
         self.update_check_failed.connect(self._on_update_check_failed, _queued)
         self.players_steam_resolved.connect(self._on_player_steam_resolved, _queued)
         self.stop_camo_finished.connect(self._stop_camo_done, _queued)
@@ -637,7 +637,7 @@ class Menu(QWidget):
         self.esp.refresh_blocklist_cache(force=True)
         if hasattr(self.esp, "set_rename_notify"):
             self.esp.set_rename_notify(
-                lambda ok, msg: self.trainer_rename_finished.emit(ok, msg or "")
+                lambda ok, msg: self.exploits_rename_finished.emit(ok, msg or "")
             )
         self._peter_logo_poll_timer = QTimer(self)
         self._peter_logo_poll_timer.timeout.connect(self._poll_peter_logo_ready)
@@ -695,7 +695,7 @@ class Menu(QWidget):
                 err = getattr(self.esp, "_camo_last_error", None) or "inject failed"
                 short = err if len(err) <= 100 else err[:97] + "..."
                 self.lbl_bridge_exploit_status.setText(f"Bridge failed — {short}")
-        if ok and getattr(self.config, "trainer_anti_kick", False):
+        if ok and getattr(self.config, "exploits_anti_kick", False):
             self.esp._anti_kick_bridge_state = None
             if hasattr(self.esp, "_schedule_anti_kick_bridge_sync"):
                 self.esp._schedule_anti_kick_bridge_sync(True, self.config)
@@ -712,7 +712,7 @@ class Menu(QWidget):
             overlay._last_menu_visible = True
 
     def _on_ui_overlay_fps_label(self, fps):
-        fps = max(1, min(240, int(fps)))
+        fps = max(1, min(MAX_OVERLAY_FPS, int(fps)))
         self.config.ui_overlay_fps = fps
         if hasattr(self, "lbl_ui_overlay_fps"):
             if self.isVisible() and fps > Overlay.MENU_OPEN_OVERLAY_FPS_CAP:
@@ -723,7 +723,7 @@ class Menu(QWidget):
                 self.lbl_ui_overlay_fps.setText(f"{fps} FPS")
 
     def _on_ui_overlay_fps_apply(self):
-        fps = max(1, min(240, int(self.sld_ui_overlay_fps.value())))
+        fps = max(1, min(MAX_OVERLAY_FPS, int(self.sld_ui_overlay_fps.value())))
         self.config.ui_overlay_fps = fps
         overlay = getattr(self, "_overlay", None)
         if overlay is not None:
@@ -812,26 +812,26 @@ class Menu(QWidget):
             f"Filled ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
         )
 
-    def _run_trainer_rename(self):
-        if getattr(self, "_trainer_rename_cooldown_active", False):
+    def _run_exploits_rename(self):
+        if getattr(self, "_exploits_rename_cooldown_active", False):
             return
-        name = self.txt_trainer_rename.text().strip()[:32]
+        name = self.txt_exploits_rename.text().strip()[:32]
         if not name:
-            self.lbl_trainer_rename_status.setText("Enter a name first.")
+            self.lbl_exploits_rename_status.setText("Enter a name first.")
             return
-        self._trainer_rename_cooldown_active = True
-        self.btn_trainer_rename.setEnabled(False)
-        QTimer.singleShot(1000, self._trainer_rename_cooldown_done)
-        self.config.trainer_rename_text = name
-        if hasattr(self.esp, "queue_trainer_rename"):
-            self.esp.queue_trainer_rename(name, self.config, force=True)
-            self.lbl_trainer_rename_status.setText(f"Queued '{name}'...")
+        self._exploits_rename_cooldown_active = True
+        self.btn_exploits_rename.setEnabled(False)
+        QTimer.singleShot(1000, self._exploits_rename_cooldown_done)
+        self.config.exploits_rename_text = name
+        if hasattr(self.esp, "queue_exploits_rename"):
+            self.esp.queue_exploits_rename(name, self.config, force=True)
+            self.lbl_exploits_rename_status.setText(f"Queued '{name}'...")
         else:
-            self.lbl_trainer_rename_status.setText("Rename unavailable — restart Peterhack.")
+            self.lbl_exploits_rename_status.setText("Rename unavailable — restart Peterhack.")
 
-    def _trainer_rename_cooldown_done(self):
-        self._trainer_rename_cooldown_active = False
-        self.btn_trainer_rename.setEnabled(True)
+    def _exploits_rename_cooldown_done(self):
+        self._exploits_rename_cooldown_active = False
+        self.btn_exploits_rename.setEnabled(True)
 
     def _run_return_to_lobby(self):
         if getattr(self, "_return_lobby_busy", False):
@@ -867,12 +867,12 @@ class Menu(QWidget):
         else:
             self.btn_return_lobby.setEnabled(True)
 
-    def _trainer_rename_done(self, ok, msg):
+    def _exploits_rename_done(self, ok, msg):
         short = msg if len(msg) <= 140 else msg[:137] + "..."
         if ok:
-            self.lbl_trainer_rename_status.setText("OK — " + short)
+            self.lbl_exploits_rename_status.setText("OK — " + short)
         else:
-            self.lbl_trainer_rename_status.setText("Failed — " + short)
+            self.lbl_exploits_rename_status.setText("Failed — " + short)
 
     def _run_bridge_teleport(self):
         if getattr(self, "_bridge_exploit_busy", False):
@@ -1035,12 +1035,12 @@ class Menu(QWidget):
     def _try_magnet_key_toggle(self):
         """Edge-triggered magnet toggle from physical key state (works outside Qt text input)."""
         if not self._magnet_hotkey_allowed():
-            vk = vk_from_name(getattr(self.config, "trainer_magnet_key", "G"))
+            vk = vk_from_name(getattr(self.config, "exploits_magnet_key", "G"))
             down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
             if hasattr(self.esp, "_magnet_key_was_down"):
                 self.esp._magnet_key_was_down = down
             return
-        vk = vk_from_name(getattr(self.config, "trainer_magnet_key", "G"))
+        vk = vk_from_name(getattr(self.config, "exploits_magnet_key", "G"))
         down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
         was_down = bool(getattr(self.esp, "_magnet_key_was_down", False))
         if down and not was_down and hasattr(self.esp, "toggle_magnet"):
@@ -1183,7 +1183,7 @@ class Menu(QWidget):
         self.btn_record_key.setText("Record Key")
 
     def _on_magnet_key_recorded(self, name):
-        self.config.trainer_magnet_key = name
+        self.config.exploits_magnet_key = name
         self.lbl_magnet_key.setText(f"Magnet toggle key: {name}")
         self.btn_record_magnet_key.setEnabled(True)
         self.btn_record_magnet_key.setText("Record Key")
@@ -1337,7 +1337,7 @@ class Menu(QWidget):
         self._build_players_tab()
         self._build_radar_tab()
         self._build_aimbot_tab()
-        self._build_trainer_tab()
+        self._build_exploits_tab()
         self._build_camouflage_tab()
         self._build_misc_tab()
         self._build_changelog_tab()
@@ -1798,10 +1798,10 @@ class Menu(QWidget):
         else:
             self._players_status("Failed to update blocklist")
 
-    def _on_trainer_rename_text_changed(self, text):
-        self.config.trainer_rename_text = text.strip()
-        if hasattr(self.esp, "_trainer_rename_pending_name"):
-            self.esp._trainer_rename_pending_name = None
+    def _on_exploits_rename_text_changed(self, text):
+        self.config.exploits_rename_text = text.strip()
+        if hasattr(self.esp, "_exploits_rename_pending_name"):
+            self.esp._exploits_rename_pending_name = None
 
     def _build_radar_tab(self):
         p = self._pages["RADAR"]
@@ -1896,7 +1896,7 @@ class Menu(QWidget):
         lo.addLayout(ar)
         lo.addStretch()
 
-    def _build_trainer_tab(self):
+    def _build_exploits_tab(self):
         p = self._pages["EXPLOITS"]
         lo = QVBoxLayout(p)
         lo.setContentsMargins(4, 4, 4, 4)
@@ -1913,36 +1913,36 @@ class Menu(QWidget):
         hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
         lo.addWidget(hint)
 
-        lo.addWidget(self._chk("No Gun Cooldown (Hunter)", "trainer_no_gun_cooldown"))
-        lo.addWidget(self._chk("No Recoil", "trainer_no_recoil"))
-        lo.addWidget(self._chk("No Decoy Cooldown", "trainer_no_decoy_cooldown"))
-        cb_anti_detect = self._chk("Anti Detection (Survivor)", "trainer_anti_detection")
+        lo.addWidget(self._chk("No Gun Cooldown (Hunter)", "exploits_no_gun_cooldown"))
+        lo.addWidget(self._chk("No Recoil", "exploits_no_recoil"))
+        lo.addWidget(self._chk("No Decoy Cooldown", "exploits_no_decoy_cooldown"))
+        cb_anti_detect = self._chk("Anti Detection (Survivor)", "exploits_anti_detection")
         cb_anti_detect.setToolTip(
             "Clears OverlapCheckCapsules each tick so buried survivors are not revealed as \"Too Buried\"."
         )
         lo.addWidget(cb_anti_detect)
-        cb_god_mode = self._chk("God Mode (Survivor)", "trainer_god_mode")
+        cb_god_mode = self._chk("God Mode (Survivor)", "exploits_god_mode")
         cb_god_mode.setToolTip(
             "MechaSRC god mode: bridge blocks Damage/DeathPlayer/KillPlayer ProcessEvent on your pawn\n"
             "and keeps Health/Invincible/Dead scrubbed. Survivor/hider only — host kills may still apply server-side."
         )
         lo.addWidget(cb_god_mode)
-        lo.addWidget(self._chk("Infinite Bullets (Hunter)", "trainer_infinite_bullets"))
-        lo.addWidget(self._chk("Set Decoy Num", "trainer_set_decoy_num"))
+        lo.addWidget(self._chk("Infinite Bullets (Hunter)", "exploits_infinite_bullets"))
+        lo.addWidget(self._chk("Set Decoy Num", "exploits_set_decoy_num"))
 
         dr = QHBoxLayout()
         dr.addWidget(QLabel("Decoy count:"))
         self.spn_decoy_count = QSpinBox()
         self.spn_decoy_count.setRange(0, 99)
-        self.spn_decoy_count.setValue(int(self.config.trainer_decoy_count))
+        self.spn_decoy_count.setValue(int(self.config.exploits_decoy_count))
         self.spn_decoy_count.valueChanged.connect(
-            lambda v: setattr(self.config, "trainer_decoy_count", int(v))
+            lambda v: setattr(self.config, "exploits_decoy_count", int(v))
         )
         dr.addWidget(self.spn_decoy_count)
         lo.addLayout(dr)
 
         magnet_row = QHBoxLayout()
-        self.lbl_magnet_key = QLabel("Magnet toggle key: " + getattr(self.config, "trainer_magnet_key", "G"))
+        self.lbl_magnet_key = QLabel("Magnet toggle key: " + getattr(self.config, "exploits_magnet_key", "G"))
         self.btn_record_magnet_key = QPushButton("Record Key")
         self.btn_record_magnet_key.setToolTip(
             "Press the key to toggle survivor magnet (default G). "
@@ -1956,8 +1956,8 @@ class Menu(QWidget):
         self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
         lo.addWidget(self.lbl_magnet_status)
 
-        lo.addWidget(self._chk("Anti-Clipping (noclip)", "trainer_anti_clipping"))
-        cb_anti_kick = self._chk("Anti-Kick", "trainer_anti_kick")
+        lo.addWidget(self._chk("Anti-Clipping (noclip)", "exploits_anti_clipping"))
+        cb_anti_kick = self._chk("Anti-Kick", "exploits_anti_kick")
         cb_anti_kick.setToolTip(
             "Blocks host kick RPCs on your PlayerController (ClientWasKicked, return-to-menu, etc.).\n"
             "If enabled before a match: waits until you spawn in + 5s stable before hooking (prevents crashes).\n"
@@ -1984,27 +1984,27 @@ class Menu(QWidget):
 
         rr = QHBoxLayout()
         rr.addWidget(QLabel("Rename to:"))
-        self.txt_trainer_rename = QLineEdit(self.config.trainer_rename_text)
-        self.txt_trainer_rename.setMaxLength(32)
-        self.txt_trainer_rename.setToolTip(
+        self.txt_exploits_rename = QLineEdit(self.config.exploits_rename_text)
+        self.txt_exploits_rename.setMaxLength(32)
+        self.txt_exploits_rename.setToolTip(
             "Calls SetName(Server) on your PlayerState — replicates CustomPlayerName\n"
             "so the nameplate above your character updates for everyone."
         )
-        self.txt_trainer_rename.textChanged.connect(self._on_trainer_rename_text_changed)
-        self.txt_trainer_rename.returnPressed.connect(self._run_trainer_rename)
-        rr.addWidget(self.txt_trainer_rename)
-        self.btn_trainer_rename = QPushButton("Rename")
-        self.btn_trainer_rename.setToolTip(
+        self.txt_exploits_rename.textChanged.connect(self._on_exploits_rename_text_changed)
+        self.txt_exploits_rename.returnPressed.connect(self._run_exploits_rename)
+        rr.addWidget(self.txt_exploits_rename)
+        self.btn_exploits_rename = QPushButton("Rename")
+        self.btn_exploits_rename.setToolTip(
             "Send SetName(Server) once via bridge.\n"
             "Works in lobby and in-match."
         )
-        self.btn_trainer_rename.clicked.connect(self._run_trainer_rename)
-        rr.addWidget(self.btn_trainer_rename)
+        self.btn_exploits_rename.clicked.connect(self._run_exploits_rename)
+        rr.addWidget(self.btn_exploits_rename)
         lo.addLayout(rr)
-        self.lbl_trainer_rename_status = QLabel("")
-        self.lbl_trainer_rename_status.setWordWrap(True)
-        self.lbl_trainer_rename_status.setStyleSheet("color: #6a8a5a; font-size: 10px;")
-        lo.addWidget(self.lbl_trainer_rename_status)
+        self.lbl_exploits_rename_status = QLabel("")
+        self.lbl_exploits_rename_status.setWordWrap(True)
+        self.lbl_exploits_rename_status.setStyleSheet("color: #6a8a5a; font-size: 10px;")
+        lo.addWidget(self.lbl_exploits_rename_status)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -2493,7 +2493,7 @@ class Menu(QWidget):
 
         lo.addWidget(QLabel("UI / Overlay"))
         info = QLabel(
-            "ESP overlay refresh when the menu is hidden (1–240). While this menu\n"
+            "ESP overlay refresh when the menu is hidden (1–100). While this menu\n"
             "is open, overlay draw is capped at 30 FPS (or lower if you set below 30)\n"
             "so the menu stays responsive. Release the slider to apply."
         )
@@ -2504,8 +2504,8 @@ class Menu(QWidget):
         fps_row = QHBoxLayout()
         fps_row.addWidget(QLabel("Overlay FPS:"))
         self.sld_ui_overlay_fps = QSlider(Qt.Horizontal)
-        self.sld_ui_overlay_fps.setRange(1, 240)
-        init_fps = max(1, min(240, int(getattr(self.config, "ui_overlay_fps", 60))))
+        self.sld_ui_overlay_fps.setRange(1, MAX_OVERLAY_FPS)
+        init_fps = max(1, min(MAX_OVERLAY_FPS, int(getattr(self.config, "ui_overlay_fps", 60))))
         self.sld_ui_overlay_fps.blockSignals(True)
         self.sld_ui_overlay_fps.setValue(init_fps)
         self.sld_ui_overlay_fps.blockSignals(False)
@@ -2513,7 +2513,7 @@ class Menu(QWidget):
         self.sld_ui_overlay_fps.setTickPosition(QSlider.TicksBelow)
         self.sld_ui_overlay_fps.setTickInterval(30)
         self.sld_ui_overlay_fps.setToolTip(
-            "Overlay repaint rate (1–240 FPS). Release mouse to apply."
+            "Overlay repaint rate (1–100 FPS). Release mouse to apply."
         )
         self.sld_ui_overlay_fps.valueChanged.connect(self._on_ui_overlay_fps_label)
         self.sld_ui_overlay_fps.sliderReleased.connect(self._on_ui_overlay_fps_apply)
@@ -2601,7 +2601,7 @@ class Menu(QWidget):
             "  + Dot ESP on chest (bone W2S); labels share chest anchor.\n"
             "\n"
             "[Stability]\n"
-            "  + Trainer loop off UI thread; async anti-kick bridge sync.\n"
+            "  + Exploits loop off UI thread; async anti-kick bridge sync.\n"
             "  + Bridge status text no longer implies game restart for Python-only fixes.\n"
             "\n"
             "[EXPLOITS / UX]\n"
@@ -2631,7 +2631,7 @@ class Menu(QWidget):
             "    NetConnection Close / disconnect-style calls.\n"
             "  + Auto-scans kick-like function names on local objects.\n"
             "  + Kick blocks logged to C:\\peterhack\\logs\\anti_kick.log;\n"
-            "    trainer polls get_anti_kick_log over bridge TCP.\n"
+            "    exploits polls get_anti_kick_log over bridge TCP.\n"
             "  + Auto-refreshes hook targets when controller/player state\n"
             "    pointers change (lobby → match spawn).\n"
             "  + Note: pure EOS/Redpoint platform kicks may still drop the\n"
@@ -2683,7 +2683,7 @@ class Menu(QWidget):
             "[Camouflage — dynamic orbit + front pass options]\n"
             "  + Dynamic camera orbit from pawn root + view (any angle/emote).\n"
             "  + Pass order: front → left → right → back (back last).\n"
-            "  + Front pass noclip held through entire paint (trainer tick fix).\n"
+            "  + Front pass noclip held through entire paint (exploits tick fix).\n"
             "  + Body-anchored scene capture on front pass (geometry pullback).\n"
             "  + Toggle: Disable front pass (only if flat map) — 3-pass mode.\n"
             "  + Camo quality slider 1–20; bridge DLL rebuilt.\n"
@@ -2712,7 +2712,7 @@ class Menu(QWidget):
             "  + Anti-Kick blocks host kick RPCs via bridge ProcessEvent hook.\n"
             "  + Auto-Rename uses SetName(Server) RPC (replicated nameplate).\n"
             "  + Bridge Teleport + Kill Self (bridge auto-injects on connect).\n"
-            "  + Debug logging to latest.log ([TRAINER:TAG] lines).\n"
+            "  + Debug logging to latest.log ([EXPLOITS:TAG] lines).\n"
             "\n"
             "[Logging / paint stability]\n"
             "  + Session logs mirror to C:\\peterhack\\logs\\latest.log.\n"
@@ -2906,7 +2906,7 @@ class Menu(QWidget):
 
         hint = QLabel(
             "Controls what is written to C:\\peterhack\\logs\\latest.log and the console.\n"
-            "Lines are matched by [TAG] prefix — e.g. [TRAINER:ANTI-KICK], [CAMO], [PAINT].\n"
+            "Lines are matched by [TAG] prefix — e.g. [EXPLOITS:ANTI-KICK], [CAMO], [PAINT].\n"
             "Timestamped session headers always go to the log file."
         )
         hint.setWordWrap(True)
@@ -2927,8 +2927,8 @@ class Menu(QWidget):
         log_specs = [
             ("Enable logging (master switch)", "log_master"),
             ("Session startup / paths ([LOG])", "log_session"),
-            ("Trainer / exploits ([TRAINER:*])", "log_trainer"),
-            ("Anti-kick & freecam ([TRAINER:ANTI-KICK])", "log_anti_kick"),
+            ("Exploits ([EXPLOITS:*])", "log_exploits"),
+            ("Anti-kick & freecam ([EXPLOITS:ANTI-KICK])", "log_anti_kick"),
             ("Camouflage & bridge ([CAMO*])", "log_camo"),
             ("Paint pipeline ([PAINT], [PRESET], [DIAG])", "log_paint"),
             ("ESP snapshot ([ESP])", "log_esp"),
@@ -3312,7 +3312,7 @@ class Menu(QWidget):
         if not hasattr(self, "lbl_magnet_status"):
             return
         active = getattr(self.esp, "_magnet_active", False)
-        key = getattr(self.config, "trainer_magnet_key", "G")
+        key = getattr(self.config, "exploits_magnet_key", "G")
         if active:
             self.lbl_magnet_status.setText(f"Magnet: ON — press {key} to disable")
             self.lbl_magnet_status.setStyleSheet("color: #ff6666; font-size: 10px; font-weight: bold;")
@@ -3378,6 +3378,7 @@ class Overlay(QWidget):
     # Keep the menu event loop responsive while it is on screen.
     MENU_OPEN_OVERLAY_FPS_CAP = 30
     FREECAM_OVERLAY_FPS_CAP = 60
+    ESP_ACTIVE_OVERLAY_FPS_CAP = 90
 
     def __init__(self, esp: MecchaESP, config: Config, menu=None):
         super().__init__()
@@ -3422,13 +3423,13 @@ class Overlay(QWidget):
 
         # Game FPS tracker — 500 Hz background thread counts camera ticks/sec
         self._game_fps_info = self.esp.start_fps_tracker()
-        self.esp.start_trainer_loop(lambda: self.config)
+        self.esp.start_exploits_loop(lambda: self.config)
         # Defer heavy ESP reads so the menu can paint/respond first.
         QTimer.singleShot(800, lambda: self.esp.start_esp_snapshot_loop(lambda: self.config))
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_overlay)
-        self._target_overlay_fps = max(1, min(240, int(getattr(self.config, "ui_overlay_fps", 60))))
+        self._target_overlay_fps = max(1, min(MAX_OVERLAY_FPS, int(getattr(self.config, "ui_overlay_fps", 60))))
         self._overlay_interval_applied_ms = None
         if menu is not None:
             self.esp._menu_ui_active = True
@@ -3610,7 +3611,7 @@ class Overlay(QWidget):
 
     @staticmethod
     def _overlay_interval_ms(fps: int) -> int:
-        fps = max(1, min(240, int(fps)))
+        fps = max(1, min(MAX_OVERLAY_FPS, int(fps)))
         return max(1, int(round(1000.0 / fps)))
 
     def request_set_fps(self, fps: int):
@@ -3619,7 +3620,7 @@ class Overlay(QWidget):
 
     def _apply_overlay_fps(self, fps: int):
         """Store user overlay cap and apply the effective timer interval."""
-        fps = max(1, min(240, int(fps)))
+        fps = max(1, min(MAX_OVERLAY_FPS, int(fps)))
         self.config.ui_overlay_fps = fps
         self._target_overlay_fps = fps
         self._sync_overlay_timer_interval()
@@ -3630,8 +3631,21 @@ class Overlay(QWidget):
             return menu.isVisible()
         return bool(getattr(self.esp, "_menu_ui_active", False))
 
+    def _esp_overlay_active(self) -> bool:
+        """Any feature that drives snapshot / paint work."""
+        c = self.config
+        return bool(
+            getattr(c, "enabled", False)
+            or getattr(c, "aimbot_enabled", False)
+            or getattr(c, "skeleton_esp", False)
+            or getattr(c, "clone_esp", False)
+            or getattr(c, "radar_enabled", False)
+        )
+
     def _effective_overlay_fps(self) -> int:
-        target = max(1, min(240, int(getattr(self, "_target_overlay_fps", 60))))
+        target = max(1, min(MAX_OVERLAY_FPS, int(getattr(self, "_target_overlay_fps", 60))))
+        if self._esp_overlay_active():
+            target = min(target, self.ESP_ACTIVE_OVERLAY_FPS_CAP)
         if self._menu_is_open():
             return min(target, self.MENU_OPEN_OVERLAY_FPS_CAP)
         if hasattr(self.esp, "_is_freecam_or_spectating") and self.esp._is_freecam_or_spectating():
@@ -3672,6 +3686,11 @@ class Overlay(QWidget):
                 f"[UI] overlay timer {effective} FPS ({ms} ms) — freecam/spectate (saved {target} FPS)",
                 flush=True,
             )
+        elif self._esp_overlay_active() and effective < target:
+            print(
+                f"[UI] overlay timer {effective} FPS ({ms} ms) — ESP active (saved {target} FPS)",
+                flush=True,
+            )
         elif prev_ms != ms:
             print(f"[UI] overlay timer {effective} FPS ({ms} ms)", flush=True)
 
@@ -3696,6 +3715,10 @@ class Overlay(QWidget):
                 self._last_menu_visible = visible
                 self.esp._menu_ui_active = visible
                 self._sync_overlay_timer_interval()
+        esp_active = self._esp_overlay_active()
+        if esp_active != getattr(self, "_overlay_esp_active", None):
+            self._overlay_esp_active = esp_active
+            self._sync_overlay_timer_interval()
         self.esp._overlay_screen_geom = (max(1, self.width()), max(1, self.height()))
         self._fps_times.append(now)
         # Keep only timestamps within the last second
@@ -4564,34 +4587,18 @@ class Overlay(QWidget):
         snap = self.esp.get_esp_paint_snapshot() if hasattr(self.esp, "get_esp_paint_snapshot") else None
         aim_target = snap.get("aim_target") if snap else None
 
-        # Fresh camera while playing — throttled so high overlay FPS cannot starve Qt.
-        cam = None
-        if not getattr(self.esp, "_menu_ui_active", False):
-            import time as _time
-            now = _time.monotonic()
-            cam_hz = 30.0 if (
-                hasattr(self.esp, "_is_freecam_or_spectating")
-                and self.esp._is_freecam_or_spectating()
-            ) else 90.0
-            if now - getattr(self, "_paint_cam_ts", 0.0) >= (1.0 / cam_hz):
-                try:
-                    self._paint_cam_cache = self.esp.get_camera()
-                    self._paint_cam_ts = now
-                except Exception:
-                    pass
-            cam = getattr(self, "_paint_cam_cache", None)
-        if not cam and snap:
-            cam = snap.get("cam")
+        # Camera comes from the snapshot thread only — never block paint on get_camera().
+        cam = snap.get("cam") if snap else None
+        if not cam:
+            cam = getattr(self, "_last_cam", None)
         if cam:
             self._last_cam = cam
-        else:
-            cam = getattr(self, "_last_cam", None)
         if not cam:
             painter.setPen(QPen(QColor(255, 255, 255)))
             painter.drawText(10, 20, "NO CAMERA")
             return
 
-        # Re-sync overlay timer when entering/leaving freecam (caps 240→60 FPS).
+        # Re-sync overlay timer when entering/leaving freecam (caps 100→60 FPS).
         relaxed = (
             hasattr(self.esp, "_is_freecam_or_spectating")
             and self.esp._is_freecam_or_spectating()
@@ -4873,6 +4880,12 @@ class Overlay(QWidget):
             ) if game_fps > 0 else QColor(150, 150, 150)
 
             cap_note = f" saved:{target_fps}" if effective_cap < target_fps else ""
+            if (
+                self._esp_overlay_active()
+                and effective_cap < target_fps
+                and not self._menu_is_open()
+            ):
+                cap_note = f" esp-cap:{self.ESP_ACTIVE_OVERLAY_FPS_CAP}{cap_note}"
             _draw_label(
                 painter, 10, 40,
                 f"OVL: {overlay_fps}/{effective_cap}fps ({timer_ms}ms){cap_note}",

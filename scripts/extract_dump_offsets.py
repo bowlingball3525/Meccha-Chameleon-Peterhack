@@ -10,13 +10,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "meccha_chameleon_tools" / "core.py"
-TRAINER = ROOT / "meccha_chameleon_tools" / "trainer.py"
+EXPLOITS = ROOT / "meccha_chameleon_tools" / "exploits.py"
 
 GLOBAL_PATCHES = {
     "GWORLD_RVA": "OFFSET_GWORLD",
 }
 
-TRAINER_PATCHES = {
+EXPLOITS_PATCHES = {
     "RVA_PROCESS_EVENT": "OFFSET_PROCESSEVENT",
 }
 
@@ -177,7 +177,7 @@ def collect_updates(dump: Path) -> dict[str, int]:
         if global_key in globals_map:
             updates[const] = globals_map[global_key]
 
-    for const, global_key in TRAINER_PATCHES.items():
+    for const, global_key in EXPLOITS_PATCHES.items():
         if global_key in globals_map:
             updates[const] = globals_map[global_key]
 
@@ -218,7 +218,7 @@ def collect_updates(dump: Path) -> dict[str, int]:
 def apply_updates(updates: dict[str, int]) -> None:
     targets = (
         (CORE, "core.py"),
-        (TRAINER, "trainer.py"),
+        (EXPLOITS, "exploits.py"),
     )
     for path, label in targets:
         if not path.is_file():
@@ -227,8 +227,8 @@ def apply_updates(updates: dict[str, int]) -> None:
         changed = []
         missing = []
         for name, value in sorted(updates.items()):
-            # Trainer only gets ProcessEvent; core gets everything else.
-            if path == TRAINER and name != "RVA_PROCESS_EVENT":
+            # Exploits module only gets ProcessEvent; core gets everything else.
+            if path == EXPLOITS and name != "RVA_PROCESS_EVENT":
                 continue
             if path == CORE and name == "RVA_PROCESS_EVENT":
                 continue
@@ -253,13 +253,13 @@ def report(dump: Path, updates: dict[str, int]) -> None:
         if k.startswith("OFFSET") or k.startswith("INDEX"):
             print(f"  {k} = 0x{v:X}")
 
-    for label, path in (("core.py", CORE), ("trainer.py", TRAINER)):
+    for label, path in (("core.py", CORE), ("exploits.py", EXPLOITS)):
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8")
         print(f"\n=== {label} vs dump ===")
         for name, new_val in sorted(updates.items()):
-            if label == "trainer.py" and name != "RVA_PROCESS_EVENT":
+            if label == "exploits.py" and name != "RVA_PROCESS_EVENT":
                 continue
             if label == "core.py" and name == "RVA_PROCESS_EVENT":
                 continue

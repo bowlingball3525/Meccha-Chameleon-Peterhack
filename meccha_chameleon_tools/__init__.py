@@ -235,7 +235,7 @@ def main():
         _disable_high_res_timers()
         if _esp_holder:
             try:
-                _esp_holder[0].stop_trainer_loop()
+                _esp_holder[0].stop_exploits_loop()
             except Exception:
                 pass
             try:

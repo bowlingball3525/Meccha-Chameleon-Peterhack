@@ -30,7 +30,7 @@ Peterhack is a **fully external** cheat. It does not modify game files on disk.
 1. **Attach** — On launch, Peterhack finds the game process and opens it with `pymem` (external read/write memory).
 2. **Read game state** — Resolves UE5 offsets (GWorld, actors, bones, health, team, Steam IDs, etc.) and builds a debounced player list each frame.
 3. **Draw overlay** — A transparent PyQt5 window sits on top of the game and renders ESP, radar, and the aimbot FOV circle.
-4. **Write memory (trainer)** — Exploits apply small targeted writes (cooldowns, recoil, collision flags) at ~20 Hz when toggled on.
+4. **Write memory (exploits)** — Exploits apply small targeted writes (cooldowns, recoil, collision flags) at ~20 Hz when toggled on.
 5. **Bridge (camo + exploits)** — Auto-injects **`meccha-xenos-bridge.dll`** and talks over **localhost TCP port 47654**. Used for environment camo, teleport, kill, rename, and anti-kick hooks.
 6. **Custom image paint** — PNG/JPG skins use Peterhack’s own remote-call path (`ImportChannel` / UV stamping), separate from bridge camouflage.
 
@@ -105,7 +105,7 @@ Writes `ControlRotation` on the local PlayerController via pymem.
 
 ### Exploits (EXPLOITS Tab)
 
-Memory writes applied when toggled on (~20 Hz trainer tick):
+Memory writes applied when toggled on (~20 Hz exploits tick):
 
 | Toggle | How it works |
 |---|---|
@@ -123,7 +123,7 @@ Memory writes applied when toggled on (~20 Hz trainer tick):
 | **Auto-Rename** | Queued background rename via bridge; debounced 1.5 s after typing stops. |
 | **Rename button** | Manual rename (Enter or **Rename**); queued on background thread — safe to spam without freezing UI. |
 | **Teleport / Kill Self** | Bridge TCP: `K2_SetActorLocation` / destroy local pawn. |
-| **Debug Logging** | Emits `[TRAINER:TAG]` lines to `latest.log`. |
+| **Debug Logging** | Emits `[EXPLOITS:TAG]` lines to `latest.log`. |
 
 Hunter/survivor exploits ported from [phxgg/chameleonEsp](https://github.com/phxgg/chameleonEsp) (external memory + ProcessEvent, same offsets).
 
@@ -136,7 +136,7 @@ Anti-kick runs **inside the injected bridge DLL**, not from Python memory writes
 | **Hook method** | **Vtable ProcessEvent hooks** on your local `PlayerController`, `PlayerState`, and `NetConnection` — does **not** patch the global ProcessEvent function (UE4SS-safe). |
 | **Blocked RPCs** | Explicit: `ClientWasKicked`, `ClientReturnToMainMenu`, `ClientReturnToMainMenuWithTextReason`, `PlayerState.Kick`, `NetConnection.Close`, etc. |
 | **Auto-scan** | Scans class hierarchies for kick/ban/disconnect/leave/redpoint/eos-like function names and adds them to the block list. |
-| **Kick logger** | Each block logged to `anti_kick.log` with seq, function name, owner class, and **host username** when available. Trainer polls `get_anti_kick_log` over TCP. |
+| **Kick logger** | Each block logged to `anti_kick.log` with seq, function name, owner class, and **host username** when available. Exploits loop polls `get_anti_kick_log` over TCP. |
 | **Auto-refresh** | Re-syncs hooks when your controller or player state pointer changes (e.g. lobby → match spawn). |
 | **Limitation** | Pure **EOS/Redpoint platform kicks** may still drop the socket at the network layer even when UE RPCs are blocked. Check logs for `NetConnection lost while world active`. |
 
@@ -309,7 +309,7 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 | Rename UI freezes when spamming | Update — renames use a background queue; UI stays responsive. |
 | Rename stuck / reverts in lobby | Use **Rename** button; enable Debug Logging; ensure bridge connected. |
 | Magnet does nothing | You must be **Hunter**; press **G** (or your bound key) to toggle ON. Key works while tabbed into the game — run Peterhack as Admin if hotkey fails. |
-| Kill Selected / Kill All fails | Hunter only; host/session rules apply — check `[TRAINER:KILL]` in log. |
+| Kill Selected / Kill All fails | Hunter only; host/session rules apply — check `[EXPLOITS:KILL]` in log. |
 | `could not unload` / DLL stuck | **Quit the game completely** and relaunch. Run Peterhack as Administrator. |
 | `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` |
 | Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |
