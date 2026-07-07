@@ -253,14 +253,13 @@ namespace sdk
         std::uint8_t Pad_DC[0x4]{};
     };
 
-    struct FPaintStrokeBatch
+    struct RuntimePaintableComponent_PaintAtUVWithBrush
     {
-        TArray<FPaintStroke> Strokes{};
-    };
-
-    struct RuntimePaintableComponent_ServerPaintBatch
-    {
-        FPaintStrokeBatch Batch{};
+        FVector2D Uv{};
+        FPaintChannelData ChannelData{};
+        FRuntimeBrushSettings BrushSettings{};
+        EPaintChannel Channel{EPaintChannel::Albedo};
+        std::uint8_t Pad_59[0x7]{};
     };
 
     struct Controller_K2_GetPawn
@@ -268,14 +267,14 @@ namespace sdk
         void* ReturnValue{nullptr};
     };
 
-    struct Controller_SetControlRotation
-    {
-        FRotator NewRotation{};
-    };
-
     struct Actor_K2_GetActorLocation
     {
         FVector ReturnValue{};
+    };
+
+    struct Controller_SetControlRotation
+    {
+        FRotator NewRotation{};
     };
 
     struct Actor_K2_GetActorRotation
@@ -369,8 +368,7 @@ namespace sdk
     static_assert(offsetof(FPaintStroke, BrushSettings) == 0x68, "PaintStroke BrushSettings offset mismatch");
     static_assert(offsetof(FPaintStroke, ChannelData) == 0x90, "PaintStroke ChannelData offset mismatch");
     static_assert(offsetof(FPaintStroke, TargetChannel) == 0xB0, "PaintStroke TargetChannel offset mismatch");
-    static_assert(sizeof(FPaintStrokeBatch) == 0x10, "PaintStrokeBatch layout mismatch");
-    static_assert(sizeof(RuntimePaintableComponent_ServerPaintBatch) == 0x10, "ServerPaintBatch params layout mismatch");
+    static_assert(sizeof(RuntimePaintableComponent_PaintAtUVWithBrush) == 0x60, "PaintAtUVWithBrush params layout mismatch");
     static_assert(sizeof(Actor_K2_GetActorLocation) == 0x18, "K2_GetActorLocation params layout mismatch");
     static_assert(sizeof(Actor_K2_GetActorRotation) == 0x18, "K2_GetActorRotation params layout mismatch");
     static_assert(sizeof(Controller_SetControlRotation) == 0x18, "SetControlRotation params layout mismatch");

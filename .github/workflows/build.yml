@@ -26,11 +26,17 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Build bridge DLL
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File runtime/scripts/build.ps1
+
       - name: Build EXE with PyInstaller
         run: |
           pyinstaller --onefile --windowed --name Peterhack ^
-            --add-data "meccha_chameleon_tools/meccha-xenos-bridge.dll;meccha_chameleon_tools" ^
-            --add-data "meccha_chameleon_tools/meccha-xenos-injector.exe;meccha_chameleon_tools" ^
+            --add-data "bridge/meccha-xenos-bridge.dll;bridge" ^
+            --add-data "bridge/meccha-xenos-injector.exe;bridge" ^
+            --add-data "bridge/mesh-profiles/paintman.mesh-profile-v2.json;bridge/mesh-profiles" ^
+            --add-data "bridge/mesh-profiles/paintman_cube.mesh-profile-v2.json;bridge/mesh-profiles" ^
             meccha_chameleon_tools/__main__.py
 
       - name: Upload EXE as artifact

@@ -3377,7 +3377,7 @@ class Overlay(QWidget):
     fps_apply_requested = pyqtSignal(int)
     # Keep the menu event loop responsive while it is on screen.
     MENU_OPEN_OVERLAY_FPS_CAP = 30
-    FREECAM_OVERLAY_FPS_CAP = 60
+    FREECAM_OVERLAY_FPS_CAP = 15
     ESP_ACTIVE_OVERLAY_FPS_CAP = 90
 
     def __init__(self, esp: MecchaESP, config: Config, menu=None):
@@ -3719,6 +3719,11 @@ class Overlay(QWidget):
         if esp_active != getattr(self, "_overlay_esp_active", None):
             self._overlay_esp_active = esp_active
             self._sync_overlay_timer_interval()
+        if hasattr(self.esp, "_is_freecam_or_spectating"):
+            relaxed = self.esp._is_freecam_or_spectating()
+            if relaxed != getattr(self, "_overlay_relaxed_mode", None):
+                self._overlay_relaxed_mode = relaxed
+                self._sync_overlay_timer_interval()
         self.esp._overlay_screen_geom = (max(1, self.width()), max(1, self.height()))
         self._fps_times.append(now)
         # Keep only timestamps within the last second
@@ -4559,7 +4564,9 @@ class Overlay(QWidget):
 
     def _paint_esp(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        freecam = bool(getattr(self, "_overlay_relaxed_mode", False))
+        if not freecam:
+            painter.setRenderHint(QPainter.Antialiasing)
         font = mono_font(10)
         painter.setFont(font)
 
@@ -4598,16 +4605,6 @@ class Overlay(QWidget):
             painter.drawText(10, 20, "NO CAMERA")
             return
 
-        # Re-sync overlay timer when entering/leaving freecam (caps 100→60 FPS).
-        relaxed = (
-            hasattr(self.esp, "_is_freecam_or_spectating")
-            and self.esp._is_freecam_or_spectating()
-        )
-        prev_relaxed = getattr(self, "_overlay_relaxed_mode", None)
-        if prev_relaxed != relaxed:
-            self._overlay_relaxed_mode = relaxed
-            self._sync_overlay_timer_interval()
-
         steam_active = self._overlay_steam_features_active()
         self.esp.set_steam_features_active(steam_active)
 
@@ -4621,6 +4618,8 @@ class Overlay(QWidget):
             for pdata in all_players:
               try:
                 is_local = pdata["is_local"]
+                if is_local and not self.config.show_local:
+                    continue
                 pos = pdata["pos"]
                 actor = pdata["actor"]
                 ps = pdata["player_state"]

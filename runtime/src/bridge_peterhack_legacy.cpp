@@ -1,0 +1,10950 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <functional>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "../include/sdk.hpp"
+
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Gdi32.lib")
+
+namespace
+{
+    constexpr int DefaultBridgePort = 47654;
+    constexpr int IdleShutdownSeconds = 15;
+    constexpr std::size_t MaxRequestBytes = 8 * 1024 * 1024;
+    constexpr int ProcessEventVtableIndex = 0x4C;
+    constexpr UINT PaintDispatchMessage = WM_APP + 0x4D43;
+    constexpr int ServerPaintBatchStrokeLimit = 50;
+    constexpr int ServerPaintBatchDelayMs = 150;
+
+    constexpr std::uintptr_t OffClass = 0x10;
+    constexpr std::uintptr_t OffName = 0x18;
+    constexpr std::uintptr_t OffOuter = 0x20;
+    constexpr std::uintptr_t OffObjectFlags = 0x08;
+    constexpr std::uint32_t RFClassDefaultObject = 0x10;
+    constexpr std::uintptr_t OffSuperStruct = 0x40;
+    constexpr std::uintptr_t OffChildren = 0x48;
+    constexpr std::uintptr_t OffChildProperties = 0x50;
+    constexpr std::uintptr_t OffPropertiesSize = 0x58;
+    constexpr std::uintptr_t OffUFieldNext = 0x28;
+    constexpr std::uintptr_t OffFFieldNext = 0x18;
+    constexpr std::uintptr_t OffFFieldName = 0x20;
+    constexpr std::uintptr_t OffFPropertyElementSize = 0x3C;
+    constexpr std::uintptr_t OffFPropertyOffset = 0x44;
+    constexpr std::uintptr_t OffFStructPropertyStruct = 0x78;
+
+    HMODULE g_module = nullptr;
+    std::atomic<bool> g_running{true};
+    std::atomic<bool> g_process_event_hook_installed{false};
+    std::atomic<std::uintptr_t> g_original_process_event{0};
+    std::atomic<HHOOK> g_message_hook{nullptr};
+    std::atomic<DWORD> g_game_thread_id{0};
+    std::mutex g_hook_mutex;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> g_process_event_hook_slots;
+    thread_local bool g_inside_process_event_hook = false;
+
+    constexpr std::uintptr_t OffPlayerControllerPlayerState = 0x2B0;
+    constexpr std::uintptr_t OffPlayerControllerIsLocal = 0x6C4;
+    constexpr std::uintptr_t OffPawnPlayerState = 0x2C8;
+    constexpr std::size_t ProcessEventInlinePatchSize = 14;
+    constexpr std::size_t AntiKickMaxBlockedFunctions = 32;
+    constexpr std::size_t AntiKickLogCapacity = 64;
+
+    struct ProcessEventInlineHook
+    {
+        void* target = nullptr;
+        void* trampoline = nullptr;
+        std::uint8_t original[ProcessEventInlinePatchSize]{};
+        bool installed = false;
+        bool chained = false;
+    };
+
+    std::mutex g_inline_hook_mutex;
+    ProcessEventInlineHook g_pe_inline_hook{};
+    constexpr std::uintptr_t OffUPlayerConnection = 0x28;
+    constexpr std::size_t AntiKickMaxVtableHooks = 8;
+    struct AntiKickVtableRestore
+    {
+        void** vtable{nullptr};
+        std::size_t slot{0};
+        void* original{nullptr};
+    };
+    std::mutex g_anti_kick_vtable_mutex;
+    AntiKickVtableRestore g_anti_kick_vtable_restores[AntiKickMaxVtableHooks]{};
+    std::size_t g_anti_kick_vtable_restore_count{0};
+    bool g_anti_kick_vtable_hook_installed{false};
+    std::atomic<bool> g_anti_kick_enabled{false};
+
+    // God mode (MechaSRC port) — block Damage/DeathPlayer/KillPlayer on local pawn.
+    constexpr std::size_t GodModeMaxBlockedFunctions = 8;
+    std::atomic<bool> g_god_mode_enabled{false};
+    std::atomic<std::uintptr_t> g_god_mode_local_pawn{0};
+    std::atomic<std::uintptr_t> g_god_mode_blocked_functions[GodModeMaxBlockedFunctions]{};
+    std::atomic<std::size_t> g_god_mode_blocked_function_count{0};
+    std::atomic<int> g_god_mode_block_count{0};
+    constexpr std::uintptr_t GodModeOffHealth = 0x0640;
+    constexpr std::uintptr_t GodModeOffMaxHealth = 0x0648;
+    constexpr std::uintptr_t GodModeOffInvincible = 0x05AB;
+    constexpr std::uintptr_t GodModeOffDead = 0x05AA;
+    std::atomic<std::uintptr_t> g_anti_kick_local_controller{0};
+    std::atomic<std::uintptr_t> g_anti_kick_local_player{0};
+    std::atomic<std::uintptr_t> g_anti_kick_local_player_state{0};
+    std::atomic<std::uintptr_t> g_anti_kick_local_net_connection{0};
+    std::atomic<std::uintptr_t> g_anti_kick_local_pawn{0};
+
+    // Capture mode: while anti-kick is on, log every distinct UFunction that is
+    // dispatched on one of our local objects (controller / player state / net
+    // connection / pawn). The kick that keeps getting through fires no function
+    // in our block list, so we need to SEE what (if anything) the engine calls
+    // on us during a host kick. Pointer-gated to the four local objects so it
+    // costs almost nothing on the hot ProcessEvent path, and deduped so each
+    // distinct call logs once per session. Read-only — never blocks.
+    std::atomic<bool> g_anti_kick_capture_enabled{false};
+    std::atomic<std::uintptr_t> g_anti_kick_capture_names_pool{0};
+    std::atomic<int> g_anti_kick_capture_names_table_offset{0x10};
+    std::atomic<int> g_anti_kick_capture_names_style{1};
+    std::mutex g_anti_kick_capture_mutex;
+    std::unordered_set<std::string> g_anti_kick_capture_seen;
+
+    // Widened capture (every object, not just the 4 local ones). To keep the hot
+    // ProcessEvent path cheap we classify each distinct UFunction pointer exactly
+    // once: the first time a function is ever dispatched we resolve + keyword-test
+    // its name, then record the pointer here so every later call is just a
+    // lock-free probe + skip. This lets us prove whether ANY kick RPC fires on a
+    // GameSession/OnlineSession/etc., and simultaneously discover the game's
+    // session/join functions (needed to wire auto-rejoin).
+    constexpr std::size_t CaptureSeenTableSize = 16384;  // power of two
+    std::atomic<std::uintptr_t> g_capture_seen_funcs[CaptureSeenTableSize]{};
+    std::atomic<std::size_t> g_capture_seen_func_fill{0};
+
+    // Diagnostic native probe: registry of disconnect-reason-carrying RPCs
+    // (ClientTravelInternal, ClientReturnToMainMenu*, ClientWasKicked, network/
+    // travel-failure). When one of these fires during a kick we read its FString
+    // URL/reason param — that string carries the engine's actual close reason,
+    // which is what we need to distinguish an application kick from a transport /
+    // EOS session drop. Pointers are discovered lazily (once) and compared on the
+    // hot path with cheap atomic loads, so cost is negligible until a kick occurs.
+    constexpr std::size_t CaptureReasonMaxFuncs = 16;
+    std::atomic<std::uintptr_t> g_capture_reason_funcs[CaptureReasonMaxFuncs]{};
+    std::atomic<std::size_t> g_capture_reason_func_count{0};
+    std::mutex g_capture_reason_mutex;
+    std::unordered_set<std::string> g_capture_reason_seen_text;
+
+    // ---- NetConnection close watcher (diagnostic) --------------------------
+    // Background thread that polls the local UNetConnection and logs the exact
+    // moment it goes away (pointer nulled on the local player, or the object
+    // becomes invalid), so we can time the transport close relative to the
+    // ProcessEvent capture sequence (ReceiveUnPossess/EndPlay/Destroyed). Pure
+    // SEH-guarded reads — no patching — so it cannot crash the game.
+    std::atomic<bool> g_netconn_watch_enabled{false};
+    std::atomic<bool> g_netconn_watch_thread_alive{false};
+    std::atomic<std::uintptr_t> g_netconn_watch_conn{0};
+    std::atomic<std::uintptr_t> g_netconn_watch_local_player{0};
+    std::atomic<std::uintptr_t> g_anti_kick_blocked_functions[AntiKickMaxBlockedFunctions]{};
+    std::atomic<std::size_t> g_anti_kick_blocked_function_count{0};
+    // FName comparison indices of the well-known kick RPC names (Kick,
+    // ClientWasKicked, ...). The engine recreates BP UFunction objects between
+    // rounds, which invalidates the pointer list above; the FName index for a
+    // given name is stable for the whole session, so matching on it keeps the
+    // block working after a round transition (chameleonEsp re-matches by name
+    // on every call for the same reason).
+    constexpr std::size_t AntiKickMaxBlockedNames = 8;
+    std::atomic<std::uint32_t> g_anti_kick_blocked_name_indices[AntiKickMaxBlockedNames]{};
+    char g_anti_kick_blocked_name_texts[AntiKickMaxBlockedNames][64]{};
+    std::atomic<std::size_t> g_anti_kick_blocked_name_count{0};
+    std::atomic<std::uint64_t> g_anti_kick_block_count{0};
+    std::size_t g_anti_kick_last_logged_blocked_count{static_cast<std::size_t>(-1)};
+    std::uintptr_t g_anti_kick_last_logged_net_connection{0};
+    bool g_anti_kick_last_logged_no_player_state{false};
+    bool g_anti_kick_last_logged_no_net_connection{false};
+
+    struct AntiKickFuncMeta
+    {
+        std::uintptr_t func{0};
+        char name[64]{};
+        char owner[24]{};
+    };
+
+    struct AntiKickLogEntry
+    {
+        std::uint64_t seq{0};
+        std::uint64_t timestamp_ms{0};
+        char function_name[64]{};
+        char object_owner[24]{};
+        char kicker[64]{};
+        char detail[128]{};
+    };
+
+    struct AntiKickSessionCache
+    {
+        std::uintptr_t world{0};
+        int gamestate_off{0};
+        int playerarray_off{0};
+        int host_ps_direct_off{0};
+        int host_flag_off{0};
+    };
+
+    AntiKickSessionCache g_anti_kick_session{};
+    std::mutex g_anti_kick_host_name_mutex;
+    char g_anti_kick_host_name[64]{};
+    std::uint64_t g_anti_kick_host_name_ms{0};
+
+    std::mutex g_anti_kick_meta_mutex;
+    AntiKickFuncMeta g_anti_kick_func_meta[AntiKickMaxBlockedFunctions]{};
+    std::size_t g_anti_kick_func_meta_count{0};
+    std::mutex g_anti_kick_log_mutex;
+    AntiKickLogEntry g_anti_kick_log[AntiKickLogCapacity]{};
+    std::size_t g_anti_kick_log_head{0};
+    std::atomic<std::uint64_t> g_anti_kick_log_seq{0};
+
+    using ProcessEventFn = void(__fastcall*)(void*, void*, void*);
+
+    struct QueuedPaintJob
+    {
+        std::string request{};
+        std::string response{};
+        bool done{false};
+    };
+
+    std::mutex g_paint_jobs_mutex;
+    std::condition_variable g_paint_jobs_cv;
+    std::vector<std::shared_ptr<QueuedPaintJob>> g_paint_jobs;
+    std::atomic<bool> g_mesh_snapshot_ready{false};
+    std::atomic<bool> g_dump_cancel_requested{false};
+    std::atomic<bool> g_paint_cancelled{false};
+
+    struct QueuedGameCommand
+    {
+        std::string request{};
+        std::string response{};
+        bool done{false};
+    };
+
+    std::mutex g_game_cmd_mutex;
+    std::condition_variable g_game_cmd_cv;
+    std::vector<std::shared_ptr<QueuedGameCommand>> g_game_cmds;
+
+    struct Reflection;
+    struct SdkContext;
+
+    auto paint_full_route_native_direct(const std::string& request) -> std::string;
+    auto is_template_uv_brush_request(const std::string& request) -> bool;
+    auto start_template_uv_brush_async_job(const std::string& request, const std::shared_ptr<QueuedPaintJob>& queued_job) -> bool;
+    auto drain_game_commands_on_game_thread() -> void;
+    auto execute_game_command_on_game_thread(const std::string& request) -> std::string;
+    auto handle_game_command_direct(const std::string& request) -> std::string;
+    auto handle_game_teleport(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_set_fov(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_kill(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_set_anti_kick(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_set_god_mode(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_get_skeleton(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto god_mode_should_block(void* object, void* function) -> bool;
+    auto god_mode_scrub_pawn(std::uintptr_t pawn) -> void;
+    auto handle_get_anti_kick_log(const std::string& payload) -> std::string;
+    auto handle_game_set_player_name(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string;
+    auto handle_game_get_player_steam_id(const std::string& payload, Reflection& ref) -> std::string;
+    auto resolve_process_event_address(std::uintptr_t sample_object) -> std::uintptr_t;
+    auto install_process_event_inline_hook(std::uintptr_t sample_object, std::string& failure) -> bool;
+    auto uninstall_process_event_inline_hook() -> void;
+    auto install_anti_kick_vtable_hooks(std::uintptr_t controller,
+                                        std::uintptr_t player_state,
+                                        std::uintptr_t net_connection,
+                                        std::string& failure) -> bool;
+    auto anti_kick_is_local_object(std::uintptr_t object) -> bool;
+    auto uninstall_anti_kick_vtable_hooks() -> void;
+    auto anti_kick_should_block(void* object, void* function, void* params) -> bool;
+    auto read_fstring_param(const std::uint8_t* base) -> std::string;
+    auto trim_player_name(std::string name) -> std::string;
+    auto cached_session_host_name(Reflection& ref) -> const char*;
+    auto json_extract_string(const std::string& json, const std::string& key) -> std::string;
+    auto json_extract_double(const std::string& json, const std::string& key) -> double;
+    auto json_extract_bool(const std::string& json, const std::string& key) -> bool;
+    auto json_extract_payload(const std::string& full_json) -> std::string;
+    auto tick_template_uv_brush_async_job() -> void;
+    auto handle_cancel_paint() -> std::string;
+    auto drain_paint_jobs_on_game_thread() -> void;
+    void __fastcall hooked_process_event(void* object, void* function, void* params);
+    LRESULT CALLBACK message_hook_proc(int code, WPARAM wparam, LPARAM lparam);
+
+    template <typename T>
+    auto safe_read(std::uintptr_t address, T fallback = T{}) -> T
+    {
+        __try
+        {
+            return *reinterpret_cast<T*>(address);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return fallback;
+        }
+    }
+
+    auto safe_copy(void* dest, const void* src, std::size_t size) -> bool
+    {
+        __try
+        {
+            std::memcpy(dest, src, size);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    auto lower_copy(std::string text) -> std::string
+    {
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return text;
+    }
+
+    auto contains_text(const std::string& text, const char* needle) -> bool
+    {
+        return text.find(needle) != std::string::npos;
+    }
+
+    auto json_escape(const std::string& text) -> std::string
+    {
+        std::string out{};
+        out.reserve(text.size() + 8);
+        for (const char c : text)
+        {
+            const auto value = static_cast<unsigned char>(c);
+            if (c == '\\' || c == '"')
+            {
+                out.push_back('\\');
+                out.push_back(c);
+            }
+            else if (c == '\n')
+            {
+                out += "\\n";
+            }
+            else if (c == '\r')
+            {
+                out += "\\r";
+            }
+            else if (c == '\t')
+            {
+                out += "\\t";
+            }
+            else if (value < 0x20)
+            {
+                static constexpr char digits[] = "0123456789abcdef";
+                out += "\\u00";
+                out.push_back(digits[(value >> 4) & 0x0f]);
+                out.push_back(digits[value & 0x0f]);
+            }
+            else
+            {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    auto response_json(bool success,
+                       const char* stage,
+                       int applied,
+                       int failures,
+                       const std::string& message,
+                       const std::string& metadata = "") -> std::string
+    {
+        std::string out = "{\"success\":";
+        out += success ? "true" : "false";
+        out += ",\"stage\":\"";
+        out += stage;
+        out += "\",\"applied\":";
+        out += std::to_string(applied);
+        out += ",\"failures\":";
+        out += std::to_string(failures);
+        out += ",\"message\":\"";
+        out += json_escape(message);
+        out += "\",\"timing_ms\":{},\"metadata\":{\"bridge\":\"runtime-bridge\"";
+        if (!metadata.empty())
+        {
+            out += ",";
+            out += metadata;
+        }
+        out += "}}\n";
+        return out;
+    }
+
+    auto resolve_bridge_port() -> int
+    {
+        wchar_t dll_path[MAX_PATH]{};
+        if (g_module != nullptr && GetModuleFileNameW(g_module, dll_path, MAX_PATH) > 0)
+        {
+            std::wstring port_path = dll_path;
+            port_path += L".port";
+            HANDLE file = CreateFileW(port_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE)
+            {
+                char buffer[32]{};
+                DWORD bytes_read = 0;
+                const BOOL ok = ReadFile(file, buffer, static_cast<DWORD>(sizeof(buffer) - 1), &bytes_read, nullptr);
+                CloseHandle(file);
+                if (ok && bytes_read > 0)
+                {
+                    const int port = std::atoi(buffer);
+                    if (port >= 1024 && port <= 65535)
+                    {
+                        return port;
+                    }
+                }
+            }
+        }
+        return DefaultBridgePort;
+    }
+
+    auto bridge_sidecar_path(const wchar_t* suffix) -> std::wstring
+    {
+        wchar_t dll_path[MAX_PATH]{};
+        if (g_module != nullptr && GetModuleFileNameW(g_module, dll_path, MAX_PATH) > 0)
+        {
+            std::wstring path = dll_path;
+            path += suffix;
+            return path;
+        }
+        return {};
+    }
+
+    auto write_bridge_progress(const std::string& stage,
+                               const std::string& message,
+                               int step,
+                               int total_steps,
+                               double elapsed_ms,
+                               const std::string& extra = "") -> void
+    {
+        const auto path = bridge_sidecar_path(L".progress.json");
+        if (path.empty())
+        {
+            return;
+        }
+        const double progress = total_steps > 0 ? std::max(0.0, std::min(1.0, static_cast<double>(step) / static_cast<double>(total_steps))) : 0.0;
+        const bool stream_progress = extra.find("server_batch_index") != std::string::npos ||
+                                     extra.find("server_batches") != std::string::npos ||
+                                     extra.find("server_sent") != std::string::npos;
+        const double eta_ms = stream_progress && progress > 0.02 ? std::max(0.0, (elapsed_ms / progress) - elapsed_ms) : 0.0;
+        std::string json = "{\"stage\":\"" + json_escape(stage) +
+                           "\",\"message\":\"" + json_escape(message) +
+                           "\",\"step\":" + std::to_string(step) +
+                           ",\"total_steps\":" + std::to_string(total_steps) +
+                           ",\"progress\":" + std::to_string(progress) +
+                           ",\"elapsed_ms\":" + std::to_string(elapsed_ms) +
+                           ",\"eta_ms\":" + std::to_string(eta_ms);
+        if (!extra.empty())
+        {
+            json += ",";
+            json += extra;
+        }
+        json += "}\n";
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+        DWORD written = 0;
+        WriteFile(file, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+        CloseHandle(file);
+    }
+
+    auto json_extract_string(const std::string& json, const std::string& key) -> std::string
+    {
+        const auto key_start = json.find("\"" + key + "\"");
+        if (key_start == std::string::npos) return {};
+        const auto colon = json.find(':', key_start);
+        if (colon == std::string::npos) return {};
+        const auto value_start = json.find_first_of("\"0123456789-tfn", colon + 1);
+        if (value_start == std::string::npos) return {};
+        if (json[value_start] == '\"')
+        {
+            const auto value_end = json.find('\"', value_start + 1);
+            if (value_end == std::string::npos) return {};
+            return json.substr(value_start + 1, value_end - value_start - 1);
+        }
+        const auto value_end = json.find_first_of(",}]", value_start);
+        if (value_end == std::string::npos) return {};
+        return json.substr(value_start, value_end - value_start);
+    }
+
+    auto json_extract_double(const std::string& json, const std::string& key) -> double
+    {
+        const auto str = json_extract_string(json, key);
+        if (str.empty()) return 0.0;
+        char* end = nullptr;
+        return std::strtod(str.c_str(), &end);
+    }
+
+    auto json_extract_bool(const std::string& json, const std::string& key) -> bool
+    {
+        const auto str = json_extract_string(json, key);
+        return str == "true";
+    }
+
+    auto json_extract_payload(const std::string& full_json) -> std::string
+    {
+        const auto pay_key = full_json.find("\"payload\"");
+        if (pay_key == std::string::npos) return {};
+        const auto colon = full_json.find(':', pay_key);
+        if (colon == std::string::npos) return {};
+        const auto brace = full_json.find('{', colon);
+        if (brace == std::string::npos) return {};
+        int depth = 1;
+        for (std::size_t i = brace + 1; i < full_json.size(); ++i)
+        {
+            if (full_json[i] == '{') ++depth;
+            else if (full_json[i] == '}') { --depth; if (depth == 0) return full_json.substr(brace, i - brace + 1); }
+        }
+        return {};
+    }
+
+    auto clear_bridge_progress() -> void
+    {
+        const auto path = bridge_sidecar_path(L".progress.json");
+        if (!path.empty())
+        {
+            DeleteFileW(path.c_str());
+        }
+    }
+
+    auto write_bridge_sidecar_text(const wchar_t* suffix, const std::string& text) -> bool
+    {
+        const auto path = bridge_sidecar_path(suffix);
+        if (path.empty())
+        {
+            return false;
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        DWORD written = 0;
+        const auto ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+        CloseHandle(file);
+        return ok && written == text.size();
+    }
+
+    auto ensure_directory(const std::wstring& path) -> bool
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+        if (CreateDirectoryW(path.c_str(), nullptr))
+        {
+            return true;
+        }
+        return GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+
+    auto runtime_log_dir_path() -> std::wstring
+    {
+        wchar_t local_appdata[MAX_PATH]{};
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local_appdata, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH)
+        {
+            return {};
+        }
+        std::wstring base = local_appdata;
+        const std::wstring root = base + L"\\MecchaCamouflage";
+        const std::wstring runtime = root + L"\\runtime";
+        if (!ensure_directory(root) || !ensure_directory(runtime))
+        {
+            return {};
+        }
+        return runtime;
+    }
+
+    struct ModuleRange
+    {
+        std::uintptr_t base{0};
+        std::size_t size{0};
+    };
+
+    auto main_module_range() -> ModuleRange
+    {
+        auto* base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+        if (!base)
+        {
+            return {};
+        }
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        {
+            return {};
+        }
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+        {
+            return {};
+        }
+        return {reinterpret_cast<std::uintptr_t>(base), nt->OptionalHeader.SizeOfImage};
+    }
+
+    auto address_in_main_module(std::uintptr_t address) -> bool
+    {
+        const auto module = main_module_range();
+        return module.base && address >= module.base && address < module.base + module.size;
+    }
+
+    auto live_uobject(std::uintptr_t object) -> bool
+    {
+        if (!object || address_in_main_module(object))
+        {
+            return false;
+        }
+        const auto flags = safe_read<std::uint32_t>(object + OffObjectFlags, 0);
+        return (flags & RFClassDefaultObject) == 0;
+    }
+
+    auto match_pattern(const std::uint8_t* data, const std::uint8_t* pattern, const std::uint8_t* mask, std::size_t length) -> bool
+    {
+        for (std::size_t i = 0; i < length; ++i)
+        {
+            if (mask[i] && data[i] != pattern[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    auto scan_pattern(const std::vector<std::uint8_t>& pattern, const std::vector<std::uint8_t>& mask) -> std::uintptr_t
+    {
+        const auto module = main_module_range();
+        if (!module.base || !module.size || pattern.empty() || pattern.size() != mask.size())
+        {
+            return 0;
+        }
+        const auto* base = reinterpret_cast<const std::uint8_t*>(module.base);
+        const std::size_t length = pattern.size();
+        for (std::size_t offset = 0; offset + length < module.size; ++offset)
+        {
+            __try
+            {
+                if (match_pattern(base + offset, pattern.data(), mask.data(), length))
+                {
+                    return module.base + offset;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        return 0;
+    }
+
+    struct FNameResolver
+    {
+        std::uintptr_t pool{0};
+        int table_offset{0x10};
+        int style{1};
+        const int offsets[14]{0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70};
+
+        auto entry(std::uint32_t id, int table, int entry_style) const -> std::string
+        {
+            const auto block_index = id >> 16;
+            const auto within = (id & 0xFFFF) << 1;
+            const auto block = safe_read<std::uintptr_t>(pool + table + static_cast<std::uintptr_t>(block_index) * 8);
+            if (!block)
+            {
+                return {};
+            }
+            const auto header = safe_read<std::uint16_t>(block + within);
+            bool wide = false;
+            int length = 0;
+            if (entry_style == 0)
+            {
+                wide = (header & 1) != 0;
+                length = header >> 1;
+            }
+            else if (entry_style == 2)
+            {
+                wide = (header & 1) != 0;
+                length = (header >> 6) & 0x3FF;
+            }
+            else
+            {
+                length = header & 0x3FF;
+                wide = ((header >> 10) & 1) != 0;
+            }
+            if (length <= 0 || length > 512)
+            {
+                return {};
+            }
+            if (wide)
+            {
+                std::wstring text(length, L'\0');
+                if (!safe_copy(text.data(), reinterpret_cast<void*>(block + within + 2), static_cast<std::size_t>(length) * sizeof(wchar_t)))
+                {
+                    return {};
+                }
+                std::string out{};
+                out.reserve(text.size());
+                for (wchar_t c : text)
+                {
+                    out.push_back(c >= 0 && c < 128 ? static_cast<char>(c) : '?');
+                }
+                return out;
+            }
+            std::string text(length, '\0');
+            if (!safe_copy(text.data(), reinterpret_cast<void*>(block + within + 2), static_cast<std::size_t>(length)))
+            {
+                return {};
+            }
+            return text;
+        }
+
+        auto detect() -> void
+        {
+            for (const int off : offsets)
+            {
+                for (const int st : {2, 1, 0})
+                {
+                    if (entry(0, off, st) == "None")
+                    {
+                        table_offset = off;
+                        style = st;
+                        return;
+                    }
+                }
+            }
+        }
+
+        auto resolve(std::uint32_t id) -> std::string
+        {
+            auto name = entry(id, table_offset, style);
+            if (!name.empty())
+            {
+                return name;
+            }
+            for (const int off : offsets)
+            {
+                for (const int st : {2, 1, 0})
+                {
+                    name = entry(id, off, st);
+                    if (!name.empty())
+                    {
+                        table_offset = off;
+                        style = st;
+                        return name;
+                    }
+                }
+            }
+            return {};
+        }
+    };
+
+    struct Reflection
+    {
+        std::uintptr_t guobject_array{0};
+        std::uintptr_t fname_pool{0};
+        FNameResolver names{};
+        std::uintptr_t meta_class{0};
+
+        auto init(std::string& failure) -> bool
+        {
+            static const std::vector<std::uint8_t> gu_sig{0x48, 0x8D, 0x05, 0, 0, 0, 0, 0x48, 0x89, 0x01, 0x45, 0x8B, 0xD1};
+            static const std::vector<std::uint8_t> gu_mask{1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1};
+            const auto gu_ref = scan_pattern(gu_sig, gu_mask);
+            if (!gu_ref)
+            {
+                failure = "guobject_pattern_not_found";
+                return false;
+            }
+            const auto rel = safe_read<std::int32_t>(gu_ref + 3);
+            guobject_array = gu_ref + 7 + rel;
+            const auto delta_candidate = guobject_array - 0x11C658;  // GObjects − GNames (dump 5.6.1-44394996)
+            names.pool = delta_candidate;
+            names.detect();
+            if (names.resolve(0) == "None")
+            {
+                fname_pool = delta_candidate;
+                return true;
+            }
+
+            const std::vector<std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> patterns{
+                {{0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0x4C, 0x8B, 0xC0}, {1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1}},
+                {{0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0x48, 0x8B}, {1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1}},
+                {{0x48, 0x8D, 0x35, 0, 0, 0, 0}, {1, 1, 1, 0, 0, 0, 0}},
+                {{0x48, 0x8D, 0x3D, 0, 0, 0, 0}, {1, 1, 1, 0, 0, 0, 0}},
+            };
+            for (const auto& [sig, mask] : patterns)
+            {
+                const auto ref = scan_pattern(sig, mask);
+                if (!ref)
+                {
+                    continue;
+                }
+                const auto fname_rel = safe_read<std::int32_t>(ref + 3);
+                names.pool = ref + 7 + fname_rel;
+                names.detect();
+                if (names.resolve(0) == "None")
+                {
+                    fname_pool = names.pool;
+                    return true;
+                }
+            }
+            failure = "fname_pool_not_found";
+            return false;
+        }
+
+        auto object_name(std::uintptr_t object) -> std::string
+        {
+            if (!object)
+            {
+                return {};
+            }
+            auto out = names.resolve(safe_read<std::uint32_t>(object + OffName));
+            const auto slash = out.find_last_of("/.");
+            if (slash != std::string::npos)
+            {
+                out = out.substr(slash + 1);
+            }
+            if (out.rfind("Default__", 0) == 0)
+            {
+                out = out.substr(9);
+            }
+            return out;
+        }
+
+        auto class_ptr(std::uintptr_t object) -> std::uintptr_t
+        {
+            return object ? safe_read<std::uintptr_t>(object + OffClass) : 0;
+        }
+
+        auto class_name(std::uintptr_t object) -> std::string
+        {
+            return object_name(class_ptr(object));
+        }
+
+        template <typename Fn>
+        auto for_each_object(Fn fn) -> void
+        {
+            const auto chunks = safe_read<std::uintptr_t>(guobject_array + 0x10);
+            if (!chunks)
+            {
+                return;
+            }
+            for (int ci = 0; ci < 64; ++ci)
+            {
+                const auto chunk = safe_read<std::uintptr_t>(chunks + static_cast<std::uintptr_t>(ci) * 8);
+                if (!chunk)
+                {
+                    break;
+                }
+                for (int wi = 0; wi < 65536; ++wi)
+                {
+                    const auto obj = safe_read<std::uintptr_t>(chunk + static_cast<std::uintptr_t>(wi) * 0x18);
+                    if (obj && fn(obj))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        auto find_meta_class() -> std::uintptr_t
+        {
+            if (meta_class)
+            {
+                return meta_class;
+            }
+            for_each_object([&](std::uintptr_t obj) {
+                if (object_name(obj) == "Class")
+                {
+                    meta_class = obj;
+                    return true;
+                }
+                return false;
+            });
+            return meta_class;
+        }
+
+        auto find_class(const char* name) -> std::uintptr_t
+        {
+            const auto meta = find_meta_class();
+            if (!meta)
+            {
+                return 0;
+            }
+            std::uintptr_t found = 0;
+            for_each_object([&](std::uintptr_t obj) {
+                if (class_ptr(obj) == meta && object_name(obj) == name)
+                {
+                    found = obj;
+                    return true;
+                }
+                return false;
+            });
+            return found;
+        }
+
+        auto find_class_any(const char* name) -> std::uintptr_t
+        {
+            // find_class only matches native classes (meta == "Class");
+            // Blueprint-generated classes like BP_FirstPersonPlayerState_Online_C
+            // have BlueprintGeneratedClass as their class, so match those too.
+            std::uintptr_t found = 0;
+            for_each_object([&](std::uintptr_t obj) {
+                if (object_name(obj) != name)
+                {
+                    return false;
+                }
+                const auto meta_name = class_name(obj);
+                if (meta_name == "Class" || meta_name == "BlueprintGeneratedClass"
+                    || meta_name == "WidgetBlueprintGeneratedClass" || meta_name == "AnimBlueprintGeneratedClass")
+                {
+                    found = obj;
+                    return true;
+                }
+                return false;
+            });
+            return found;
+        }
+
+        auto find_first_instance(const char* class_name_text) -> std::uintptr_t
+        {
+            const auto cls = find_class(class_name_text);
+            if (!cls)
+            {
+                return 0;
+            }
+            std::uintptr_t found = 0;
+            for_each_object([&](std::uintptr_t obj) {
+                if (class_ptr(obj) == cls && object_name(obj).rfind("Default__", 0) != 0)
+                {
+                    found = obj;
+                    return true;
+                }
+                return false;
+            });
+            return found;
+        }
+
+        auto find_property(std::uintptr_t structure, const char* property_name) -> std::uintptr_t
+        {
+            for (auto prop = safe_read<std::uintptr_t>(structure + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+            {
+                if (names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)) == property_name)
+                {
+                    return prop;
+                }
+            }
+            return 0;
+        }
+
+        auto resolve_property_offset(const char* class_name_text, const char* property_name) -> int
+        {
+            auto cls = find_class(class_name_text);
+            for (int depth = 0; cls && depth < 32; ++depth)
+            {
+                const auto prop = find_property(cls, property_name);
+                if (prop)
+                {
+                    return safe_read<int>(prop + OffFPropertyOffset, -1);
+                }
+                cls = safe_read<std::uintptr_t>(cls + OffSuperStruct);
+            }
+            return -1;
+        }
+
+        auto find_function_in_class(std::uintptr_t cls, const char* function_name) -> std::uintptr_t
+        {
+            for (int depth = 0; cls && depth < 64; ++depth)
+            {
+                for (auto child = safe_read<std::uintptr_t>(cls + OffChildren); child; child = safe_read<std::uintptr_t>(child + OffUFieldNext))
+                {
+                    if (object_name(child) == function_name)
+                    {
+                        return child;
+                    }
+                }
+                cls = safe_read<std::uintptr_t>(cls + OffSuperStruct);
+            }
+            return 0;
+        }
+
+        auto find_function(std::uintptr_t object, const char* function_name) -> std::uintptr_t
+        {
+            return find_function_in_class(class_ptr(object), function_name);
+        }
+    };
+
+    auto is_kick_protect_excluded_name(const std::string& lower_name) -> bool
+    {
+        static const char* excluded[] = {
+            "clientcapbandwidth",
+            "capbandwidth",
+            "bandwidth",
+        };
+        for (const char* name : excluded)
+        {
+            if (lower_name == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    auto is_kick_like_function_name(const std::string& lower_name) -> bool
+    {
+        if (is_kick_protect_excluded_name(lower_name))
+        {
+            return false;
+        }
+        static const char* needles[] = {
+            "kick",
+            "kicked",
+            "ban",
+            "banned",
+            "removeplayer",
+            "disconnect",
+            "returnmainmenu",
+            "returntomainmenu",
+            "travelerror",
+            "connectionlost",
+            "hostmigration",
+            "gotokick",
+            "wasremoved",
+            "sessionfull",
+            "redpoint",
+            "removefrom",
+            "leaved",
+            "leavegame",
+            "expel",
+            "eject",
+            "forced",
+            "eos",
+            "closesocket",
+        };
+        for (const char* needle : needles)
+        {
+            if (lower_name.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    auto is_connection_protect_function_name(const std::string& lower_name) -> bool
+    {
+        static const char* needles[] = {
+            "close",
+            "cleanup",
+            "disconnect",
+            "connectionlost",
+            "destroy",
+            "shutdown",
+            "kick",
+            "removed",
+            "leave",
+            "travelerror",
+            "returnmainmenu",
+            "returntomainmenu",
+            "ban",
+        };
+        for (const char* needle : needles)
+        {
+            if (lower_name.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    auto append_anti_kick_log_file(const std::string& line) -> void
+    {
+        static const wchar_t* paths[] = {
+            L"C:\\peterhack\\logs\\anti_kick.log",
+            L"C:\\peterhack\\logs\\latest_anti_kick.log",
+        };
+        for (const wchar_t* path : paths)
+        {
+            HANDLE file = CreateFileW(
+                path,
+                FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                continue;
+            }
+            DWORD written = 0;
+            WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+            CloseHandle(file);
+            return;
+        }
+        write_bridge_sidecar_text(L".anti_kick.log", line);
+    }
+
+    auto try_read_fstring_param_preview(void* params, char* out, std::size_t out_len) -> void
+    {
+        if (!params || !out || out_len == 0)
+        {
+            return;
+        }
+        out[0] = '\0';
+        __try
+        {
+            const auto* base = reinterpret_cast<const std::uint8_t*>(params);
+            const auto* data = safe_read<const wchar_t*>(reinterpret_cast<std::uintptr_t>(base));
+            const auto num = safe_read<int>(reinterpret_cast<std::uintptr_t>(base + 8));
+            if (!data || num <= 1 || num > 256)
+            {
+                return;
+            }
+            std::size_t written = 0;
+            const int limit = std::min(num - 1, 96);
+            for (int i = 0; i < limit && written + 1 < out_len; ++i)
+            {
+                const wchar_t ch = data[i];
+                if (ch == 0)
+                {
+                    break;
+                }
+                out[written++] = static_cast<char>(ch < 128 ? ch : '?');
+            }
+            out[written] = '\0';
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (out_len > 0)
+            {
+                out[0] = '\0';
+            }
+        }
+    }
+
+    auto anti_kick_lookup_meta(std::uintptr_t func, const char** out_name, const char** out_owner) -> bool
+    {
+        if (!func || !out_name || !out_owner)
+        {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+        for (std::size_t i = 0; i < g_anti_kick_func_meta_count; ++i)
+        {
+            if (g_anti_kick_func_meta[i].func == func)
+            {
+                *out_name = g_anti_kick_func_meta[i].name;
+                *out_owner = g_anti_kick_func_meta[i].owner;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    auto anti_kick_record_block(std::uintptr_t func, void* params,
+                                const char* fallback_name = nullptr,
+                                const char* fallback_owner = nullptr) -> void
+    {
+        const char* func_name = fallback_name ? fallback_name : "unknown";
+        const char* owner = fallback_owner ? fallback_owner : "local";
+        anti_kick_lookup_meta(func, &func_name, &owner);
+
+        char detail[128]{};
+        try_read_fstring_param_preview(params, detail, sizeof(detail));
+
+        Reflection ref{};
+        std::string ref_failure{};
+        const char* kicker = "unknown host";
+        if (ref.init(ref_failure))
+        {
+            kicker = cached_session_host_name(ref);
+        }
+
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        const auto seq = g_anti_kick_log_seq.fetch_add(1) + 1;
+
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_log_mutex);
+            auto& entry = g_anti_kick_log[g_anti_kick_log_head % AntiKickLogCapacity];
+            entry.seq = seq;
+            entry.timestamp_ms = now_ms;
+            std::snprintf(entry.function_name, sizeof(entry.function_name), "%s", func_name);
+            std::snprintf(entry.object_owner, sizeof(entry.object_owner), "%s", owner);
+            std::snprintf(entry.kicker, sizeof(entry.kicker), "%s", kicker ? kicker : "unknown host");
+            std::snprintf(entry.detail, sizeof(entry.detail), "%s", detail);
+            g_anti_kick_log_head = (g_anti_kick_log_head + 1) % AntiKickLogCapacity;
+        }
+
+        std::string line = "[anti-kick] seq=" + std::to_string(seq) +
+                           " BLOCKED kick from " + std::string(kicker ? kicker : "unknown host") +
+                           " — " + func_name + " on " + owner;
+        if (detail[0] != '\0')
+        {
+            line += " reason=\"";
+            line += detail;
+            line += "\"";
+        }
+        line += "\n";
+        append_anti_kick_log_file(line);
+    }
+
+    auto scan_kick_functions_on_object(
+        Reflection& ref,
+        std::uintptr_t object,
+        const char* owner_label,
+        const std::function<void(std::uintptr_t, const char*, const char*)>& remember) -> void
+    {
+        if (!live_uobject(object) || !owner_label || !remember)
+        {
+            return;
+        }
+        const bool net_connection = std::string(owner_label) == "NetConnection";
+        auto cls = ref.class_ptr(object);
+        for (int depth = 0; cls && depth < 64; ++depth)
+        {
+            for (auto child = safe_read<std::uintptr_t>(cls + OffChildren); child;
+                 child = safe_read<std::uintptr_t>(child + OffUFieldNext))
+            {
+                const auto name = ref.object_name(child);
+                if (name.empty())
+                {
+                    continue;
+                }
+                const auto lower = lower_copy(name);
+                const bool protect = net_connection ? is_connection_protect_function_name(lower)
+                                                    : is_kick_like_function_name(lower);
+                if (!protect)
+                {
+                    continue;
+                }
+                remember(child, owner_label, name.c_str());
+            }
+            cls = safe_read<std::uintptr_t>(cls + OffSuperStruct);
+        }
+    }
+
+    struct Color
+    {
+        double r{1.0};
+        double g{1.0};
+        double b{1.0};
+        double roughness{0.0};
+        double metallic{1.0};
+        int apply_mode{0};
+    };
+
+    struct FrontSample
+    {
+        double u{0.5};
+        double v{0.5};
+        double r{1.0};
+        double g{1.0};
+        double b{1.0};
+        double roughness{0.65};
+        double metallic{0.0};
+        double screen_nx{0.5};
+        double screen_ny{0.5};
+        bool has_world_position{false};
+        sdk::FVector world_position{};
+    };
+
+    auto clamp01(double value) -> double;
+    auto prop_offset(std::uintptr_t prop) -> int;
+    auto prop_element_size(std::uintptr_t prop) -> int;
+    auto write_number(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, double value) -> bool;
+    auto process_event(std::uintptr_t object, std::uintptr_t function, std::uint8_t* params, std::string& failure) -> bool;
+    auto read_return_bool(Reflection& ref, std::uintptr_t function, std::uint8_t* params) -> bool;
+
+    auto clamp01(double value) -> double
+    {
+        return std::max(0.0, std::min(1.0, value));
+    }
+
+    auto sdk_worker_count_for_items(std::size_t item_count) -> unsigned
+    {
+        const auto hardware = std::max(1U, std::thread::hardware_concurrency());
+        const auto useful = item_count < 65536
+                                ? 1U
+                                : std::min<unsigned>(hardware, static_cast<unsigned>((item_count + 65535) / 65536));
+        return std::max(1U, useful);
+    }
+
+    template <typename Fn>
+    auto sdk_parallel_ranges(std::size_t item_count, Fn&& fn) -> void
+    {
+        const auto workers = sdk_worker_count_for_items(item_count);
+        if (workers <= 1 || item_count == 0)
+        {
+            fn(0, item_count, 0);
+            return;
+        }
+        std::vector<std::thread> threads{};
+        threads.reserve(workers);
+        for (unsigned worker = 0; worker < workers; ++worker)
+        {
+            const auto begin = (item_count * static_cast<std::size_t>(worker)) / static_cast<std::size_t>(workers);
+            const auto end = (item_count * static_cast<std::size_t>(worker + 1)) / static_cast<std::size_t>(workers);
+            threads.emplace_back([begin, end, worker, &fn]() {
+                fn(begin, end, worker);
+            });
+        }
+        for (auto& thread : threads)
+        {
+            if (thread.joinable())
+            {
+                thread.join();
+            }
+        }
+    }
+
+    auto prop_offset(std::uintptr_t prop) -> int
+    {
+        return safe_read<int>(prop + OffFPropertyOffset, -1);
+    }
+
+    auto prop_element_size(std::uintptr_t prop) -> int
+    {
+        return safe_read<int>(prop + OffFPropertyElementSize, 0);
+    }
+
+    auto find_property_any(Reflection& ref, std::uintptr_t structure, std::initializer_list<const char*> field_names) -> std::uintptr_t
+    {
+        if (!structure)
+        {
+            return 0;
+        }
+        for (const auto* field_name : field_names)
+        {
+            if (field_name)
+            {
+                if (const auto prop = ref.find_property(structure, field_name))
+                {
+                    return prop;
+                }
+            }
+        }
+        for (auto prop = safe_read<std::uintptr_t>(structure + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto prop_name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            for (const auto* field_name : field_names)
+            {
+                if (field_name && prop_name == lower_copy(field_name))
+                {
+                    return prop;
+                }
+            }
+        }
+        return 0;
+    }
+
+    auto struct_has_any_field(Reflection& ref, std::uintptr_t structure, std::initializer_list<const char*> field_names) -> bool
+    {
+        return find_property_any(ref, structure, field_names) != 0;
+    }
+
+    auto struct_type(Reflection& ref, std::uintptr_t prop, std::initializer_list<const char*> field_names) -> std::uintptr_t
+    {
+        const std::uintptr_t candidate_offsets[]{
+            OffFStructPropertyStruct,
+            0x68,
+            0x70,
+            0x80,
+            0x88,
+            0x90,
+            0x98,
+            0xA0,
+        };
+        for (const auto offset : candidate_offsets)
+        {
+            const auto structure = safe_read<std::uintptr_t>(prop + offset);
+            if (struct_has_any_field(ref, structure, field_names))
+            {
+                return structure;
+            }
+        }
+        return safe_read<std::uintptr_t>(prop + OffFStructPropertyStruct);
+    }
+
+    auto strict_vector_struct_type(Reflection& ref, std::uintptr_t prop, std::initializer_list<const char*> field_names, int min_size) -> std::uintptr_t
+    {
+        if (prop_element_size(prop) < min_size)
+        {
+            return 0;
+        }
+        const auto structure = struct_type(ref, prop, field_names);
+        if (!structure)
+        {
+            return 0;
+        }
+        for (const auto* field_name : field_names)
+        {
+            if (!field_name || !find_property_any(ref, structure, {field_name}))
+            {
+                return 0;
+            }
+        }
+        return structure;
+    }
+
+    auto function_param_schema(Reflection& ref, std::uintptr_t function) -> std::string
+    {
+        std::string out{};
+        int count = 0;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop && count < 32; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext), ++count)
+        {
+            if (!out.empty())
+            {
+                out += ";";
+            }
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            out += name + "@" + std::to_string(prop_offset(prop)) + "#" + std::to_string(prop_element_size(prop));
+        }
+        return out;
+    }
+
+    auto early_hex_address(std::uintptr_t value) -> std::string
+    {
+        char buffer[32]{};
+        std::snprintf(buffer, sizeof(buffer), "0x%llx", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+
+    auto hex_address(std::uintptr_t value) -> std::string
+    {
+        return early_hex_address(value);
+    }
+
+    auto parse_hex_address(const std::string& text) -> std::uintptr_t
+    {
+        if (text.empty())
+        {
+            return 0;
+        }
+        try
+        {
+            std::string trimmed = text;
+            while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '"'))
+            {
+                trimmed.erase(trimmed.begin());
+            }
+            while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '"'))
+            {
+                trimmed.pop_back();
+            }
+            if (trimmed.empty())
+            {
+                return 0;
+            }
+            std::size_t idx = 0;
+            const int base = (trimmed.rfind("0x", 0) == 0 || trimmed.rfind("0X", 0) == 0) ? 16 : 10;
+            return static_cast<std::uintptr_t>(std::stoull(trimmed, &idx, base));
+        }
+        catch (...)
+        {
+            return 0;
+        }
+    }
+
+    template <typename T>
+    auto safe_write(std::uintptr_t address, T value) -> bool
+    {
+        __try
+        {
+            *reinterpret_cast<T*>(address) = value;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    auto early_json_bool(bool value) -> const char*
+    {
+        return value ? "true" : "false";
+    }
+
+    auto property_list_json(Reflection& ref, std::uintptr_t object, int max_props = 96) -> std::string
+    {
+        std::string out = "[";
+        int count = 0;
+        for (auto cls = ref.class_ptr(object); cls && count < max_props; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+        {
+            for (auto prop = safe_read<std::uintptr_t>(cls + OffChildProperties); prop && count < max_props; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext), ++count)
+            {
+                if (count > 0)
+                {
+                    out += ",";
+                }
+                out += "{\"name\":\"" + json_escape(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName))) + "\"";
+                out += ",\"offset\":" + std::to_string(prop_offset(prop));
+                out += ",\"element_size\":" + std::to_string(prop_element_size(prop));
+                out += "}";
+            }
+        }
+        out += "]";
+        return out;
+    }
+
+    auto property_name_at_or_before_offset(Reflection& ref, std::uintptr_t object, int offset) -> std::string
+    {
+        std::string best_name{};
+        int best_offset = -1;
+        for (auto cls = ref.class_ptr(object); cls; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+        {
+            for (auto prop = safe_read<std::uintptr_t>(cls + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+            {
+                const auto current_offset = prop_offset(prop);
+                if (current_offset <= offset && current_offset > best_offset)
+                {
+                    best_offset = current_offset;
+                    best_name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+                }
+            }
+        }
+        if (best_name.empty())
+        {
+            return "";
+        }
+        return best_name + "+" + std::to_string(offset - best_offset);
+    }
+
+    auto function_list_json(Reflection& ref, std::uintptr_t object, int max_functions = 96) -> std::string
+    {
+        std::string out = "[";
+        int count = 0;
+        for (auto cls = ref.class_ptr(object); cls && count < max_functions; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+        {
+            for (auto child = safe_read<std::uintptr_t>(cls + OffChildren); child && count < max_functions; child = safe_read<std::uintptr_t>(child + OffUFieldNext))
+            {
+                const auto name = ref.object_name(child);
+                if (name.empty())
+                {
+                    continue;
+                }
+                if (count > 0)
+                {
+                    out += ",";
+                }
+                out += "{\"name\":\"" + json_escape(name) + "\"";
+                out += ",\"params_size\":" + std::to_string(safe_read<int>(child + OffPropertiesSize, 0));
+                out += ",\"schema\":\"" + json_escape(function_param_schema(ref, child)) + "\"}";
+                ++count;
+            }
+        }
+        out += "]";
+        return out;
+    }
+
+    auto array_header_scan_json(std::uintptr_t object, int scan_bytes = 0x1000, int max_entries = 96) -> std::string
+    {
+        std::string out = "[";
+        int count = 0;
+        for (int offset = 0; object && offset + 16 <= scan_bytes && count < max_entries; offset += 8)
+        {
+            const auto data = safe_read<std::uintptr_t>(object + static_cast<std::uintptr_t>(offset), 0);
+            const auto num = safe_read<int>(object + static_cast<std::uintptr_t>(offset + 8), 0);
+            const auto max = safe_read<int>(object + static_cast<std::uintptr_t>(offset + 12), 0);
+            if (!data || num <= 0 || max < num || max > 2000000)
+            {
+                continue;
+            }
+            const auto first = safe_read<std::uintptr_t>(data, 0);
+            if (count > 0)
+            {
+                out += ",";
+            }
+            out += "{\"offset\":" + std::to_string(offset);
+            out += ",\"data\":\"" + early_hex_address(data) + "\"";
+            out += ",\"num\":" + std::to_string(num);
+            out += ",\"max\":" + std::to_string(max);
+            out += ",\"first_qword\":\"" + early_hex_address(first) + "\"}";
+            ++count;
+        }
+        out += "]";
+        return out;
+    }
+
+    auto pointer_scan_json(std::uintptr_t object, int scan_bytes = 0x1000, int max_entries = 128) -> std::string
+    {
+        std::string out = "[";
+        int count = 0;
+        for (int offset = 0; object && offset + 8 <= scan_bytes && count < max_entries; offset += 8)
+        {
+            const auto ptr = safe_read<std::uintptr_t>(object + static_cast<std::uintptr_t>(offset), 0);
+            if (!ptr || address_in_main_module(ptr))
+            {
+                continue;
+            }
+            const auto first = safe_read<std::uintptr_t>(ptr, 0);
+            if (!first)
+            {
+                continue;
+            }
+            if (count > 0)
+            {
+                out += ",";
+            }
+            out += "{\"offset\":" + std::to_string(offset);
+            out += ",\"ptr\":\"" + early_hex_address(ptr) + "\"";
+            out += ",\"first_qword\":\"" + early_hex_address(first) + "\"";
+            out += ",\"live_uobject\":" + std::string(early_json_bool(live_uobject(ptr))) + "}";
+            ++count;
+        }
+        out += "]";
+        return out;
+    }
+
+    auto json_float_or_null(float value) -> std::string
+    {
+        if (!std::isfinite(static_cast<double>(value)))
+        {
+            return "null";
+        }
+        return std::to_string(value);
+    }
+
+    auto bytes_preview_hex(std::uintptr_t data, int byte_count) -> std::string
+    {
+        static constexpr char digits[] = "0123456789abcdef";
+        std::string out{};
+        out.reserve(static_cast<std::size_t>(std::max(0, byte_count) * 2));
+        for (int i = 0; data && i < byte_count; ++i)
+        {
+            const auto value = safe_read<std::uint8_t>(data + static_cast<std::uintptr_t>(i), 0);
+            out.push_back(digits[(value >> 4) & 0x0f]);
+            out.push_back(digits[value & 0x0f]);
+        }
+        return out;
+    }
+
+    auto nonzero_preview_bytes(std::uintptr_t data, int byte_count) -> int
+    {
+        int count = 0;
+        for (int i = 0; data && i < byte_count; ++i)
+        {
+            if (safe_read<std::uint8_t>(data + static_cast<std::uintptr_t>(i), 0) != 0)
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    auto float_preview_json(std::uintptr_t data, int float_count) -> std::string
+    {
+        std::string out = "[";
+        for (int i = 0; data && i < float_count; ++i)
+        {
+            if (i > 0)
+            {
+                out += ",";
+            }
+            out += json_float_or_null(safe_read<float>(data + static_cast<std::uintptr_t>(i * 4), 0.0f));
+        }
+        out += "]";
+        return out;
+    }
+
+    auto u16_preview_json(std::uintptr_t data, int count) -> std::string
+    {
+        std::string out = "[";
+        for (int i = 0; data && i < count; ++i)
+        {
+            if (i > 0)
+            {
+                out += ",";
+            }
+            out += std::to_string(safe_read<std::uint16_t>(data + static_cast<std::uintptr_t>(i * 2), 0));
+        }
+        out += "]";
+        return out;
+    }
+
+    auto u32_preview_json(std::uintptr_t data, int count) -> std::string
+    {
+        std::string out = "[";
+        for (int i = 0; data && i < count; ++i)
+        {
+            if (i > 0)
+            {
+                out += ",";
+            }
+            out += std::to_string(safe_read<std::uint32_t>(data + static_cast<std::uintptr_t>(i * 4), 0));
+        }
+        out += "]";
+        return out;
+    }
+
+    auto array_candidate_kind(int num, int max) -> std::string
+    {
+        if (num >= 8192 && max <= 1000000)
+        {
+            return "large_mesh_buffer_candidate";
+        }
+        if (num >= 256 && max <= 1000000)
+        {
+            return "mesh_buffer_candidate";
+        }
+        return "array";
+    }
+
+    auto array_candidate_score(int num,
+                               int max,
+                               std::uintptr_t first_qword,
+                               std::uint32_t first_dword,
+                               float first_float,
+                               int nonzero_bytes,
+                               bool pointer_table_suspect) -> int
+    {
+        int score = 0;
+        if (num >= 8192)
+        {
+            score += 40;
+        }
+        else if (num >= 2048)
+        {
+            score += 28;
+        }
+        else if (num >= 256)
+        {
+            score += 14;
+        }
+        if (max >= num && max <= num + std::max(64, num / 4))
+        {
+            score += 12;
+        }
+        if (first_qword != 0)
+        {
+            score += 8;
+        }
+        if (first_dword < 1000000)
+        {
+            score += 6;
+        }
+        if (std::isfinite(static_cast<double>(first_float)) && first_float > -100000.0f && first_float < 100000.0f)
+        {
+            score += 6;
+        }
+        if (nonzero_bytes >= 24)
+        {
+            score += 36;
+        }
+        else if (nonzero_bytes >= 8)
+        {
+            score += 18;
+        }
+        else if (nonzero_bytes == 0)
+        {
+            score -= 48;
+        }
+        if (pointer_table_suspect)
+        {
+            score -= 64;
+        }
+        return score;
+    }
+
+    auto pointer_target_array_scan_json(std::uintptr_t object,
+                                        int owner_scan_bytes = 0x1800,
+                                        int target_scan_bytes = 0x800,
+                                        int max_targets = 96,
+                                        int max_arrays_per_target = 32) -> std::string
+    {
+        std::string out = "[";
+        int target_count = 0;
+        for (int owner_offset = 0; object && owner_offset + 8 <= owner_scan_bytes && target_count < max_targets; owner_offset += 8)
+        {
+            const auto target = safe_read<std::uintptr_t>(object + static_cast<std::uintptr_t>(owner_offset), 0);
+            if (!target || address_in_main_module(target))
+            {
+                continue;
+            }
+            std::string arrays = "[";
+            int array_count = 0;
+            for (int target_offset = 0; target_offset + 16 <= target_scan_bytes && array_count < max_arrays_per_target; target_offset += 8)
+            {
+                const auto data = safe_read<std::uintptr_t>(target + static_cast<std::uintptr_t>(target_offset), 0);
+                const auto num = safe_read<int>(target + static_cast<std::uintptr_t>(target_offset + 8), 0);
+                const auto max = safe_read<int>(target + static_cast<std::uintptr_t>(target_offset + 12), 0);
+                if (!data || num <= 0 || max < num || max > 4000000)
+                {
+                    continue;
+                }
+                if (array_count > 0)
+                {
+                    arrays += ",";
+                }
+                const auto first_qword = safe_read<std::uintptr_t>(data, 0);
+                const auto first_dword = safe_read<std::uint32_t>(data, 0);
+                const auto first_float = safe_read<float>(data, 0.0f);
+                const auto nonzero_bytes = nonzero_preview_bytes(data, 64);
+                const auto candidate_kind = array_candidate_kind(num, max);
+                arrays += "{\"offset\":" + std::to_string(target_offset);
+                arrays += ",\"data\":\"" + early_hex_address(data) + "\"";
+                arrays += ",\"num\":" + std::to_string(num);
+                arrays += ",\"max\":" + std::to_string(max);
+                arrays += ",\"first_qword\":\"" + early_hex_address(first_qword) + "\"";
+                arrays += ",\"first_dword\":" + std::to_string(first_dword);
+                arrays += ",\"first_float\":" + json_float_or_null(first_float);
+                arrays += ",\"preview_nonzero_bytes\":" + std::to_string(nonzero_bytes);
+                arrays += ",\"candidate_kind\":\"" + candidate_kind + "\"";
+                arrays += "}";
+                ++array_count;
+            }
+            arrays += "]";
+            if (array_count <= 0)
+            {
+                continue;
+            }
+            if (target_count > 0)
+            {
+                out += ",";
+            }
+            out += "{\"owner_offset\":" + std::to_string(owner_offset);
+            out += ",\"target\":\"" + early_hex_address(target) + "\"";
+            out += ",\"target_first_qword\":\"" + early_hex_address(safe_read<std::uintptr_t>(target, 0)) + "\"";
+            out += ",\"target_live_uobject\":" + std::string(early_json_bool(live_uobject(target)));
+            out += ",\"arrays\":" + arrays + "}";
+            ++target_count;
+        }
+        out += "]";
+        return out;
+    }
+
+    auto mesh_buffer_candidates_json(Reflection& ref,
+                                     std::uintptr_t object,
+                                     int owner_scan_bytes = 0x1800,
+                                     int target_scan_bytes = 0x900,
+                                     int max_candidates = 80) -> std::string
+    {
+        struct Candidate
+        {
+            int score{0};
+            int owner_offset{0};
+            int target_offset{0};
+            std::uintptr_t target{0};
+            bool target_live_uobject{false};
+            bool pointer_table_suspect{false};
+            std::uintptr_t data{0};
+            int num{0};
+            int max{0};
+            std::uintptr_t first_qword{0};
+            std::uint32_t first_dword{0};
+            float first_float{0.0f};
+            int nonzero_bytes{0};
+            std::string kind{};
+        };
+        std::vector<Candidate> candidates{};
+        for (int owner_offset = 0; object && owner_offset + 8 <= owner_scan_bytes; owner_offset += 8)
+        {
+            const auto target = safe_read<std::uintptr_t>(object + static_cast<std::uintptr_t>(owner_offset), 0);
+            if (!target || address_in_main_module(target))
+            {
+                continue;
+            }
+            for (int target_offset = 0; target_offset + 16 <= target_scan_bytes; target_offset += 8)
+            {
+                const auto data = safe_read<std::uintptr_t>(target + static_cast<std::uintptr_t>(target_offset), 0);
+                const auto num = safe_read<int>(target + static_cast<std::uintptr_t>(target_offset + 8), 0);
+                const auto max = safe_read<int>(target + static_cast<std::uintptr_t>(target_offset + 12), 0);
+                if (!data || num <= 0 || max < num || max > 4000000)
+                {
+                    continue;
+                }
+                const auto kind = array_candidate_kind(num, max);
+                if (kind == "array")
+                {
+                    continue;
+                }
+                const auto first_qword = safe_read<std::uintptr_t>(data, 0);
+                const auto first_dword = safe_read<std::uint32_t>(data, 0);
+                const auto first_float = safe_read<float>(data, 0.0f);
+                const auto nonzero_bytes = nonzero_preview_bytes(data, 64);
+                const bool pointer_table_suspect = address_in_main_module(first_qword) || live_uobject(first_qword);
+                if (nonzero_bytes == 0)
+                {
+                    continue;
+                }
+                candidates.push_back(Candidate{
+                    array_candidate_score(num, max, first_qword, first_dword, first_float, nonzero_bytes, pointer_table_suspect),
+                    owner_offset,
+                    target_offset,
+                    target,
+                    live_uobject(target),
+                    pointer_table_suspect,
+                    data,
+                    num,
+                    max,
+                    first_qword,
+                    first_dword,
+                    first_float,
+                    nonzero_bytes,
+                    kind});
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.score != b.score)
+            {
+                return a.score > b.score;
+            }
+            return a.num > b.num;
+        });
+        std::string out = "[";
+        const auto count = std::min<int>(static_cast<int>(candidates.size()), max_candidates);
+        for (int i = 0; i < count; ++i)
+        {
+            const auto& c = candidates[static_cast<std::size_t>(i)];
+            if (i > 0)
+            {
+                out += ",";
+            }
+            out += "{\"rank\":" + std::to_string(i + 1);
+            out += ",\"score\":" + std::to_string(c.score);
+            out += ",\"kind\":\"" + c.kind + "\"";
+            out += ",\"owner_offset\":" + std::to_string(c.owner_offset);
+            out += ",\"owner_property\":\"" + json_escape(property_name_at_or_before_offset(ref, object, c.owner_offset)) + "\"";
+            out += ",\"target\":\"" + early_hex_address(c.target) + "\"";
+            out += ",\"target_name\":\"" + json_escape(c.target_live_uobject ? ref.object_name(c.target) : std::string{}) + "\"";
+            out += ",\"target_class\":\"" + json_escape(c.target_live_uobject ? ref.class_name(c.target) : std::string{}) + "\"";
+            out += ",\"target_live_uobject\":" + std::string(early_json_bool(c.target_live_uobject));
+            out += ",\"target_offset\":" + std::to_string(c.target_offset);
+            out += ",\"data\":\"" + early_hex_address(c.data) + "\"";
+            out += ",\"num\":" + std::to_string(c.num);
+            out += ",\"max\":" + std::to_string(c.max);
+            out += ",\"first_qword\":\"" + early_hex_address(c.first_qword) + "\"";
+            out += ",\"first_dword\":" + std::to_string(c.first_dword);
+            out += ",\"first_float\":" + json_float_or_null(c.first_float);
+            out += ",\"preview_nonzero_bytes\":" + std::to_string(c.nonzero_bytes);
+            out += ",\"pointer_table_suspect\":" + std::string(early_json_bool(c.pointer_table_suspect));
+            out += ",\"first_bytes_hex\":\"" + bytes_preview_hex(c.data, 64) + "\"";
+            out += ",\"first_floats\":" + float_preview_json(c.data, 8);
+            out += ",\"first_u16\":" + u16_preview_json(c.data, 16);
+            out += ",\"first_u32\":" + u32_preview_json(c.data, 12);
+            out += "}";
+        }
+        out += "]";
+        return out;
+    }
+
+    auto find_object_property(Reflection& ref, std::uintptr_t object, const char* property_name) -> std::uintptr_t
+    {
+        auto cls = ref.class_ptr(object);
+        for (int depth = 0; cls && depth < 32; ++depth)
+        {
+            const auto prop = ref.find_property(cls, property_name);
+            if (prop)
+            {
+                return prop;
+            }
+            cls = safe_read<std::uintptr_t>(cls + OffSuperStruct);
+        }
+        return 0;
+    }
+
+    auto write_number(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, double value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        auto* dest = container + offset;
+        const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+        const auto size = prop_element_size(prop);
+        const bool integral = contains_text(name, "channel") || contains_text(name, "mode") || contains_text(name, "level") ||
+                              contains_text(name, "resolution") || contains_text(name, "triangles") || contains_text(name, "pixels");
+        if (integral)
+        {
+            if (size <= 1)
+            {
+                *dest = static_cast<std::uint8_t>(value);
+            }
+            else
+            {
+                *reinterpret_cast<std::int32_t*>(dest) = static_cast<std::int32_t>(value);
+            }
+            return true;
+        }
+        if (size == 8)
+        {
+            *reinterpret_cast<double*>(dest) = value;
+            return true;
+        }
+        if (size >= 4)
+        {
+            *reinterpret_cast<float*>(dest) = static_cast<float>(value);
+            return true;
+        }
+        if (size == 1)
+        {
+            *dest = static_cast<std::uint8_t>(value);
+            return true;
+        }
+        return false;
+    }
+
+    auto write_bool(std::uintptr_t prop, std::uint8_t* container, bool value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        *(container + offset) = value ? 1 : 0;
+        return true;
+    }
+
+    auto process_event(std::uintptr_t object, std::uintptr_t function, std::uint8_t* params, std::string& failure) -> bool
+    {
+        auto target = g_original_process_event.load();
+        if (!target)
+        {
+            const auto vtable = safe_read<std::uintptr_t>(object);
+            if (!vtable)
+            {
+                failure = "vtable_unavailable";
+                return false;
+            }
+            target = safe_read<std::uintptr_t>(vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t));
+            if (!target)
+            {
+                failure = "process_event_unavailable";
+                return false;
+            }
+        }
+        const bool via_hook = g_pe_inline_hook.installed || g_original_process_event.load() != 0;
+        if (!via_hook && !address_in_main_module(target))
+        {
+            failure = "process_event_target_outside_main_module";
+            return false;
+        }
+        __try
+        {
+            reinterpret_cast<ProcessEventFn>(target)(reinterpret_cast<void*>(object), reinterpret_cast<void*>(function), params);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            failure = "process_event_exception";
+            return false;
+        }
+    }
+
+    auto read_return_bool(Reflection& ref, std::uintptr_t function, std::uint8_t* params) -> bool
+    {
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            if (name == "ReturnValue")
+            {
+                const auto offset = prop_offset(prop);
+                return offset < 0 ? true : (*(params + offset) != 0);
+            }
+        }
+        return true;
+    }
+
+    auto read_return_object(Reflection& ref, std::uintptr_t function, std::uint8_t* params) -> std::uintptr_t
+    {
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            if (name == "ReturnValue")
+            {
+                const auto offset = prop_offset(prop);
+                return offset < 0 ? 0 : safe_read<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(params + offset));
+            }
+        }
+        return 0;
+    }
+
+    auto call_no_params_return_object(Reflection& ref, std::uintptr_t object, const char* function_name) -> std::uintptr_t
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return 0;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size < 0 || params_size > 1024)
+        {
+            return 0;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(1, params_size)), 0);
+        std::string failure{};
+        if (!process_event(object, function, params.data(), failure))
+        {
+            return 0;
+        }
+        return read_return_object(ref, function, params.data());
+    }
+
+    auto call_no_params_return_bool(Reflection& ref, std::uintptr_t object, const char* function_name) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size < 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(1, params_size)), 0);
+        std::string failure{};
+        if (!process_event(object, function, params.data(), failure))
+        {
+            return false;
+        }
+        return read_return_bool(ref, function, params.data());
+    }
+
+    auto read_object_property_by_names(Reflection& ref, std::uintptr_t object, std::initializer_list<const char*> names) -> std::uintptr_t
+    {
+        if (!live_uobject(object))
+        {
+            return 0;
+        }
+        for (const auto* name : names)
+        {
+            if (!name)
+            {
+                continue;
+            }
+            const auto prop = find_object_property(ref, object, name);
+            const auto offset = prop ? prop_offset(prop) : -1;
+            if (offset < 0)
+            {
+                continue;
+            }
+            const auto value = safe_read<std::uintptr_t>(object + offset);
+            if (live_uobject(value))
+            {
+                return value;
+            }
+        }
+        return 0;
+    }
+
+    struct ComponentSelection
+    {
+        std::uintptr_t component{0};
+        std::uintptr_t owner{0};
+        std::uintptr_t target{0};
+        std::string target_source{};
+        std::uintptr_t target_mesh{0};
+        std::string mesh_source{};
+        std::string source{};
+        std::uintptr_t pawn{0};
+    };
+
+    auto find_component(Reflection& ref, std::string& failure) -> ComponentSelection
+    {
+        ComponentSelection selected{};
+        const auto root_component_offset = ref.resolve_property_offset("Actor", "RootComponent");
+        const auto attach_children_offset = ref.resolve_property_offset("SceneComponent", "AttachChildren");
+        const auto owned_components_offset = ref.resolve_property_offset("Actor", "OwnedComponents");
+        int owner_offset = ref.resolve_property_offset("ActorComponent", "OwnerPrivate");
+        if (owner_offset < 0)
+        {
+            owner_offset = ref.resolve_property_offset("ActorComponent", "Owner");
+        }
+
+        const auto engine = ref.find_first_instance("GameEngine");
+        const auto viewport_offset = ref.resolve_property_offset("Engine", "GameViewport");
+        const auto world_offset = ref.resolve_property_offset("GameViewportClient", "World");
+        const auto game_instance_offset = ref.resolve_property_offset("World", "OwningGameInstance");
+        const auto local_players_offset = ref.resolve_property_offset("GameInstance", "LocalPlayers");
+        int controller_offset = ref.resolve_property_offset("Player", "PlayerController");
+        if (controller_offset < 0)
+        {
+            controller_offset = ref.resolve_property_offset("LocalPlayer", "PlayerController");
+        }
+        int pawn_offset = ref.resolve_property_offset("PlayerController", "AcknowledgedPawn");
+        if (pawn_offset < 0)
+        {
+            pawn_offset = ref.resolve_property_offset("Controller", "Pawn");
+        }
+        const auto viewport = viewport_offset >= 0 ? safe_read<std::uintptr_t>(engine + viewport_offset) : 0;
+        const auto world = world_offset >= 0 ? safe_read<std::uintptr_t>(viewport + world_offset) : 0;
+        const auto game_instance = game_instance_offset >= 0 ? safe_read<std::uintptr_t>(world + game_instance_offset) : 0;
+        const auto local_players_data = local_players_offset >= 0 ? safe_read<std::uintptr_t>(game_instance + local_players_offset) : 0;
+        const auto local_players_count = local_players_offset >= 0 ? safe_read<int>(game_instance + local_players_offset + 8) : 0;
+        const auto local_player = local_players_data && local_players_count > 0 ? safe_read<std::uintptr_t>(local_players_data) : 0;
+        auto controller = controller_offset >= 0 ? safe_read<std::uintptr_t>(local_player + controller_offset) : 0;
+        auto pawn = pawn_offset >= 0 ? safe_read<std::uintptr_t>(controller + pawn_offset) : 0;
+        auto read_controller_pawn = [&](std::uintptr_t candidate_controller) -> std::uintptr_t {
+            if (!live_uobject(candidate_controller))
+            {
+                return 0;
+            }
+            if (pawn_offset >= 0)
+            {
+                if (const auto candidate_pawn = safe_read<std::uintptr_t>(candidate_controller + pawn_offset); live_uobject(candidate_pawn))
+                {
+                    return candidate_pawn;
+                }
+            }
+            const auto candidate_pawn = call_no_params_return_object(ref, candidate_controller, "GetPawn");
+            return live_uobject(candidate_pawn) ? candidate_pawn : 0;
+        };
+        if (!live_uobject(pawn))
+        {
+            pawn = read_controller_pawn(controller);
+        }
+        if (!live_uobject(pawn))
+        {
+            ref.for_each_object([&](std::uintptr_t obj) {
+                if (!live_uobject(obj))
+                {
+                    return false;
+                }
+                const auto cls = lower_copy(ref.class_name(obj));
+                if (!contains_text(cls, "playercontroller"))
+                {
+                    return false;
+                }
+                if (const auto candidate_pawn = read_controller_pawn(obj))
+                {
+                    controller = obj;
+                    pawn = candidate_pawn;
+                    return true;
+                }
+                return false;
+            });
+        }
+        selected.pawn = pawn;
+        const auto controller_view_target = live_uobject(controller) ? call_no_params_return_object(ref, controller, "GetViewTarget") : 0;
+        const auto camera = live_uobject(controller) ? call_no_params_return_object(ref, controller, "GetPlayerCameraManager") : 0;
+        const auto camera_view_target = live_uobject(camera) ? call_no_params_return_object(ref, camera, "GetViewTarget") : 0;
+        std::vector<std::pair<std::uintptr_t, const char*>> targets{};
+        auto add_target = [&](std::uintptr_t object, const char* source) {
+            if (!live_uobject(object))
+            {
+                return;
+            }
+            for (const auto& existing : targets)
+            {
+                if (existing.first == object)
+                {
+                    return;
+                }
+            }
+            targets.push_back({object, source});
+        };
+        add_target(controller_view_target, "controller_view_target");
+        add_target(camera_view_target, "camera_view_target");
+        add_target(pawn, "controller_pawn");
+
+        auto read_owner = [&](std::uintptr_t obj) -> std::uintptr_t {
+            if (owner_offset >= 0)
+            {
+                if (const auto owner = safe_read<std::uintptr_t>(obj + owner_offset))
+                {
+                    return owner;
+                }
+            }
+            return call_no_params_return_object(ref, obj, "GetOwner");
+        };
+
+        auto live_object = [&](std::uintptr_t obj) -> bool {
+            return live_uobject(obj);
+        };
+
+        auto owner_matches_target = [&](std::uintptr_t owner) -> bool {
+            for (const auto& target : targets)
+            {
+                if (owner && owner == target.first)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto target_source_for_owner = [&](std::uintptr_t owner) -> const char* {
+            for (const auto& target : targets)
+            {
+                if (owner && owner == target.first)
+                {
+                    return target.second;
+                }
+            }
+            return "";
+        };
+
+        auto outer_matches_target = [&](std::uintptr_t object, std::uintptr_t& matched_target, const char*& matched_source) -> bool {
+            for (int depth = 0; live_uobject(object) && depth < 8; ++depth)
+            {
+                const auto outer = safe_read<std::uintptr_t>(object + OffOuter);
+                if (!live_uobject(outer))
+                {
+                    return false;
+                }
+                if (owner_matches_target(outer))
+                {
+                    matched_target = outer;
+                    matched_source = target_source_for_owner(outer);
+                    return true;
+                }
+                object = outer;
+            }
+            return false;
+        };
+
+        std::vector<std::pair<std::uintptr_t, const char*>> target_meshes{};
+        auto add_target_mesh = [&](std::uintptr_t mesh, const char* source) {
+            if (!live_uobject(mesh))
+            {
+                return;
+            }
+            const auto cls = lower_copy(ref.class_name(mesh));
+            if (!contains_text(cls, "mesh"))
+            {
+                return;
+            }
+            for (const auto& existing : target_meshes)
+            {
+                if (existing.first == mesh)
+                {
+                    return;
+                }
+            }
+            target_meshes.push_back({mesh, source});
+        };
+
+        auto collect_meshes_from_actor = [&](std::uintptr_t actor, const char* source) {
+            add_target_mesh(read_object_property_by_names(ref,
+                                                          actor,
+                                                          {"Mesh", "MeshComponent", "SkeletalMeshComponent", "TargetMeshComponent", "TargetMesh"}),
+                            source);
+            if (root_component_offset >= 0 && attach_children_offset >= 0)
+            {
+                const auto root = safe_read<std::uintptr_t>(actor + root_component_offset);
+                const auto data = safe_read<std::uintptr_t>(root + attach_children_offset);
+                const auto count = safe_read<int>(root + attach_children_offset + 8);
+                if (data && count > 0 && count <= 512)
+                {
+                    for (int i = 0; i < count; ++i)
+                    {
+                        add_target_mesh(safe_read<std::uintptr_t>(data + static_cast<std::uintptr_t>(i) * 8), source);
+                    }
+                }
+            }
+            if (owned_components_offset >= 0)
+            {
+                const auto data = safe_read<std::uintptr_t>(actor + owned_components_offset);
+                const auto count = safe_read<int>(actor + owned_components_offset + 8);
+                if (data && count > 0 && count <= 512)
+                {
+                    for (int i = 0; i < count; ++i)
+                    {
+                        add_target_mesh(safe_read<std::uintptr_t>(data + static_cast<std::uintptr_t>(i) * 8), source);
+                    }
+                }
+            }
+        };
+
+        for (const auto& target : targets)
+        {
+            collect_meshes_from_actor(target.first, target.second);
+        }
+
+        ref.for_each_object([&](std::uintptr_t obj) {
+            if (!live_uobject(obj))
+            {
+                return false;
+            }
+            const auto cls = lower_copy(ref.class_name(obj));
+            if (!contains_text(cls, "meshcomponent"))
+            {
+                return false;
+            }
+            const auto owner = read_owner(obj);
+            if (owner_matches_target(owner))
+            {
+                add_target_mesh(obj, target_source_for_owner(owner));
+            }
+            return false;
+        });
+
+        auto mesh_match_source = [&](std::uintptr_t mesh) -> const char* {
+            for (const auto& target_mesh : target_meshes)
+            {
+                if (mesh && mesh == target_mesh.first)
+                {
+                    return target_mesh.second;
+                }
+            }
+            return "";
+        };
+
+        auto property_reference_matches = [&](std::uintptr_t object,
+                                              std::uintptr_t& matched_target,
+                                              const char*& matched_target_source,
+                                              std::uintptr_t& matched_mesh,
+                                              const char*& matched_mesh_source) -> bool {
+            auto cls = ref.class_ptr(object);
+            for (int depth = 0; cls && depth < 32; ++depth)
+            {
+                for (auto prop = safe_read<std::uintptr_t>(cls + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+                {
+                    const auto offset = prop_offset(prop);
+                    if (offset < 0 || offset > 0x10000)
+                    {
+                        continue;
+                    }
+                    const auto value = safe_read<std::uintptr_t>(object + offset);
+                    if (!live_uobject(value))
+                    {
+                        continue;
+                    }
+                    if (owner_matches_target(value))
+                    {
+                        matched_target = value;
+                        matched_target_source = target_source_for_owner(value);
+                        return true;
+                    }
+                    const auto* source = mesh_match_source(value);
+                    if (source && source[0] != '\0')
+                    {
+                        matched_mesh = value;
+                        matched_mesh_source = source;
+                        return true;
+                    }
+                }
+                cls = safe_read<std::uintptr_t>(cls + OffSuperStruct);
+            }
+            return false;
+        };
+
+        auto component_matches_target_mesh = [&](std::uintptr_t obj, std::uintptr_t& matched_mesh, const char*& matched_source) -> bool {
+            const auto mesh = read_object_property_by_names(ref,
+                                                            obj,
+                                                            {"TargetMeshComponent",
+                                                             "TargetMesh",
+                                                             "MeshComponent",
+                                                             "SkeletalMeshComponent",
+                                                             "Mesh",
+                                                             "OwnerMesh"});
+            const auto* source = mesh_match_source(mesh);
+            if (mesh && source && source[0] != '\0')
+            {
+                matched_mesh = mesh;
+                matched_source = source;
+                return true;
+            }
+            return false;
+        };
+
+        int candidate_count = 0;
+        int owner_match_count = 0;
+        int outer_match_count = 0;
+        int ref_match_count = 0;
+        int mesh_match_count = 0;
+        int any_owner_candidate_count = 0;
+        auto check_component = [&](std::uintptr_t obj, const char* source, bool require_owner) -> bool {
+            if (!live_object(obj))
+            {
+                return false;
+            }
+            const auto cls = lower_copy(ref.class_name(obj));
+            const bool paint_component = contains_text(cls, "runtimepaint") || contains_text(cls, "paint");
+            const bool server_ready = ref.find_function(obj, "ServerPaintBatch") != 0;
+            const bool front_sampler_ready = ref.find_function(obj, "HitTestAtScreenPosition") != 0;
+            if (paint_component && server_ready && front_sampler_ready)
+            {
+                ++candidate_count;
+                const auto owner = read_owner(obj);
+                const bool owner_match = owner_matches_target(owner);
+                std::uintptr_t matched_outer_target = 0;
+                const char* matched_outer_source = "";
+                const bool outer_match = outer_matches_target(obj, matched_outer_target, matched_outer_source);
+                std::uintptr_t matched_ref_target = 0;
+                const char* matched_ref_target_source = "";
+                std::uintptr_t matched_mesh = 0;
+                const char* matched_mesh_source = "";
+                bool mesh_match = component_matches_target_mesh(obj, matched_mesh, matched_mesh_source);
+                const bool ref_match = property_reference_matches(obj, matched_ref_target, matched_ref_target_source, matched_mesh, matched_mesh_source);
+                mesh_match = mesh_match || (matched_mesh != 0);
+                if (owner_match)
+                {
+                    ++owner_match_count;
+                }
+                if (outer_match)
+                {
+                    ++outer_match_count;
+                }
+                if (ref_match)
+                {
+                    ++ref_match_count;
+                }
+                if (mesh_match)
+                {
+                    ++mesh_match_count;
+                }
+                if (require_owner && !owner_match && !outer_match && !ref_match && !mesh_match)
+                {
+                    return false;
+                }
+                selected.component = obj;
+                selected.owner = owner;
+                selected.target = owner_match ? owner : (outer_match ? matched_outer_target : matched_ref_target);
+                selected.target_source = owner_match ? target_source_for_owner(owner) : (outer_match ? matched_outer_source : matched_ref_target_source);
+                selected.target_mesh = matched_mesh;
+                selected.mesh_source = matched_mesh ? matched_mesh_source : "";
+                selected.source = source ? source : "unknown";
+                return true;
+            }
+            return false;
+        };
+
+        for (const auto& target : targets)
+        {
+            if (root_component_offset >= 0 && attach_children_offset >= 0)
+            {
+                const auto root = safe_read<std::uintptr_t>(target.first + root_component_offset);
+                const auto data = safe_read<std::uintptr_t>(root + attach_children_offset);
+                const auto count = safe_read<int>(root + attach_children_offset + 8);
+                if (data && count > 0 && count <= 512)
+                {
+                    for (int i = 0; i < count; ++i)
+                    {
+                        if (check_component(safe_read<std::uintptr_t>(data + static_cast<std::uintptr_t>(i) * 8), "root_attach_children", false))
+                        {
+                            selected.target = target.first;
+                            selected.target_source = target.second;
+                            return selected;
+                        }
+                    }
+                }
+            }
+            if (owned_components_offset >= 0)
+            {
+                const auto data = safe_read<std::uintptr_t>(target.first + owned_components_offset);
+                const auto count = safe_read<int>(target.first + owned_components_offset + 8);
+                if (data && count > 0 && count <= 512)
+                {
+                    for (int i = 0; i < count; ++i)
+                    {
+                        if (check_component(safe_read<std::uintptr_t>(data + static_cast<std::uintptr_t>(i) * 8), "owned_components", false))
+                        {
+                            selected.target = target.first;
+                            selected.target_source = target.second;
+                            return selected;
+                        }
+                    }
+                }
+            }
+        }
+
+        struct OwnedComponentCandidate
+        {
+            std::uintptr_t component{0};
+            std::uintptr_t owner{0};
+            std::uintptr_t mesh{0};
+            std::string mesh_source{};
+            int score{-1000000};
+        };
+        OwnedComponentCandidate best_owned{};
+        ref.for_each_object([&](std::uintptr_t obj) {
+            if (!live_object(obj))
+            {
+                return false;
+            }
+            const auto cls = lower_copy(ref.class_name(obj));
+            if (!(contains_text(cls, "runtimepaint") || contains_text(cls, "paint")) ||
+                !ref.find_function(obj, "ServerPaintBatch") ||
+                !ref.find_function(obj, "HitTestAtScreenPosition"))
+            {
+                return false;
+            }
+            const auto owner = read_owner(obj);
+            if (!live_uobject(owner))
+            {
+                return false;
+            }
+            ++any_owner_candidate_count;
+            const auto owner_cls = lower_copy(ref.class_name(owner));
+            int score = 10;
+            if (owner_matches_target(owner))
+            {
+                score += 1000;
+            }
+            if (call_no_params_return_bool(ref, owner, "IsPlayerControlled"))
+            {
+                score += 250;
+            }
+            if (contains_text(owner_cls, "character"))
+            {
+                score += 80;
+            }
+            if (contains_text(owner_cls, "pawn"))
+            {
+                score += 60;
+            }
+            if (call_no_params_return_object(ref, owner, "GetController"))
+            {
+                score += 25;
+            }
+            std::uintptr_t matched_mesh = 0;
+            const char* matched_mesh_source = "";
+            if (component_matches_target_mesh(obj, matched_mesh, matched_mesh_source))
+            {
+                score += 40;
+            }
+            if (score > best_owned.score)
+            {
+                best_owned.component = obj;
+                best_owned.owner = owner;
+                best_owned.mesh = matched_mesh;
+                best_owned.mesh_source = matched_mesh_source ? matched_mesh_source : "";
+                best_owned.score = score;
+            }
+            return false;
+        });
+        if (best_owned.component && best_owned.score >= 10)
+        {
+            selected.component = best_owned.component;
+            selected.owner = best_owned.owner;
+            selected.target = best_owned.owner;
+            selected.target_source = owner_matches_target(best_owned.owner) ? target_source_for_owner(best_owned.owner) : "owned_runtimepaint_owner_scan";
+            selected.target_mesh = best_owned.mesh;
+            selected.mesh_source = best_owned.mesh_source;
+            selected.source = "owned_runtimepaint_owner_scan";
+            selected.pawn = best_owned.owner;
+            return selected;
+        }
+
+        ref.for_each_object([&](std::uintptr_t obj) {
+            return check_component(obj, "owned_runtimepaint_scan", true);
+        });
+        if (selected.component)
+        {
+            return selected;
+        }
+        if (!selected.component)
+        {
+            failure = "runtime_paint_component_unavailable pawn=" + hex_address(pawn) +
+                      " view_target=" + hex_address(controller_view_target) +
+                      " camera_view_target=" + hex_address(camera_view_target) +
+                      " meshes=" + std::to_string(target_meshes.size()) +
+                      " candidates=" + std::to_string(candidate_count) +
+                      " any_owner_candidates=" + std::to_string(any_owner_candidate_count) +
+                      " owner_matches=" + std::to_string(owner_match_count) +
+                      " outer_matches=" + std::to_string(outer_match_count) +
+                      " ref_matches=" + std::to_string(ref_match_count) +
+                      " mesh_matches=" + std::to_string(mesh_match_count);
+        }
+        return selected;
+    }
+
+    auto install_process_event_hook(std::string& failure) -> bool
+    {
+        if (g_process_event_hook_installed.load())
+        {
+            return true;
+        }
+        DWORD thread_id = 0;
+        const DWORD process_id = GetCurrentProcessId();
+        EnumWindows(
+            [](HWND hwnd, LPARAM lparam) -> BOOL {
+                DWORD owner_pid = 0;
+                const DWORD tid = GetWindowThreadProcessId(hwnd, &owner_pid);
+                if (owner_pid == GetCurrentProcessId() && tid != 0 && IsWindowVisible(hwnd))
+                {
+                    *reinterpret_cast<DWORD*>(lparam) = tid;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&thread_id));
+        if (thread_id == 0)
+        {
+            failure = "game_window_thread_unavailable pid=" + std::to_string(process_id);
+            return false;
+        }
+        const auto hook = SetWindowsHookExW(WH_GETMESSAGE, message_hook_proc, nullptr, thread_id);
+        if (!hook)
+        {
+            failure = "message_hook_install_failed win32=" + std::to_string(GetLastError()) + " thread=" + std::to_string(thread_id);
+            return false;
+        }
+        g_message_hook.store(hook);
+        g_game_thread_id.store(thread_id);
+        g_process_event_hook_installed.store(true);
+        PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+        return true;
+    }
+
+    auto uninstall_process_event_hook() -> void
+    {
+        const auto message_hook = g_message_hook.exchange(nullptr);
+        if (message_hook)
+        {
+            UnhookWindowsHookEx(message_hook);
+        }
+        g_game_thread_id.store(0);
+        const auto hook = reinterpret_cast<std::uintptr_t>(&hooked_process_event);
+        std::lock_guard<std::mutex> hook_lock(g_hook_mutex);
+        for (const auto& entry : g_process_event_hook_slots)
+        {
+            const auto slot_address = entry.first;
+            const auto original = entry.second;
+            auto* slot = reinterpret_cast<std::uintptr_t*>(slot_address);
+            DWORD old_protect = 0;
+            if (VirtualProtect(slot, sizeof(std::uintptr_t), PAGE_EXECUTE_READWRITE, &old_protect))
+            {
+                if (safe_read<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(slot)) == hook)
+                {
+                    *slot = original;
+                    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(std::uintptr_t));
+                }
+                DWORD ignored = 0;
+                VirtualProtect(slot, sizeof(std::uintptr_t), old_protect, &ignored);
+            }
+        }
+        g_process_event_hook_slots.clear();
+        if (!g_pe_inline_hook.installed)
+        {
+            g_original_process_event.store(0);
+        }
+        g_process_event_hook_installed.store(false);
+    }
+
+    auto resolve_process_event_address(const std::uintptr_t sample_object) -> std::uintptr_t
+    {
+        if (!live_uobject(sample_object))
+        {
+            return 0;
+        }
+        const auto vtable = safe_read<std::uintptr_t>(sample_object);
+        if (!vtable)
+        {
+            return 0;
+        }
+        const auto target = safe_read<std::uintptr_t>(
+            vtable + static_cast<std::uintptr_t>(ProcessEventVtableIndex) * sizeof(std::uintptr_t));
+        return address_in_main_module(target) ? target : 0;
+    }
+
+    auto is_executable_code(std::uintptr_t address) -> bool
+    {
+        if (!address)
+        {
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info))
+        {
+            return false;
+        }
+        if (info.State != MEM_COMMIT)
+        {
+            return false;
+        }
+        const DWORD protect = info.Protect & 0xFF;
+        return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE ||
+               protect == PAGE_EXECUTE_WRITECOPY;
+    }
+
+    auto resolve_absolute_jmp_target(const std::uintptr_t address) -> std::uintptr_t
+    {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+        if (bytes[0] == 0xFF && bytes[1] == 0x25)
+        {
+            const auto* slot = reinterpret_cast<const std::uintptr_t*>(address + 6);
+            return safe_read<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(slot));
+        }
+        if (bytes[0] == 0xE9)
+        {
+            const auto rel = safe_read<std::int32_t>(address + 1);
+            return address + 5 + static_cast<std::uintptr_t>(rel);
+        }
+        if (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0)
+        {
+            return safe_read<std::uintptr_t>(address + 2);
+        }
+        return 0;
+    }
+
+    auto process_event_entry_is_hooked(const std::uintptr_t address) -> bool
+    {
+        if (!address)
+        {
+            return false;
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+        return (bytes[0] == 0xFF && bytes[1] == 0x25) || bytes[0] == 0xE9 ||
+               (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0);
+    }
+
+    auto game_thread_work_pending() -> bool
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            for (const auto& job : g_paint_jobs)
+            {
+                if (job && !job->done)
+                {
+                    return true;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_game_cmd_mutex);
+            for (const auto& job : g_game_cmds)
+            {
+                if (job && !job->done)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    auto write_absolute_jmp64(void* from, void* to) -> bool
+    {
+        if (!from || !to)
+        {
+            return false;
+        }
+        std::uint8_t patch[ProcessEventInlinePatchSize]{};
+        patch[0] = 0xFF;
+        patch[1] = 0x25;
+        patch[2] = 0x00;
+        patch[3] = 0x00;
+        patch[4] = 0x00;
+        patch[5] = 0x00;
+        std::memcpy(patch + 6, &to, sizeof(to));
+        DWORD old_protect = 0;
+        if (!VirtualProtect(from, ProcessEventInlinePatchSize, PAGE_EXECUTE_READWRITE, &old_protect))
+        {
+            return false;
+        }
+        std::memcpy(from, patch, ProcessEventInlinePatchSize);
+        FlushInstructionCache(GetCurrentProcess(), from, ProcessEventInlinePatchSize);
+        DWORD ignored = 0;
+        VirtualProtect(from, ProcessEventInlinePatchSize, old_protect, &ignored);
+        return true;
+    }
+
+    auto install_process_event_inline_hook(const std::uintptr_t sample_object, std::string& failure) -> bool
+    {
+        std::lock_guard<std::mutex> lock(g_inline_hook_mutex);
+        if (g_pe_inline_hook.installed)
+        {
+            return true;
+        }
+        const auto target = resolve_process_event_address(sample_object);
+        if (!target)
+        {
+            failure = "process_event_address_unavailable";
+            return false;
+        }
+
+        const auto chained_handler = process_event_entry_is_hooked(target)
+                                         ? resolve_absolute_jmp_target(target)
+                                         : 0;
+        if (process_event_entry_is_hooked(target))
+        {
+            if (!chained_handler || !is_executable_code(chained_handler))
+            {
+                failure = "process_event_already_hooked_unsupported";
+                return false;
+            }
+        }
+        if (chained_handler)
+        {
+            if (!safe_copy(g_pe_inline_hook.original, reinterpret_cast<const void*>(target), ProcessEventInlinePatchSize))
+            {
+                failure = "process_event_existing_hook_bytes_unreadable";
+                return false;
+            }
+            if (!write_absolute_jmp64(reinterpret_cast<void*>(target), reinterpret_cast<void*>(&hooked_process_event)))
+            {
+                failure = "process_event_chain_hook_patch_failed";
+                return false;
+            }
+            g_pe_inline_hook.target = reinterpret_cast<void*>(target);
+            g_pe_inline_hook.trampoline = nullptr;
+            g_pe_inline_hook.chained = true;
+            g_pe_inline_hook.installed = true;
+            g_original_process_event.store(chained_handler);
+            return true;
+        }
+
+        auto* trampoline = VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!trampoline)
+        {
+            failure = "process_event_trampoline_alloc_failed";
+            return false;
+        }
+        if (!safe_copy(g_pe_inline_hook.original, reinterpret_cast<const void*>(target), ProcessEventInlinePatchSize))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            failure = "process_event_original_bytes_unreadable";
+            return false;
+        }
+        std::memcpy(trampoline, g_pe_inline_hook.original, ProcessEventInlinePatchSize);
+        const auto resume = reinterpret_cast<std::uint8_t*>(target) + ProcessEventInlinePatchSize;
+        if (!write_absolute_jmp64(reinterpret_cast<std::uint8_t*>(trampoline) + ProcessEventInlinePatchSize, resume))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            failure = "process_event_trampoline_jmp_failed";
+            return false;
+        }
+        if (!write_absolute_jmp64(reinterpret_cast<void*>(target), reinterpret_cast<void*>(&hooked_process_event)))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            failure = "process_event_inline_hook_patch_failed";
+            return false;
+        }
+        if (!is_executable_code(reinterpret_cast<std::uintptr_t>(trampoline)))
+        {
+            DWORD old_protect = 0;
+            if (VirtualProtect(reinterpret_cast<void*>(target), ProcessEventInlinePatchSize, PAGE_EXECUTE_READWRITE, &old_protect))
+            {
+                std::memcpy(reinterpret_cast<void*>(target), g_pe_inline_hook.original, ProcessEventInlinePatchSize);
+                FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(target), ProcessEventInlinePatchSize);
+                DWORD ignored = 0;
+                VirtualProtect(reinterpret_cast<void*>(target), ProcessEventInlinePatchSize, old_protect, &ignored);
+            }
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            failure = "process_event_trampoline_invalid";
+            return false;
+        }
+        g_pe_inline_hook.target = reinterpret_cast<void*>(target);
+        g_pe_inline_hook.trampoline = trampoline;
+        g_pe_inline_hook.chained = false;
+        g_pe_inline_hook.installed = true;
+        g_original_process_event.store(reinterpret_cast<std::uintptr_t>(trampoline));
+        return true;
+    }
+
+    auto uninstall_process_event_inline_hook() -> void
+    {
+        std::lock_guard<std::mutex> lock(g_inline_hook_mutex);
+        if (!g_pe_inline_hook.installed || !g_pe_inline_hook.target)
+        {
+            return;
+        }
+        DWORD old_protect = 0;
+        if (VirtualProtect(g_pe_inline_hook.target, ProcessEventInlinePatchSize, PAGE_EXECUTE_READWRITE, &old_protect))
+        {
+            std::memcpy(g_pe_inline_hook.target, g_pe_inline_hook.original, ProcessEventInlinePatchSize);
+            FlushInstructionCache(GetCurrentProcess(), g_pe_inline_hook.target, ProcessEventInlinePatchSize);
+            DWORD ignored = 0;
+            VirtualProtect(g_pe_inline_hook.target, ProcessEventInlinePatchSize, old_protect, &ignored);
+        }
+        if (g_pe_inline_hook.trampoline)
+        {
+            VirtualFree(g_pe_inline_hook.trampoline, 0, MEM_RELEASE);
+        }
+        g_pe_inline_hook = {};
+        g_original_process_event.store(0);
+    }
+
+    auto uninstall_anti_kick_vtable_hooks() -> void
+    {
+        std::lock_guard<std::mutex> lock(g_anti_kick_vtable_mutex);
+        for (std::size_t i = 0; i < g_anti_kick_vtable_restore_count; ++i)
+        {
+            auto& restore = g_anti_kick_vtable_restores[i];
+            if (!restore.vtable)
+            {
+                continue;
+            }
+            void** entry = &restore.vtable[restore.slot];
+            DWORD old_protect = 0;
+            if (VirtualProtect(entry, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect))
+            {
+                *entry = restore.original;
+                FlushInstructionCache(GetCurrentProcess(), entry, sizeof(void*));
+                DWORD ignored = 0;
+                VirtualProtect(entry, sizeof(void*), old_protect, &ignored);
+            }
+        }
+        g_anti_kick_vtable_restore_count = 0;
+        g_anti_kick_vtable_hook_installed = false;
+        if (!g_pe_inline_hook.installed)
+        {
+            g_original_process_event.store(0);
+        }
+    }
+
+    auto patch_vtable_process_event_slot(void** vtable, void** out_original) -> bool
+    {
+        if (!vtable || !out_original)
+        {
+            return false;
+        }
+        void** entry = &vtable[ProcessEventVtableIndex];
+        DWORD old_protect = 0;
+        if (!VirtualProtect(entry, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect))
+        {
+            return false;
+        }
+        *out_original = *entry;
+        *entry = reinterpret_cast<void*>(&hooked_process_event);
+        FlushInstructionCache(GetCurrentProcess(), entry, sizeof(void*));
+        DWORD ignored = 0;
+        VirtualProtect(entry, sizeof(void*), old_protect, &ignored);
+        return *out_original != nullptr;
+    }
+
+    auto install_anti_kick_vtable_hooks(const std::uintptr_t controller,
+                                        const std::uintptr_t player_state,
+                                        const std::uintptr_t net_connection,
+                                        std::string& failure) -> bool
+    {
+        std::lock_guard<std::mutex> lock(g_anti_kick_vtable_mutex);
+
+        auto hook_object_vtable = [&](const std::uintptr_t object) -> bool {
+            if (!live_uobject(object))
+            {
+                return false;
+            }
+            const auto vtable = safe_read<std::uintptr_t>(object);
+            if (!vtable)
+            {
+                return false;
+            }
+            auto* vtable_slots = reinterpret_cast<void**>(vtable);
+            for (std::size_t i = 0; i < g_anti_kick_vtable_restore_count; ++i)
+            {
+                if (g_anti_kick_vtable_restores[i].vtable == vtable_slots)
+                {
+                    return true;
+                }
+            }
+            if (g_anti_kick_vtable_restore_count >= AntiKickMaxVtableHooks)
+            {
+                return false;
+            }
+            void* original = nullptr;
+            if (!patch_vtable_process_event_slot(vtable_slots, &original))
+            {
+                return false;
+            }
+            if (!is_executable_code(reinterpret_cast<std::uintptr_t>(original))
+                || reinterpret_cast<std::uintptr_t>(original) == static_cast<std::uintptr_t>(-1))
+            {
+                void** entry = &vtable_slots[ProcessEventVtableIndex];
+                DWORD old_protect = 0;
+                if (VirtualProtect(entry, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect))
+                {
+                    *entry = original;
+                    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(void*));
+                    DWORD ignored = 0;
+                    VirtualProtect(entry, sizeof(void*), old_protect, &ignored);
+                }
+                return false;
+            }
+            auto& restore = g_anti_kick_vtable_restores[g_anti_kick_vtable_restore_count++];
+            restore.vtable = vtable_slots;
+            restore.slot = ProcessEventVtableIndex;
+            restore.original = original;
+            if (!g_original_process_event.load())
+            {
+                g_original_process_event.store(reinterpret_cast<std::uintptr_t>(original));
+            }
+            return true;
+        };
+
+        bool hooked = hook_object_vtable(controller);
+        // Do not hook PlayerState/NetConnection vtables — those objects are recreated on
+        // lobby/match transitions; a stale class vtable hook caused AV 0xFFFFFFFFFFFFFFFF.
+        (void)player_state;
+        (void)net_connection;
+        if (!hooked || g_anti_kick_vtable_restore_count == 0)
+        {
+            failure = "anti_kick_vtable_hook_failed";
+            if (!g_anti_kick_vtable_hook_installed)
+            {
+                uninstall_anti_kick_vtable_hooks();
+            }
+            return false;
+        }
+        g_anti_kick_vtable_hook_installed = true;
+        return true;
+    }
+
+    auto anti_kick_resolve_local_player_state() -> std::uintptr_t
+    {
+        const auto cached = g_anti_kick_local_player_state.load();
+        if (live_uobject(cached))
+        {
+            return cached;
+        }
+        const auto controller = g_anti_kick_local_controller.load();
+        if (live_uobject(controller))
+        {
+            const auto ps = safe_read<std::uintptr_t>(controller + OffPlayerControllerPlayerState);
+            if (live_uobject(ps))
+            {
+                return ps;
+            }
+        }
+        return 0;
+    }
+
+    auto anti_kick_resolve_local_net_connection() -> std::uintptr_t
+    {
+        const auto cached = g_anti_kick_local_net_connection.load();
+        if (live_uobject(cached))
+        {
+            return cached;
+        }
+        const auto local_player = g_anti_kick_local_player.load();
+        if (live_uobject(local_player))
+        {
+            const auto conn = safe_read<std::uintptr_t>(local_player + OffUPlayerConnection);
+            if (live_uobject(conn))
+            {
+                return conn;
+            }
+        }
+        return 0;
+    }
+
+    auto anti_kick_is_local_player_controller(const std::uintptr_t obj) -> bool
+    {
+        if (!live_uobject(obj))
+        {
+            return false;
+        }
+        if (obj == g_anti_kick_local_controller.load())
+        {
+            return true;
+        }
+        if (safe_read<std::uint8_t>(obj + OffPlayerControllerIsLocal) != 0)
+        {
+            return true;
+        }
+        const auto local_player = g_anti_kick_local_player.load();
+        if (live_uobject(local_player))
+        {
+            const auto controller = safe_read<std::uintptr_t>(local_player + 0x30);
+            return controller == obj;
+        }
+        return false;
+    }
+
+    auto anti_kick_is_local_player_state(const std::uintptr_t obj) -> bool
+    {
+        if (!live_uobject(obj))
+        {
+            return false;
+        }
+        return obj == anti_kick_resolve_local_player_state();
+    }
+
+    auto anti_kick_is_local_net_connection(const std::uintptr_t obj) -> bool
+    {
+        if (!live_uobject(obj))
+        {
+            return false;
+        }
+        return obj == anti_kick_resolve_local_net_connection();
+    }
+
+    auto anti_kick_is_local_object(const std::uintptr_t obj) -> bool
+    {
+        return anti_kick_is_local_player_controller(obj)
+            || anti_kick_is_local_player_state(obj)
+            || anti_kick_is_local_net_connection(obj);
+    }
+
+    auto anti_kick_function_targets_local_player(const char* func_name,
+                                                 const std::uintptr_t obj) -> bool
+    {
+        if (!func_name || !live_uobject(obj))
+        {
+            return false;
+        }
+        const std::string lower = lower_copy(func_name);
+        if (lower.find("netconnection") != std::string::npos
+            || lower == "close"
+            || lower == "conditionalclose"
+            || lower == "cleanup")
+        {
+            return anti_kick_is_local_net_connection(obj);
+        }
+        if (lower == "kick" || lower.find("playerstate") != std::string::npos)
+        {
+            return anti_kick_is_local_player_state(obj);
+        }
+        if (lower.rfind("client", 0) == 0)
+        {
+            return anti_kick_is_local_player_controller(obj);
+        }
+        return anti_kick_is_local_object(obj);
+    }
+
+    // Session/join/travel function names — used purely for auto-rejoin discovery.
+    // Kept separate from the kick list so the two show up under distinct log tags.
+    auto is_session_join_like_name(const std::string& lower_name) -> bool
+    {
+        static const char* needles[] = {
+            "joinsession",
+            "join",
+            "rejoin",
+            "reconnect",
+            "session",
+            "clienttravel",
+            "servertravel",
+            "openlevel",
+            "browse",
+            "invite",
+            "enterlobby",
+            "joinlobby",
+            "findsession",
+            "createsession",
+        };
+        for (const char* needle : needles)
+        {
+            if (lower_name.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Disconnect-reason-carrying RPCs whose FString/URL param reveals WHY we were
+    // dropped (application kick text vs. transport/EOS failure URL).
+    auto is_disconnect_reason_function(const std::string& lower_name) -> bool
+    {
+        static const char* needles[] = {
+            "clienttravel",
+            "returntomainmenu",
+            "clientwaskicked",
+            "waskicked",
+            "networkfailure",
+            "travelfailure",
+            "handlenetworkfailure",
+            "notifyconnectionlost",
+        };
+        for (const char* needle : needles)
+        {
+            if (lower_name.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    auto capture_register_reason_func(const std::uintptr_t func) -> void
+    {
+        if (!func)
+        {
+            return;
+        }
+        const auto count = g_capture_reason_func_count.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (g_capture_reason_funcs[i].load(std::memory_order_relaxed) == func)
+            {
+                return;  // already registered
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_capture_reason_mutex);
+        const auto cur = g_capture_reason_func_count.load(std::memory_order_relaxed);
+        for (std::size_t i = 0; i < cur; ++i)
+        {
+            if (g_capture_reason_funcs[i].load(std::memory_order_relaxed) == func)
+            {
+                return;
+            }
+        }
+        if (cur >= CaptureReasonMaxFuncs)
+        {
+            return;
+        }
+        g_capture_reason_funcs[cur].store(func, std::memory_order_relaxed);
+        g_capture_reason_func_count.store(cur + 1, std::memory_order_release);
+    }
+
+    // Classify each distinct UFunction pointer exactly once. Returns true only the
+    // first time a given pointer is seen (caller should resolve + keyword-test it);
+    // every later call is a lock-free probe that returns false so the hot path stays
+    // cheap. When the table fills we stop classifying to bound cost.
+    auto capture_mark_func_seen(const std::uintptr_t func) -> bool
+    {
+        if (g_capture_seen_func_fill.load(std::memory_order_relaxed) >= CaptureSeenTableSize - 1)
+        {
+            return false;
+        }
+        std::size_t idx = (func >> 4) & (CaptureSeenTableSize - 1);
+        for (std::size_t probe = 0; probe < 64; ++probe)
+        {
+            const std::size_t slot = (idx + probe) & (CaptureSeenTableSize - 1);
+            std::uintptr_t expected = g_capture_seen_funcs[slot].load(std::memory_order_relaxed);
+            if (expected == func)
+            {
+                return false;  // already classified
+            }
+            if (expected == 0)
+            {
+                if (g_capture_seen_funcs[slot].compare_exchange_strong(
+                        expected, func, std::memory_order_acq_rel))
+                {
+                    g_capture_seen_func_fill.fetch_add(1, std::memory_order_relaxed);
+                    return true;  // newly inserted — classify it
+                }
+                if (expected == func)
+                {
+                    return false;  // lost race to same pointer
+                }
+                // lost race to a different pointer — fall through to the next slot
+            }
+        }
+        return false;  // probe exhausted — treat as seen to bound cost
+    }
+
+    auto capture_reset_seen_table() -> void
+    {
+        for (std::size_t i = 0; i < CaptureSeenTableSize; ++i)
+        {
+            g_capture_seen_funcs[i].store(0, std::memory_order_relaxed);
+        }
+        g_capture_seen_func_fill.store(0, std::memory_order_relaxed);
+        for (std::size_t i = 0; i < CaptureReasonMaxFuncs; ++i)
+        {
+            g_capture_reason_funcs[i].store(0, std::memory_order_relaxed);
+        }
+        g_capture_reason_func_count.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(g_capture_reason_mutex);
+            g_capture_reason_seen_text.clear();
+        }
+    }
+
+    // Widened capture across EVERY object: proves whether any kick RPC fires
+    // anywhere (not just the 4 local objects) and discovers session/join functions
+    // for auto-rejoin. Each distinct function is resolved once via capture_mark_func_seen.
+    auto anti_kick_capture_probe_global(void* object, void* function) -> void
+    {
+        if (!g_anti_kick_capture_enabled.load() || !object || !function)
+        {
+            return;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        if (!capture_mark_func_seen(func))
+        {
+            return;  // fast path: already classified this function
+        }
+        const auto pool = g_anti_kick_capture_names_pool.load();
+        if (!pool)
+        {
+            return;
+        }
+        const auto fname_index = safe_read<std::uint32_t>(func + OffName, 0);
+        if (!fname_index)
+        {
+            return;
+        }
+        FNameResolver resolver{};
+        resolver.pool = pool;
+        resolver.table_offset = g_anti_kick_capture_names_table_offset.load();
+        resolver.style = g_anti_kick_capture_names_style.load();
+        std::string fname = resolver.resolve(fname_index);
+        if (fname.empty())
+        {
+            return;
+        }
+        const std::string lower = lower_copy(fname);
+        const bool kickish = is_kick_like_function_name(lower);
+        const bool sessionish = !kickish && is_session_join_like_name(lower);
+        if (!kickish && !sessionish)
+        {
+            return;
+        }
+        const auto obj = reinterpret_cast<std::uintptr_t>(object);
+        const auto cls = safe_read<std::uintptr_t>(obj + OffClass);
+        const std::uint32_t cls_name_idx = cls ? safe_read<std::uint32_t>(cls + OffName, 0) : 0;
+        std::string cls_name = cls_name_idx ? resolver.resolve(cls_name_idx) : std::string("?");
+        if (cls_name.empty())
+        {
+            cls_name = "?";
+        }
+        const char* tag = kickish ? "capture-kick" : "capture-session";
+        append_anti_kick_log_file(std::string("[anti-kick][") + tag + "] " + cls_name + "::" + fname + "\n");
+
+        // If this RPC carries a disconnect reason (travel URL / kick text),
+        // remember its pointer so the reason probe can read the param when it fires.
+        if (is_disconnect_reason_function(lower))
+        {
+            capture_register_reason_func(func);
+        }
+    }
+
+    auto anti_kick_capture_probe(void* object, void* function) -> void
+    {
+        if (!g_anti_kick_capture_enabled.load() || !object || !function)
+        {
+            return;
+        }
+        anti_kick_capture_probe_global(object, function);
+        const auto obj = reinterpret_cast<std::uintptr_t>(object);
+        const char* owner = nullptr;
+        if (obj == g_anti_kick_local_controller.load())
+        {
+            owner = "PlayerController";
+        }
+        else if (obj == g_anti_kick_local_player_state.load())
+        {
+            owner = "PlayerState";
+        }
+        else if (obj == g_anti_kick_local_net_connection.load())
+        {
+            owner = "NetConnection";
+        }
+        else if (obj == g_anti_kick_local_pawn.load())
+        {
+            owner = "Pawn";
+        }
+        else
+        {
+            return;  // not one of our local objects — cheap pointer gate
+        }
+
+        const auto pool = g_anti_kick_capture_names_pool.load();
+        if (!pool)
+        {
+            return;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        const auto fname_index = safe_read<std::uint32_t>(func + OffName, 0);
+        if (!fname_index)
+        {
+            return;
+        }
+
+        FNameResolver resolver{};
+        resolver.pool = pool;
+        resolver.table_offset = g_anti_kick_capture_names_table_offset.load();
+        resolver.style = g_anti_kick_capture_names_style.load();
+        std::string fname = resolver.resolve(fname_index);
+        if (fname.empty())
+        {
+            return;
+        }
+
+        std::string key = std::string(owner) + "::" + fname;
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_capture_mutex);
+            if (g_anti_kick_capture_seen.size() > 512 || g_anti_kick_capture_seen.count(key))
+            {
+                return;
+            }
+            g_anti_kick_capture_seen.insert(key);
+        }
+        append_anti_kick_log_file("[anti-kick][capture] ProcessEvent " + key + "\n");
+    }
+
+    // Native diagnostic probe: when a registered disconnect-reason RPC fires, read
+    // its FString URL/reason param — that string is the engine's actual close
+    // reason. Runs on every ProcessEvent but is a cheap pointer scan until such an
+    // RPC is discovered (i.e. right around a kick), so it costs nothing normally.
+    auto anti_kick_capture_reason(void* function, void* params) -> void
+    {
+        if (!g_anti_kick_capture_enabled.load() || !function)
+        {
+            return;
+        }
+        const auto count = g_capture_reason_func_count.load(std::memory_order_acquire);
+        if (count == 0)
+        {
+            return;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        bool matched = false;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (g_capture_reason_funcs[i].load(std::memory_order_relaxed) == func)
+            {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+        {
+            return;
+        }
+
+        char detail[192]{};
+        try_read_fstring_param_preview(params, detail, sizeof(detail));
+
+        std::string fname = "?";
+        const auto pool = g_anti_kick_capture_names_pool.load();
+        if (pool)
+        {
+            const auto fname_index = safe_read<std::uint32_t>(func + OffName, 0);
+            if (fname_index)
+            {
+                FNameResolver resolver{};
+                resolver.pool = pool;
+                resolver.table_offset = g_anti_kick_capture_names_table_offset.load();
+                resolver.style = g_anti_kick_capture_names_style.load();
+                std::string resolved = resolver.resolve(fname_index);
+                if (!resolved.empty())
+                {
+                    fname = resolved;
+                }
+            }
+        }
+
+        std::string reason_text = detail[0] != '\0' ? std::string(detail) : std::string("<no-fstring-param>");
+        std::string dedupe_key = fname + "|" + reason_text;
+        {
+            std::lock_guard<std::mutex> lock(g_capture_reason_mutex);
+            if (g_capture_reason_seen_text.size() > 64
+                || g_capture_reason_seen_text.count(dedupe_key))
+            {
+                return;
+            }
+            g_capture_reason_seen_text.insert(dedupe_key);
+        }
+        append_anti_kick_log_file(
+            "[anti-kick][capture-reason] " + fname + " reason='" + reason_text + "'\n");
+    }
+
+    auto anti_kick_is_global_kick_name(const char* name) -> bool
+    {
+        if (!name)
+        {
+            return false;
+        }
+        const std::string lower = lower_copy(name);
+        // The RPCs chameleonEsp blocks unconditionally. They are kick-specific,
+        // so blocking them on any object is safe — and necessary: the
+        // BP_FirstPersonCharacter_LINK_C::Kick variant runs on a character
+        // pawn, which the local player-state/controller filter would reject.
+        return lower == "kick"
+            || lower == "serverkick"
+            || lower == "clientwaskicked"
+            || lower == "clientreturntomainmenuwithtextreason"
+            || lower == "clientreturntomainmenu";
+    }
+
+    auto anti_kick_should_block(void* object, void* function, void* params) -> bool
+    {
+        if (!g_anti_kick_enabled.load() || !object || !function)
+        {
+            return false;
+        }
+        const auto obj = reinterpret_cast<std::uintptr_t>(object);
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        const auto count = g_anti_kick_blocked_function_count.load();
+        for (std::size_t i = 0; i < count && i < AntiKickMaxBlockedFunctions; ++i)
+        {
+            if (g_anti_kick_blocked_functions[i].load() != func)
+            {
+                continue;
+            }
+            const char* func_name = "unknown";
+            const char* owner = "local";
+            anti_kick_lookup_meta(func, &func_name, &owner);
+            // Known kick RPCs block regardless of which object they run on
+            // (chameleonEsp behaviour). Only the heuristic scanned functions
+            // keep the local-player filter, since blocking those globally
+            // could swallow unrelated events aimed at other players.
+            if (!anti_kick_is_global_kick_name(func_name)
+                && !anti_kick_function_targets_local_player(func_name, obj))
+            {
+                return false;
+            }
+            g_anti_kick_block_count.fetch_add(1);
+            anti_kick_record_block(func, params);
+            return true;
+        }
+        // Pointer miss: the engine recreates BP UFunction objects between
+        // rounds, so a recreated Kick has a new pointer but the same FName.
+        // Match the function's FName comparison index against the recorded
+        // kick names so blocking survives round transitions.
+        const auto name_count = g_anti_kick_blocked_name_count.load();
+        if (name_count > 0)
+        {
+            const auto name_index = safe_read<std::uint32_t>(func + OffName, 0);
+            if (name_index != 0)
+            {
+                for (std::size_t i = 0; i < name_count && i < AntiKickMaxBlockedNames; ++i)
+                {
+                    if (g_anti_kick_blocked_name_indices[i].load() != name_index)
+                    {
+                        continue;
+                    }
+                    g_anti_kick_block_count.fetch_add(1);
+                    anti_kick_record_block(func, params, g_anti_kick_blocked_name_texts[i], "by-name");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    auto god_mode_scrub_pawn(std::uintptr_t pawn) -> void
+    {
+        if (!live_uobject(pawn))
+        {
+            return;
+        }
+        __try
+        {
+            const double max_hp = *reinterpret_cast<double*>(pawn + GodModeOffMaxHealth);
+            if (max_hp > 0.0 && std::isfinite(max_hp))
+            {
+                *reinterpret_cast<double*>(pawn + GodModeOffHealth) = max_hp;
+            }
+            *reinterpret_cast<std::uint8_t*>(pawn + GodModeOffInvincible) = 1;
+            *reinterpret_cast<std::uint8_t*>(pawn + GodModeOffDead) = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    auto god_mode_should_block(void* object, void* function) -> bool
+    {
+        if (!g_god_mode_enabled.load() || !object || !function)
+        {
+            return false;
+        }
+        const auto pawn = g_god_mode_local_pawn.load();
+        if (!pawn || reinterpret_cast<std::uintptr_t>(object) != pawn)
+        {
+            return false;
+        }
+        const auto func = reinterpret_cast<std::uintptr_t>(function);
+        const auto count = g_god_mode_blocked_function_count.load();
+        for (std::size_t i = 0; i < count && i < GodModeMaxBlockedFunctions; ++i)
+        {
+            if (g_god_mode_blocked_functions[i].load() != func)
+            {
+                continue;
+            }
+            g_god_mode_block_count.fetch_add(1);
+            return true;
+        }
+        return false;
+    }
+
+    auto json_bool(bool value) -> const char*
+    {
+        return value ? "true" : "false";
+    }
+
+    struct SdkResolutionException : std::runtime_error
+    {
+        std::string stage;
+
+        SdkResolutionException(std::string stage_text, std::string message_text)
+            : std::runtime_error(message_text), stage(std::move(stage_text))
+        {
+        }
+    };
+
+    [[noreturn]] auto throw_sdk_update_required(const std::string& message) -> void
+    {
+        throw SdkResolutionException("sdk_update_required", message);
+    }
+
+    struct SdkContext
+    {
+        bool ok{false};
+        std::string stage{"sdk_unavailable"};
+        std::string message{"sdk unavailable"};
+        std::uintptr_t module_base{0};
+        std::uintptr_t actual_guobject_array{0};
+        std::string world_source{"runtime_object_scan"};
+        std::string process_event_source{"uobject_vtable"};
+        std::uintptr_t process_event{0};
+        std::uintptr_t world{0};
+        std::uintptr_t game_instance{0};
+        int local_players_count{0};
+        std::uintptr_t local_player{0};
+        std::uintptr_t controller{0};
+        std::uintptr_t k2_get_pawn_function{0};
+        std::uintptr_t pawn{0};
+        std::uintptr_t k2_get_actor_location_function{0};
+        sdk::FVector body_world_position{};
+        std::uintptr_t component{0};
+        std::uintptr_t server_paint_batch_function{0};
+    };
+
+    struct SdkViewportInfo
+    {
+        int width{0};
+        int height{0};
+    };
+
+    struct SdkDeprojectRay
+    {
+        bool ok{false};
+        std::string failure{};
+        sdk::FVector location{};
+        sdk::FVector direction{};
+    };
+
+    auto sdk_vec_add(const sdk::FVector& a, const sdk::FVector& b) -> sdk::FVector
+    {
+        return {a.X + b.X, a.Y + b.Y, a.Z + b.Z};
+    }
+
+    auto sdk_vec_sub(const sdk::FVector& a, const sdk::FVector& b) -> sdk::FVector
+    {
+        return {a.X - b.X, a.Y - b.Y, a.Z - b.Z};
+    }
+
+    auto sdk_vec_mul(const sdk::FVector& a, double scale) -> sdk::FVector
+    {
+        return {a.X * scale, a.Y * scale, a.Z * scale};
+    }
+
+    auto sdk_vec_dot(const sdk::FVector& a, const sdk::FVector& b) -> double
+    {
+        return a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+    }
+
+    auto sdk_vec_cross(const sdk::FVector& a, const sdk::FVector& b) -> sdk::FVector
+    {
+        return {a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X};
+    }
+
+    auto sdk_vec_len(const sdk::FVector& a) -> double
+    {
+        return std::sqrt(a.X * a.X + a.Y * a.Y + a.Z * a.Z);
+    }
+
+    auto sdk_vec_normalize(const sdk::FVector& a) -> sdk::FVector
+    {
+        const auto len = sdk_vec_len(a);
+        if (len <= 0.000001)
+        {
+            return {};
+        }
+        return {a.X / len, a.Y / len, a.Z / len};
+    }
+
+    auto sdk_project_world_to_viewport(const sdk::FVector& camera_location,
+                                       const sdk::FVector& camera_forward,
+                                       double horizontal_fov_deg,
+                                       int viewport_width,
+                                       int viewport_height,
+                                       const sdk::FVector& world,
+                                       double& out_x,
+                                       double& out_y) -> bool
+    {
+        if (viewport_width <= 0 || viewport_height <= 0 || !std::isfinite(horizontal_fov_deg))
+        {
+            return false;
+        }
+        const sdk::FVector delta{
+            world.X - camera_location.X,
+            world.Y - camera_location.Y,
+            world.Z - camera_location.Z,
+        };
+        const sdk::FVector forward = sdk_vec_normalize(camera_forward);
+        if (sdk_vec_len(forward) <= 0.000001)
+        {
+            return false;
+        }
+        sdk::FVector right = sdk_vec_cross(forward, sdk::FVector{0.0, 0.0, 1.0});
+        if (sdk_vec_len(right) <= 0.000001)
+        {
+            right = sdk::FVector{1.0, 0.0, 0.0};
+        }
+        else
+        {
+            right = sdk_vec_normalize(right);
+        }
+        const sdk::FVector up = sdk_vec_normalize(sdk_vec_cross(right, forward));
+        const double local_z = sdk_vec_dot(delta, forward);
+        if (local_z <= 0.001)
+        {
+            return false;
+        }
+        const double local_x = sdk_vec_dot(delta, right);
+        const double local_y = sdk_vec_dot(delta, up);
+        const double aspect = static_cast<double>(viewport_width) / static_cast<double>(std::max(1, viewport_height));
+        const double half_h_rad = (horizontal_fov_deg * 3.14159265358979323846 / 180.0) * 0.5;
+        const double tan_half_h = std::tan(half_h_rad);
+        const double tan_half_v = tan_half_h / std::max(0.01, aspect);
+        const double ndc_x = local_x / (local_z * tan_half_h);
+        const double ndc_y = -local_y / (local_z * tan_half_v);
+        out_x = (ndc_x + 1.0) * 0.5 * static_cast<double>(viewport_width);
+        out_y = (ndc_y + 1.0) * 0.5 * static_cast<double>(viewport_height);
+        return std::isfinite(out_x) && std::isfinite(out_y);
+    }
+
+    auto sdk_read_number(Reflection& ref, std::uintptr_t prop, std::uint8_t* container) -> double
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return 0.0;
+        }
+        auto* src = container + offset;
+        const auto size = prop_element_size(prop);
+        const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+        if (size == 8 && !contains_text(name, "int") && !contains_text(name, "channel") && !contains_text(name, "mode"))
+        {
+            return *reinterpret_cast<double*>(src);
+        }
+        if (size >= 4)
+        {
+            if (contains_text(name, "size") || contains_text(name, "width") || contains_text(name, "height") ||
+                contains_text(name, "count") || contains_text(name, "index") || contains_text(name, "channel") ||
+                contains_text(name, "mode"))
+            {
+                return static_cast<double>(*reinterpret_cast<std::int32_t*>(src));
+            }
+            return static_cast<double>(*reinterpret_cast<float*>(src));
+        }
+        if (size == 2)
+        {
+            return static_cast<double>(*reinterpret_cast<std::int16_t*>(src));
+        }
+        if (size == 1)
+        {
+            return static_cast<double>(*src);
+        }
+        return 0.0;
+    }
+
+    auto sdk_read_bool(std::uintptr_t prop, std::uint8_t* container) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        return offset >= 0 && *(container + offset) != 0;
+    }
+
+    auto sdk_write_object(std::uintptr_t prop, std::uint8_t* container, std::uintptr_t value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        *reinterpret_cast<std::uintptr_t*>(container + offset) = value;
+        return true;
+    }
+
+    auto sdk_read_object(std::uintptr_t prop, std::uint8_t* container) -> std::uintptr_t
+    {
+        const auto offset = prop_offset(prop);
+        return offset < 0 ? 0 : safe_read<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(container + offset));
+    }
+
+    auto sdk_write_vector3(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, const sdk::FVector& value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        auto* base = container + offset;
+        const auto st = struct_type(ref, prop, {"X", "Y", "Z"});
+        bool wrote = false;
+        if (st)
+        {
+            const auto x = find_property_any(ref, st, {"X"});
+            const auto y = find_property_any(ref, st, {"Y"});
+            const auto z = find_property_any(ref, st, {"Z"});
+            const auto xo = x ? prop_offset(x) : -1;
+            const auto yo = y ? prop_offset(y) : -1;
+            const auto zo = z ? prop_offset(z) : -1;
+            if (xo >= 0 && yo > xo && zo > yo)
+            {
+                if (yo - xo >= 8 && zo - yo >= 8)
+                {
+                    *reinterpret_cast<double*>(base + xo) = value.X;
+                    *reinterpret_cast<double*>(base + yo) = value.Y;
+                    *reinterpret_cast<double*>(base + zo) = value.Z;
+                }
+                else
+                {
+                    *reinterpret_cast<float*>(base + xo) = static_cast<float>(value.X);
+                    *reinterpret_cast<float*>(base + yo) = static_cast<float>(value.Y);
+                    *reinterpret_cast<float*>(base + zo) = static_cast<float>(value.Z);
+                }
+                return true;
+            }
+        }
+        const auto size = prop_element_size(prop);
+        if (size >= 24)
+        {
+            const double values[3]{value.X, value.Y, value.Z};
+            std::memcpy(base, values, sizeof(values));
+            return true;
+        }
+        if (size >= 12)
+        {
+            const float values[3]{static_cast<float>(value.X), static_cast<float>(value.Y), static_cast<float>(value.Z)};
+            std::memcpy(base, values, sizeof(values));
+            return true;
+        }
+        return false;
+    }
+
+    auto sdk_read_vector3(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, sdk::FVector& out) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        auto* base = container + offset;
+        const auto st = struct_type(ref, prop, {"X", "Y", "Z"});
+        if (st)
+        {
+            const auto x = find_property_any(ref, st, {"X"});
+            const auto y = find_property_any(ref, st, {"Y"});
+            const auto z = find_property_any(ref, st, {"Z"});
+            const auto xo = x ? prop_offset(x) : -1;
+            const auto yo = y ? prop_offset(y) : -1;
+            const auto zo = z ? prop_offset(z) : -1;
+            if (xo >= 0 && yo > xo && zo > yo)
+            {
+                if (yo - xo >= 8 && zo - yo >= 8)
+                {
+                    out.X = *reinterpret_cast<double*>(base + xo);
+                    out.Y = *reinterpret_cast<double*>(base + yo);
+                    out.Z = *reinterpret_cast<double*>(base + zo);
+                }
+                else
+                {
+                    out.X = *reinterpret_cast<float*>(base + xo);
+                    out.Y = *reinterpret_cast<float*>(base + yo);
+                    out.Z = *reinterpret_cast<float*>(base + zo);
+                }
+                return std::isfinite(out.X) && std::isfinite(out.Y) && std::isfinite(out.Z);
+            }
+        }
+        const auto size = prop_element_size(prop);
+        if (size >= 24)
+        {
+            const auto* values = reinterpret_cast<double*>(base);
+            out = {values[0], values[1], values[2]};
+            return true;
+        }
+        if (size >= 12)
+        {
+            const auto* values = reinterpret_cast<float*>(base);
+            out = {values[0], values[1], values[2]};
+            return true;
+        }
+        return false;
+    }
+
+    auto sdk_read_vector2(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, double& x, double& y) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        auto* base = container + offset;
+        const auto st = struct_type(ref, prop, {"X", "Y"});
+        if (st)
+        {
+            const auto xp = find_property_any(ref, st, {"X"});
+            const auto yp = find_property_any(ref, st, {"Y"});
+            const auto xo = xp ? prop_offset(xp) : -1;
+            const auto yo = yp ? prop_offset(yp) : -1;
+            if (xo >= 0 && yo > xo)
+            {
+                if (yo - xo >= 8)
+                {
+                    x = *reinterpret_cast<double*>(base + xo);
+                    y = *reinterpret_cast<double*>(base + yo);
+                }
+                else
+                {
+                    x = *reinterpret_cast<float*>(base + xo);
+                    y = *reinterpret_cast<float*>(base + yo);
+                }
+                return std::isfinite(x) && std::isfinite(y);
+            }
+        }
+        const auto size = prop_element_size(prop);
+        if (size >= 16)
+        {
+            const auto* values = reinterpret_cast<double*>(base);
+            x = values[0];
+            y = values[1];
+            return true;
+        }
+        if (size >= 8)
+        {
+            const auto* values = reinterpret_cast<float*>(base);
+            x = values[0];
+            y = values[1];
+            return true;
+        }
+        return false;
+    }
+
+    auto sdk_call_no_params(Reflection& ref, std::uintptr_t object, const char* function_name) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size < 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(1, params_size)), 0);
+        std::string failure{};
+        return process_event(object, function, params.data(), failure);
+    }
+
+    auto sdk_call_single_number(Reflection& ref, std::uintptr_t object, const char* function_name, double value) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            if (name != "ReturnValue")
+            {
+                wrote = write_number(ref, prop, params.data(), value) || wrote;
+            }
+        }
+        std::string failure{};
+        return wrote && process_event(object, function, params.data(), failure);
+    }
+
+    auto sdk_call_single_bool(Reflection& ref, std::uintptr_t object, const char* function_name, bool value) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            if (name != "ReturnValue")
+            {
+                wrote = write_bool(prop, params.data(), value) || wrote;
+            }
+        }
+        std::string failure{};
+        return wrote && process_event(object, function, params.data(), failure);
+    }
+
+    auto sdk_call_two_bools(Reflection& ref, std::uintptr_t object, const char* function_name, bool first, bool second) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        int bool_index = 0;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            if (name == "ReturnValue")
+            {
+                continue;
+            }
+            const bool value = (name.find("Propagate") != std::string::npos || bool_index > 0) ? second : first;
+            wrote = write_bool(prop, params.data(), value) || wrote;
+            ++bool_index;
+        }
+        std::string failure{};
+        return wrote && process_event(object, function, params.data(), failure);
+    }
+
+    auto sdk_call_object_param(Reflection& ref, std::uintptr_t object, const char* function_name, std::uintptr_t value) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function || !value)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            if (name != "ReturnValue")
+            {
+                wrote = sdk_write_object(prop, params.data(), value) || wrote;
+            }
+        }
+        std::string failure{};
+        return wrote && process_event(object, function, params.data(), failure);
+    }
+
+    auto sdk_context_metadata(Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        return "\"sdk_version\":\"runtime_dynamic_reflection_min\"" +
+               std::string(",\"sdk_route\":\"sdk_server_paint_batch_strokes\"") +
+               ",\"module_base\":\"" + hex_address(ctx.module_base) + "\"" +
+               ",\"guobject_array\":\"" + hex_address(ctx.actual_guobject_array) + "\"" +
+               ",\"global_offset_source\":\"runtime_pattern_scan\"" +
+               ",\"world_source\":\"" + json_escape(ctx.world_source) + "\"" +
+               ",\"process_event_source\":\"" + json_escape(ctx.process_event_source) + "\"" +
+               ",\"process_event_vtable_index\":" + std::to_string(ProcessEventVtableIndex) +
+               ",\"world\":\"" + hex_address(ctx.world) + "\"" +
+               ",\"game_instance\":\"" + hex_address(ctx.game_instance) + "\"" +
+               ",\"local_players_count\":" + std::to_string(ctx.local_players_count) +
+               ",\"local_player\":\"" + hex_address(ctx.local_player) + "\"" +
+               ",\"controller\":\"" + hex_address(ctx.controller) + "\"" +
+               ",\"k2_get_pawn_function\":\"" + hex_address(ctx.k2_get_pawn_function) + "\"" +
+               ",\"pawn\":\"" + hex_address(ctx.pawn) + "\"" +
+               ",\"pawn_class\":\"" + json_escape(ref.class_name(ctx.pawn)) + "\"" +
+               ",\"k2_get_actor_location_function\":\"" + hex_address(ctx.k2_get_actor_location_function) + "\"" +
+               ",\"body_world_x\":" + std::to_string(ctx.body_world_position.X) +
+               ",\"body_world_y\":" + std::to_string(ctx.body_world_position.Y) +
+               ",\"body_world_z\":" + std::to_string(ctx.body_world_position.Z) +
+               ",\"runtime_paintable_offset\":\"0xb68\"" +
+               ",\"component\":\"" + hex_address(ctx.component) + "\"" +
+               ",\"component_class\":\"" + json_escape(ref.class_name(ctx.component)) + "\"" +
+               ",\"function_server_paint_batch_available\":" + std::string(json_bool(ctx.server_paint_batch_function != 0)) +
+               ",\"function_server_paint_batch\":\"" + hex_address(ctx.server_paint_batch_function) + "\"" +
+               ",\"param_schema\":\"FPaintStroke{Uv@0,WorldPosition@16,bHasWorldPosition@40,BrushSettings@104,ChannelData@144,TargetChannel@176};ServerPaintBatch{Batch@0}\"" +
+               std::string(",\"sdk_replication_api\":\"component_server_paint_batch\"") +
+               ",\"multiplayer_replicated\":true";
+    }
+
+    auto sdk_resolve_context(Reflection& ref) -> SdkContext
+    {
+        SdkContext ctx{};
+        const auto module = main_module_range();
+        ctx.module_base = module.base;
+        ctx.actual_guobject_array = ref.guobject_array;
+        if (!module.base)
+        {
+            ctx.stage = "sdk_unavailable";
+            ctx.message = "main module unavailable";
+            return ctx;
+        }
+        if (!ctx.actual_guobject_array)
+        {
+            throw_sdk_update_required("runtime GUObjectArray pattern scan failed");
+        }
+        auto world_has_local_context = [&](std::uintptr_t world) -> bool {
+            if (!live_uobject(world))
+            {
+                return false;
+            }
+            const auto game_instance = safe_read<std::uintptr_t>(world + sdk::FieldOffsets::UWorld_OwningGameInstance);
+            if (!live_uobject(game_instance))
+            {
+                return false;
+            }
+            const auto local_players = safe_read<sdk::TArray<std::uintptr_t>>(game_instance + sdk::FieldOffsets::UGameInstance_LocalPlayers);
+            return local_players.Data && local_players.Num > 0 && local_players.Num <= 8;
+        };
+
+        const auto world_class = ref.find_class("World");
+        if (!world_class)
+        {
+            throw_sdk_update_required("UWorld class unavailable from runtime object scan");
+        }
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (ref.class_ptr(object) == world_class && world_has_local_context(object))
+            {
+                ctx.world = object;
+                return true;
+            }
+            return false;
+        });
+        if (!live_uobject(ctx.world))
+        {
+            throw_sdk_update_required("runtime object scan found no active UWorld with LocalPlayers");
+        }
+        ctx.game_instance = safe_read<std::uintptr_t>(ctx.world + sdk::FieldOffsets::UWorld_OwningGameInstance);
+        if (!live_uobject(ctx.game_instance))
+        {
+            throw_sdk_update_required("UWorld::OwningGameInstance unavailable");
+        }
+
+        const auto local_players = safe_read<sdk::TArray<std::uintptr_t>>(ctx.game_instance + sdk::FieldOffsets::UGameInstance_LocalPlayers);
+        ctx.local_players_count = local_players.Num;
+        if (!local_players.Data || local_players.Num <= 0 || local_players.Num > 8)
+        {
+            throw_sdk_update_required("GameInstance.LocalPlayers is empty or invalid");
+        }
+        ctx.local_player = safe_read<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(local_players.Data));
+        if (!live_uobject(ctx.local_player))
+        {
+            ctx.stage = "local_pawn_unavailable";
+            ctx.message = "LocalPlayers[0] unavailable";
+            return ctx;
+        }
+        ctx.controller = safe_read<std::uintptr_t>(ctx.local_player + sdk::FieldOffsets::UPlayer_PlayerController);
+        if (!live_uobject(ctx.controller))
+        {
+            ctx.stage = "local_pawn_unavailable";
+            ctx.message = "LocalPlayers[0].PlayerController unavailable";
+            return ctx;
+        }
+        ctx.k2_get_pawn_function = ref.find_function(ctx.controller, "K2_GetPawn");
+        if (!ctx.k2_get_pawn_function)
+        {
+            ctx.stage = "local_pawn_unavailable";
+            ctx.message = "PlayerController.K2_GetPawn unavailable";
+            return ctx;
+        }
+        sdk::Controller_K2_GetPawn pawn_params{};
+        std::string process_failure{};
+        if (!process_event(ctx.controller, ctx.k2_get_pawn_function, reinterpret_cast<std::uint8_t*>(&pawn_params), process_failure))
+        {
+            ctx.stage = "local_pawn_unavailable";
+            ctx.message = "K2_GetPawn ProcessEvent failed: " + process_failure;
+            return ctx;
+        }
+        ctx.pawn = reinterpret_cast<std::uintptr_t>(pawn_params.ReturnValue);
+        if (!live_uobject(ctx.pawn))
+        {
+            ctx.stage = "local_pawn_unavailable";
+            ctx.message = "K2_GetPawn returned null or invalid pawn";
+            return ctx;
+        }
+        ctx.k2_get_actor_location_function = ref.find_function(ctx.pawn, "K2_GetActorLocation");
+        if (ctx.k2_get_actor_location_function)
+        {
+            sdk::Actor_K2_GetActorLocation location_params{};
+            std::string location_failure{};
+            if (process_event(ctx.pawn, ctx.k2_get_actor_location_function, reinterpret_cast<std::uint8_t*>(&location_params), location_failure))
+            {
+                ctx.body_world_position = location_params.ReturnValue;
+            }
+        }
+        ctx.component = safe_read<std::uintptr_t>(ctx.pawn + sdk::FieldOffsets::BP_FirstPersonCharacter_RuntimePaintable);
+        auto component_class = lower_copy(ref.class_name(ctx.component));
+        if (!live_uobject(ctx.component) || !contains_text(component_class, "runtimepaint"))
+        {
+            std::string component_failure{};
+            const auto selected = find_component(ref, component_failure);
+            if (live_uobject(selected.component))
+            {
+                ctx.component = selected.component;
+                if (live_uobject(selected.pawn))
+                {
+                    ctx.pawn = selected.pawn;
+                }
+                component_class = lower_copy(ref.class_name(ctx.component));
+            }
+        }
+        if (!live_uobject(ctx.component) || !contains_text(component_class, "runtimepaint"))
+        {
+            ctx.stage = "paint_component_unavailable";
+            ctx.message = "BP_FirstPersonCharacter.RuntimePaintable unavailable";
+            return ctx;
+        }
+        ctx.server_paint_batch_function = ref.find_function(ctx.component, "ServerPaintBatch");
+        ctx.ok = true;
+        ctx.stage = "sdk_ready";
+        ctx.message = "SDK context ready";
+        return ctx;
+    }
+
+    struct SdkNativeFrontSampleResult
+    {
+        std::vector<FrontSample> samples{};
+        std::string failure{};
+        std::uintptr_t mesh{0};
+        std::uintptr_t hit_test_function{0};
+        std::string sampling_backend{"unset"};
+        int viewport_width{0};
+        int viewport_height{0};
+        int min_front_hits{0};
+        int target_front_hits{0};
+        int hard_attempt_budget{0};
+    };
+
+    struct SdkFrontCaptureResult
+    {
+        bool ok{false};
+        std::string failure{"front_capture_unavailable"};
+        std::vector<FrontSample> samples{};
+        std::string texture_source{"bulk_calibrated_direct_texture_unavailable"};
+        int width{0};
+        int height{0};
+        std::uintptr_t render_target{0};
+        std::uintptr_t capture_actor{0};
+        std::uintptr_t capture_component{0};
+        std::uintptr_t read_function{0};
+        bool render_target_created{false};
+        bool capture_actor_spawned{false};
+        bool capture_component_found{false};
+        bool texture_target_written{false};
+        bool hide_component_called{false};
+        bool capture_scene_called{false};
+        double capture_fov{90.0};
+        int viewport_width{0};
+        int viewport_height{0};
+        int requested_texture_width{0};
+        int requested_texture_height{0};
+        double viewport_aspect{1.0};
+        double capture_aspect{1.0};
+        double capture_scale_x{1.0};
+        double capture_scale_y{1.0};
+        std::string capture_resolution_source{"viewport"};
+        std::uintptr_t camera_manager{0};
+        bool camera_location_used{false};
+        bool camera_rotation_used{false};
+        bool camera_fov_used{false};
+        std::string camera_manager_source{"function:GetPlayerCameraManager"};
+        std::string camera_location_source{"deproject_center"};
+        std::string camera_rotation_source{"deproject_center_ray"};
+        std::string camera_fov_source{"deproject_horizontal"};
+        sdk::FVector capture_location{};
+        sdk::FVector capture_direction{};
+        int project_attempts{0};
+        int project_success{0};
+        int project_failed{0};
+        int project_out_of_view{0};
+        int project_world_capture{0};
+        double project_delta_sum_px{0.0};
+        double project_delta_max_px{0.0};
+        int read_attempts{0};
+        int read_success{0};
+        int missing_color{0};
+        double raw_rgb_min{0.0};
+        double raw_rgb_max{0.0};
+        double raw_rgb_avg{0.0};
+        double raw_luma_range{0.0};
+        int raw_whiteish_samples{0};
+        double resolved_rgb_delta_avg{0.0};
+        double resolved_rgb_delta_max{0.0};
+        int resolved_rgb_delta_samples{0};
+        double rgb_min{0.0};
+        double rgb_max{0.0};
+        double rgb_avg{0.0};
+        double luma_range{0.0};
+        int whiteish_samples{0};
+        bool uniform{false};
+        bool all_whiteish{false};
+        bool bulk_readback_used{false};
+        bool image_bulk_calibration_ok{false};
+        int bulk_candidates{0};
+        int bulk_available{0};
+        int bulk_decoded_pixels{0};
+        int bulk_function_attempts{0};
+        int bulk_process_event_ok{0};
+        int bulk_array_param_count{0};
+        int bulk_array_offset{-1};
+        int bulk_array_num{0};
+        int bulk_array_max{0};
+        int bulk_array_element_size{0};
+        std::string bulk_decode_candidate_type{"none"};
+        int bulk_calibration_samples{0};
+        int bulk_calibration_pairs{0};
+        double bulk_calibration_best_median{0.0};
+        double bulk_calibration_runner_up_median{0.0};
+        std::string bulk_backend{"not_run"};
+        std::string bulk_inner_type{"none"};
+        std::string bulk_bool_variant{"none"};
+        std::string bulk_color_transform{"identity"};
+        std::string bulk_calibration_backend{"not_run"};
+        std::string capture_transform_backend{"project_world_to_screen_scaled"};
+    };
+
+    auto sdk_find_object_named(Reflection& ref, const char* object_name) -> std::uintptr_t
+    {
+        std::uintptr_t found = 0;
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (ref.object_name(object) == object_name)
+            {
+                found = object;
+                return true;
+            }
+            return false;
+        });
+        return found;
+    }
+
+    struct ScriptStringParam
+    {
+        wchar_t* data{nullptr};
+        int num{0};
+        int max{0};
+    };
+
+    auto widen_ascii(const std::string& text) -> std::wstring
+    {
+        std::wstring out{};
+        out.reserve(text.size());
+        for (const char ch : text)
+        {
+            out.push_back(static_cast<unsigned char>(ch) < 128 ? static_cast<wchar_t>(ch) : L'?');
+        }
+        return out;
+    }
+
+    auto sdk_write_fstring_param(std::uintptr_t prop,
+                                 std::uint8_t* container,
+                                 const std::string& text,
+                                 std::vector<std::wstring>& backing) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        backing.push_back(widen_ascii(text));
+        auto& wide = backing.back();
+        auto* dest = reinterpret_cast<ScriptStringParam*>(container + offset);
+        dest->data = wide.empty() ? nullptr : wide.data();
+        dest->num = static_cast<int>(wide.size()) + 1;
+        dest->max = dest->num;
+        return true;
+    }
+
+    auto sdk_write_linear_color_param(Reflection& ref,
+                                      std::uintptr_t prop,
+                                      std::uint8_t* container,
+                                      bool failure) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        auto* dest = container + offset;
+        const auto st = struct_type(ref, prop, {"R", "G", "B", "A"});
+        if (!st)
+        {
+            return false;
+        }
+        bool wrote = false;
+        if (const auto p = find_property_any(ref, st, {"R"})) wrote = write_number(ref, p, dest, 1.0) || wrote;
+        if (const auto p = find_property_any(ref, st, {"G"})) wrote = write_number(ref, p, dest, failure ? 0.08 : 0.72) || wrote;
+        if (const auto p = find_property_any(ref, st, {"B"})) wrote = write_number(ref, p, dest, failure ? 0.06 : 0.12) || wrote;
+        if (const auto p = find_property_any(ref, st, {"A"})) wrote = write_number(ref, p, dest, 1.0) || wrote;
+        return wrote;
+    }
+
+    auto sdk_screen_message(Reflection& ref,
+                            const SdkContext& ctx,
+                            const std::string& stage,
+                            const std::string& message,
+                            bool failure = false,
+                            double duration = 2.0) -> bool
+    {
+        static std::string last_stage{};
+        static auto last_emit = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (!failure && stage == last_stage &&
+            std::chrono::duration<double>(now - last_emit).count() < 1.0)
+        {
+            return true;
+        }
+        last_stage = stage;
+        last_emit = now;
+
+        const std::string text = failure ? ("FAILED " + stage + ": " + message) : message;
+        const auto library = sdk_find_object_named(ref, "Default__KismetSystemLibrary");
+        const auto print_function = library ? ref.find_function(library, "PrintString") : 0;
+        if (library && print_function)
+        {
+            const auto params_size = safe_read<int>(print_function + OffPropertiesSize, 0);
+            if (params_size > 0 && params_size <= 4096)
+            {
+                std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+                std::vector<std::wstring> backing{};
+                backing.reserve(4);
+                bool wrote_string = false;
+                for (auto prop = safe_read<std::uintptr_t>(print_function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+                {
+                    const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+                    if (contains_text(name, "world") || contains_text(name, "context"))
+                    {
+                        sdk_write_object(prop, params.data(), ctx.world ? ctx.world : ctx.controller);
+                    }
+                    else if (contains_text(name, "string") || contains_text(name, "message"))
+                    {
+                        wrote_string = sdk_write_fstring_param(prop, params.data(), text, backing) || wrote_string;
+                    }
+                    else if (contains_text(name, "screen"))
+                    {
+                        write_bool(prop, params.data(), true);
+                    }
+                    else if (contains_text(name, "log"))
+                    {
+                        write_bool(prop, params.data(), false);
+                    }
+                    else if (contains_text(name, "duration"))
+                    {
+                        write_number(ref, prop, params.data(), failure ? 10.0 : duration);
+                    }
+                    else if (contains_text(name, "color"))
+                    {
+                        sdk_write_linear_color_param(ref, prop, params.data(), failure);
+                    }
+                }
+                std::string pe_failure{};
+                if (wrote_string && process_event(library, print_function, params.data(), pe_failure))
+                {
+                    return true;
+                }
+            }
+        }
+
+        const auto client_message = ctx.controller ? ref.find_function(ctx.controller, "ClientMessage") : 0;
+        if (ctx.controller && client_message)
+        {
+            const auto params_size = safe_read<int>(client_message + OffPropertiesSize, 0);
+            if (params_size > 0 && params_size <= 4096)
+            {
+                std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+                std::vector<std::wstring> backing{};
+                backing.reserve(4);
+                bool wrote_string = false;
+                for (auto prop = safe_read<std::uintptr_t>(client_message + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+                {
+                    const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+                    if (contains_text(name, "string") || contains_text(name, "message") || name == "s")
+                    {
+                        wrote_string = sdk_write_fstring_param(prop, params.data(), text, backing) || wrote_string;
+                    }
+                    else if (contains_text(name, "life") || contains_text(name, "duration") || contains_text(name, "time"))
+                    {
+                        write_number(ref, prop, params.data(), failure ? 10.0 : duration);
+                    }
+                }
+                std::string pe_failure{};
+                if (wrote_string && process_event(ctx.controller, client_message, params.data(), pe_failure))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    auto sdk_format_progress_text(const std::string& stage,
+                                  const std::string& message,
+                                  int step,
+                                  int total_steps,
+                                  double elapsed_ms) -> std::string
+    {
+        const double progress = total_steps > 0 ? std::max(0.0, std::min(1.0, static_cast<double>(step) / static_cast<double>(total_steps))) : 0.0;
+        const double eta_ms = progress > 0.02 ? std::max(0.0, (elapsed_ms / progress) - elapsed_ms) : 0.0;
+        std::string out = "Meccha p " + std::to_string(step) + "/" + std::to_string(total_steps) +
+                          " " + stage +
+                          " " + std::to_string(static_cast<int>(progress * 100.0)) + "%" +
+                          " elapsed=" + std::to_string(static_cast<int>(elapsed_ms / 1000.0)) + "s";
+        if (eta_ms > 0.0)
+        {
+            out += " eta=" + std::to_string(static_cast<int>(eta_ms / 1000.0)) + "s";
+        }
+        out += "\n" + message;
+        return out;
+    }
+
+    auto sdk_object_is_or_belongs_to(Reflection& ref, std::uintptr_t object, std::uintptr_t target) -> bool
+    {
+        if (!live_uobject(object) || !live_uobject(target))
+        {
+            return false;
+        }
+        if (object == target)
+        {
+            return true;
+        }
+        for (auto current = object; live_uobject(current); current = safe_read<std::uintptr_t>(current + OffOuter))
+        {
+            if (current == target)
+            {
+                return true;
+            }
+        }
+        const auto owner = read_object_property_by_names(ref, object, {"OwnerPrivate", "Owner"});
+        if (owner == target)
+        {
+            return true;
+        }
+        for (auto current = owner; live_uobject(current); current = safe_read<std::uintptr_t>(current + OffOuter))
+        {
+            if (current == target)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    struct SdkFrontMeshCandidate
+    {
+        std::uintptr_t mesh{0};
+        std::string source{};
+    };
+
+    auto sdk_collect_front_mesh_candidates(Reflection& ref, const SdkContext& ctx) -> std::vector<SdkFrontMeshCandidate>
+    {
+        std::vector<SdkFrontMeshCandidate> out{};
+        auto add_candidate = [&](std::uintptr_t mesh, const char* source) {
+            if (!live_uobject(mesh))
+            {
+                return;
+            }
+            const auto cls = lower_copy(ref.class_name(mesh));
+            if (!contains_text(cls, "mesh"))
+            {
+                return;
+            }
+            for (const auto& existing : out)
+            {
+                if (existing.mesh == mesh)
+                {
+                    return;
+                }
+            }
+            out.push_back({mesh, source ? source : "unknown"});
+        };
+
+        add_candidate(call_no_params_return_object(ref, ctx.component, "GetInitializedPaintMesh"),
+                      "runtime_paint_get_initialized_paint_mesh");
+        add_candidate(read_object_property_by_names(ref,
+                                                    ctx.component,
+                                                    {"MeshComponent", "Mesh", "OwnerMesh"}),
+                      "runtime_paint_component_property");
+        add_candidate(read_object_property_by_names(ref,
+                                                    ctx.pawn,
+                                                    {"Mesh",
+                                                     "FirstPersonMesh",
+                                                     "BodyMesh",
+                                                     "CharacterMesh",
+                                                     "SkeletalMeshComponent",
+                                                     "TargetMeshComponent"}),
+                      "pawn_mesh_property");
+
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!live_uobject(object))
+            {
+                return false;
+            }
+            const auto cls = lower_copy(ref.class_name(object));
+            if (!contains_text(cls, "meshcomponent"))
+            {
+                return false;
+            }
+            if (sdk_object_is_or_belongs_to(ref, object, ctx.pawn))
+            {
+                add_candidate(object, "pawn_owned_mesh_component_scan");
+            }
+            return false;
+        });
+        return out;
+    }
+
+    auto sdk_front_mesh_candidates_json(Reflection& ref, const std::vector<SdkFrontMeshCandidate>& candidates) -> std::string
+    {
+        std::string out = "[";
+        bool first = true;
+        for (const auto& candidate : candidates)
+        {
+            if (!first)
+            {
+                out += ",";
+            }
+            first = false;
+            out += "{\"mesh\":\"" + hex_address(candidate.mesh) + "\"";
+            out += ",\"source\":\"" + json_escape(candidate.source) + "\"";
+            out += ",\"class\":\"" + json_escape(ref.class_name(candidate.mesh)) + "\"}";
+        }
+        out += "]";
+        return out;
+    }
+
+    auto sdk_find_front_mesh(Reflection& ref, const SdkContext& ctx) -> std::uintptr_t
+    {
+        const auto candidates = sdk_collect_front_mesh_candidates(ref, ctx);
+        if (!candidates.empty())
+        {
+            return candidates.front().mesh;
+        }
+        return 0;
+    }
+
+    auto sdk_find_screen_space_brush_query(Reflection& ref, const SdkContext& ctx) -> std::uintptr_t
+    {
+        std::uintptr_t fallback = 0;
+        std::uintptr_t owned = 0;
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!live_uobject(object))
+            {
+                return false;
+            }
+            const auto cls = lower_copy(ref.class_name(object));
+            const auto name = lower_copy(ref.object_name(object));
+            if (!contains_text(cls, "screenspacebrushquery") && !contains_text(name, "screenspacebrushquery"))
+            {
+                return false;
+            }
+            if (!ref.find_function(object, "QueryFromWorldRay"))
+            {
+                return false;
+            }
+            if (!fallback)
+            {
+                fallback = object;
+            }
+            if (sdk_object_is_or_belongs_to(ref, object, ctx.pawn) || sdk_object_is_or_belongs_to(ref, object, ctx.controller))
+            {
+                owned = object;
+                return true;
+            }
+            return false;
+        });
+        return owned ? owned : fallback;
+    }
+
+    auto sdk_configure_screen_space_brush_query(Reflection& ref, std::uintptr_t query, std::uintptr_t pawn, std::uintptr_t mesh) -> bool
+    {
+        if (!live_uobject(query) || !live_uobject(pawn))
+        {
+            return false;
+        }
+        sdk_call_no_params(ref, query, "ResetFilter");
+        sdk_call_no_params(ref, query, "ClearTargetComponents");
+        sdk_call_no_params(ref, query, "ClearTargetActors");
+        sdk_call_no_params(ref, query, "ClearNoCollisionMeshTargets");
+        sdk_call_no_params(ref, query, "ClearIgnoreActors");
+        sdk_call_single_number(ref, query, "SetUVChannel", 0.0);
+        sdk_call_single_number(ref, query, "SetMaxTraceDistance", 12000.0);
+        sdk_call_single_bool(ref, query, "SetTraceComplex", true);
+        sdk_call_single_bool(ref, query, "SetAllowNoCollisionMesh", true);
+        const bool actor_ok = sdk_call_object_param(ref, query, "AddTargetActor", pawn);
+        const bool component_ok = mesh && sdk_call_object_param(ref, query, "AddTargetComponent", mesh);
+        const bool no_collision_ok = mesh && sdk_call_object_param(ref, query, "AddNoCollisionMeshTarget", mesh);
+        return ref.find_function(query, "QueryFromWorldRay") && (actor_ok || component_ok || no_collision_ok);
+    }
+
+    auto sdk_get_viewport_info(Reflection& ref, const SdkContext& ctx) -> SdkViewportInfo
+    {
+        SdkViewportInfo out{};
+        const auto function = ref.find_function(ctx.controller, "GetViewportSize");
+        if (!function)
+        {
+            return out;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return out;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        std::string failure{};
+        if (!process_event(ctx.controller, function, params.data(), failure))
+        {
+            return out;
+        }
+        std::vector<int> numeric_values{};
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "returnvalue")
+            {
+                continue;
+            }
+            const int value = static_cast<int>(sdk_read_number(ref, prop, params.data()));
+            if (value <= 0)
+            {
+                continue;
+            }
+            if (contains_text(name, "sizex") || contains_text(name, "width") || name == "x")
+            {
+                out.width = value;
+            }
+            else if (contains_text(name, "sizey") || contains_text(name, "height") || name == "y")
+            {
+                out.height = value;
+            }
+            numeric_values.push_back(value);
+        }
+        if ((out.width <= 0 || out.height <= 0) && numeric_values.size() >= 2)
+        {
+            out.width = numeric_values[0];
+            out.height = numeric_values[1];
+        }
+        return out;
+    }
+
+    auto sdk_deproject_screen_position(Reflection& ref, const SdkContext& ctx, double screen_x, double screen_y) -> SdkDeprojectRay
+    {
+        SdkDeprojectRay out{};
+        const auto function = ref.find_function(ctx.controller, "DeprojectScreenPositionToWorld");
+        if (!function)
+        {
+            out.failure = "deproject_function_unavailable";
+            return out;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 2048)
+        {
+            out.failure = "deproject_params_size_invalid";
+            return out;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        int numeric_index = 0;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "returnvalue")
+            {
+                continue;
+            }
+            if (strict_vector_struct_type(ref, prop, {"X", "Y", "Z"}, 12))
+            {
+                continue;
+            }
+            if (contains_text(name, "screenx") || contains_text(name, "screen_x") || name == "x" || numeric_index == 0)
+            {
+                write_number(ref, prop, params.data(), screen_x);
+                ++numeric_index;
+            }
+            else if (contains_text(name, "screeny") || contains_text(name, "screen_y") || name == "y" || numeric_index == 1)
+            {
+                write_number(ref, prop, params.data(), screen_y);
+                ++numeric_index;
+            }
+        }
+        std::string failure{};
+        if (!process_event(ctx.controller, function, params.data(), failure))
+        {
+            out.failure = "deproject_process_event_failed:" + failure;
+            return out;
+        }
+        out.ok = read_return_bool(ref, function, params.data());
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "returnvalue")
+            {
+                continue;
+            }
+            if (!strict_vector_struct_type(ref, prop, {"X", "Y", "Z"}, 12))
+            {
+                continue;
+            }
+            if (contains_text(name, "worldlocation") || contains_text(name, "world_location") || contains_text(name, "location"))
+            {
+                sdk_read_vector3(ref, prop, params.data(), out.location);
+            }
+            else if (contains_text(name, "worlddirection") || contains_text(name, "world_direction") || contains_text(name, "direction"))
+            {
+                sdk::FVector direction{};
+                if (sdk_read_vector3(ref, prop, params.data(), direction))
+                {
+                    out.direction = sdk_vec_normalize(direction);
+                }
+            }
+        }
+        if (!out.ok)
+        {
+            out.failure = "deproject_return_false";
+        }
+        else if (sdk_vec_len(out.direction) < 0.01)
+        {
+            out.ok = false;
+            out.failure = "deproject_direction_invalid";
+        }
+        return out;
+    }
+
+    struct SdkRecordedStrokeCountParams
+    {
+        int ReturnValue{0};
+    };
+    static_assert(sizeof(SdkRecordedStrokeCountParams) == 0x04, "GetRecordedStrokeCount params layout mismatch");
+
+    struct SdkRuntimePaintReplicationPressure
+    {
+        int QueuedBatchCount{0};
+        int QueuedStrokeCount{0};
+        int MaxStrokesPerTick{0};
+        float EstimatedTicksToDrain{0.0f};
+    };
+    static_assert(sizeof(SdkRuntimePaintReplicationPressure) == 0x10, "RuntimePaintReplicationPressure layout mismatch");
+
+    struct SdkReplicationManagerGetQueuedStrokeCountParams
+    {
+        int ReturnValue{0};
+    };
+    static_assert(sizeof(SdkReplicationManagerGetQueuedStrokeCountParams) == 0x04, "GetQueuedStrokeCount params layout mismatch");
+
+    struct SdkReplicationManagerGetQueuedStrokeCountForComponentParams
+    {
+        void* PaintComponent{nullptr};
+        int ReturnValue{0};
+        std::uint8_t Pad_C[0x4]{};
+    };
+    static_assert(sizeof(SdkReplicationManagerGetQueuedStrokeCountForComponentParams) == 0x10,
+                  "GetQueuedStrokeCountForComponent params layout mismatch");
+
+    struct SdkReplicationManagerGetReplicationPressureParams
+    {
+        SdkRuntimePaintReplicationPressure ReturnValue{};
+    };
+    static_assert(sizeof(SdkReplicationManagerGetReplicationPressureParams) == 0x10,
+                  "GetReplicationPressure params layout mismatch");
+
+    struct SdkReplicationSnapshot
+    {
+        bool recorded_count_available{false};
+        int recorded_count{-1};
+        bool manager_available{false};
+        std::uintptr_t manager{0};
+        bool manager_queued_count_available{false};
+        int manager_queued_count{-1};
+        bool manager_component_queued_count_available{false};
+        int manager_component_queued_count{-1};
+        bool manager_pressure_available{false};
+        SdkRuntimePaintReplicationPressure pressure{};
+        std::string failure{};
+    };
+
+    auto sdk_has_replicated_api(const SdkContext& ctx) -> bool
+    {
+        return ctx.server_paint_batch_function != 0;
+    }
+
+    auto sdk_find_replication_manager(Reflection& ref) -> std::uintptr_t
+    {
+        return ref.find_first_instance("RuntimePaintReplicationManager");
+    }
+
+    auto sdk_read_recorded_stroke_count(Reflection& ref, std::uintptr_t component, int& out, std::string& failure) -> bool
+    {
+        if (!live_uobject(component))
+        {
+            failure = "paint_component_unavailable";
+            return false;
+        }
+        const auto function = ref.find_function(component, "GetRecordedStrokeCount");
+        if (!function)
+        {
+            failure = "GetRecordedStrokeCount_unavailable";
+            return false;
+        }
+        SdkRecordedStrokeCountParams params{};
+        if (!process_event(component, function, reinterpret_cast<std::uint8_t*>(&params), failure))
+        {
+            return false;
+        }
+        out = params.ReturnValue;
+        return true;
+    }
+
+    auto sdk_capture_replication_snapshot(Reflection& ref, std::uintptr_t component) -> SdkReplicationSnapshot
+    {
+        SdkReplicationSnapshot snapshot{};
+        std::string failure{};
+        int recorded_count = -1;
+        if (sdk_read_recorded_stroke_count(ref, component, recorded_count, failure))
+        {
+            snapshot.recorded_count_available = true;
+            snapshot.recorded_count = recorded_count;
+        }
+        else if (snapshot.failure.empty())
+        {
+            snapshot.failure = failure;
+        }
+
+        const auto manager = sdk_find_replication_manager(ref);
+        snapshot.manager = manager;
+        snapshot.manager_available = live_uobject(manager);
+        if (!snapshot.manager_available)
+        {
+            if (snapshot.failure.empty())
+            {
+                snapshot.failure = "RuntimePaintReplicationManager_unavailable";
+            }
+            return snapshot;
+        }
+
+        if (const auto function = ref.find_function(manager, "GetQueuedStrokeCount"))
+        {
+            SdkReplicationManagerGetQueuedStrokeCountParams params{};
+            failure.clear();
+            if (process_event(manager, function, reinterpret_cast<std::uint8_t*>(&params), failure))
+            {
+                snapshot.manager_queued_count_available = true;
+                snapshot.manager_queued_count = params.ReturnValue;
+            }
+            else if (snapshot.failure.empty())
+            {
+                snapshot.failure = failure;
+            }
+        }
+        else if (snapshot.failure.empty())
+        {
+            snapshot.failure = "GetQueuedStrokeCount_unavailable";
+        }
+
+        if (const auto function = ref.find_function(manager, "GetQueuedStrokeCountForComponent"))
+        {
+            SdkReplicationManagerGetQueuedStrokeCountForComponentParams params{};
+            params.PaintComponent = reinterpret_cast<void*>(component);
+            failure.clear();
+            if (process_event(manager, function, reinterpret_cast<std::uint8_t*>(&params), failure))
+            {
+                snapshot.manager_component_queued_count_available = true;
+                snapshot.manager_component_queued_count = params.ReturnValue;
+            }
+            else if (snapshot.failure.empty())
+            {
+                snapshot.failure = failure;
+            }
+        }
+        else if (snapshot.failure.empty())
+        {
+            snapshot.failure = "GetQueuedStrokeCountForComponent_unavailable";
+        }
+
+        if (const auto function = ref.find_function(manager, "GetReplicationPressure"))
+        {
+            SdkReplicationManagerGetReplicationPressureParams params{};
+            failure.clear();
+            if (process_event(manager, function, reinterpret_cast<std::uint8_t*>(&params), failure))
+            {
+                snapshot.manager_pressure_available = true;
+                snapshot.pressure = params.ReturnValue;
+            }
+            else if (snapshot.failure.empty())
+            {
+                snapshot.failure = failure;
+            }
+        }
+        else if (snapshot.failure.empty())
+        {
+            snapshot.failure = "GetReplicationPressure_unavailable";
+        }
+
+        return snapshot;
+    }
+
+    auto sdk_replication_snapshot_metadata(const char* prefix, const SdkReplicationSnapshot& snapshot) -> std::string
+    {
+        std::string key(prefix ? prefix : "replication");
+        return ",\"" + key + "_recorded_count_available\":" + json_bool(snapshot.recorded_count_available) +
+               ",\"" + key + "_recorded_count\":" + std::to_string(snapshot.recorded_count) +
+               ",\"" + key + "_manager_available\":" + json_bool(snapshot.manager_available) +
+               ",\"" + key + "_manager\":\"" + hex_address(snapshot.manager) + "\"" +
+               ",\"" + key + "_manager_queued_count_available\":" + json_bool(snapshot.manager_queued_count_available) +
+               ",\"" + key + "_manager_queued_count\":" + std::to_string(snapshot.manager_queued_count) +
+               ",\"" + key + "_manager_component_queued_count_available\":" + json_bool(snapshot.manager_component_queued_count_available) +
+               ",\"" + key + "_manager_component_queued_count\":" + std::to_string(snapshot.manager_component_queued_count) +
+               ",\"" + key + "_manager_pressure_available\":" + json_bool(snapshot.manager_pressure_available) +
+               ",\"" + key + "_queued_batch_count\":" + std::to_string(snapshot.pressure.QueuedBatchCount) +
+               ",\"" + key + "_queued_stroke_count\":" + std::to_string(snapshot.pressure.QueuedStrokeCount) +
+               ",\"" + key + "_max_strokes_per_tick\":" + std::to_string(snapshot.pressure.MaxStrokesPerTick) +
+               ",\"" + key + "_estimated_ticks_to_drain\":" + std::to_string(snapshot.pressure.EstimatedTicksToDrain) +
+               ",\"" + key + "_failure\":\"" + json_escape(snapshot.failure) + "\"";
+    }
+
+    auto sdk_srgb_to_linear_unit(double value) -> double
+    {
+        const auto srgb = clamp01(value);
+        if (srgb <= 0.04045)
+        {
+            return srgb / 12.92;
+        }
+        return std::pow((srgb + 0.055) / 1.055, 2.4);
+    }
+
+    auto sdk_make_channel(double r,
+                          double g,
+                          double b,
+                          double metallic,
+                          double roughness,
+                          sdk::EPaintChannelApplyMode apply_mode) -> sdk::FPaintChannelData
+    {
+        sdk::FPaintChannelData data{};
+        data.AlbedoColor.R = static_cast<float>(clamp01(r));
+        data.AlbedoColor.G = static_cast<float>(clamp01(g));
+        data.AlbedoColor.B = static_cast<float>(clamp01(b));
+        data.AlbedoColor.A = 1.0f;
+        data.Metallic = static_cast<float>(clamp01(metallic));
+        data.Roughness = static_cast<float>(clamp01(roughness));
+        data.Height = 0.0f;
+        data.ApplyMode = apply_mode;
+        return data;
+    }
+
+    auto sdk_make_stroke(double u,
+                         double v,
+                         const sdk::FPaintChannelData& channel,
+                         const sdk::FRuntimeBrushSettings& brush,
+                         sdk::EPaintChannel target_channel,
+                         const sdk::FVector& world_position) -> sdk::FPaintStroke
+    {
+        sdk::FPaintStroke stroke{};
+        stroke.Uv.X = clamp01(u);
+        stroke.Uv.Y = clamp01(v);
+        stroke.WorldPosition = world_position;
+        stroke.bHasWorldPosition = true;
+        stroke.bHasLocalPosition = false;
+        stroke.bHasSkeletalTriangleAnchor = false;
+        stroke.BrushSettings = brush;
+        stroke.ChannelData = channel;
+        stroke.TargetChannel = target_channel;
+        stroke.EffectiveBrushWorldRadius = brush.Radius;
+        stroke.EffectiveSubdivisionLevel = 0;
+        stroke.EffectiveSubdivisionPixelSize = 1.0f;
+        stroke.EffectiveTemplateResolution = 0;
+        stroke.EffectiveMaxGeneratedBrushTriangles = 0;
+        stroke.EffectiveGutterExpandPixels = 0;
+        return stroke;
+    }
+
+    auto sdk_make_uv_stroke(double u,
+                            double v,
+                            const sdk::FPaintChannelData& channel,
+                            const sdk::FRuntimeBrushSettings& brush,
+                            sdk::EPaintChannel target_channel) -> sdk::FPaintStroke
+    {
+        auto stroke = sdk_make_stroke(u, v, channel, brush, target_channel, {});
+        stroke.bHasWorldPosition = false;
+        stroke.WorldPosition = {};
+        return stroke;
+    }
+
+    auto sdk_call_server_paint_batch(const SdkContext& ctx,
+                                     const std::vector<sdk::FPaintStroke>& strokes,
+                                     std::size_t offset,
+                                     std::size_t count,
+                                     std::string& failure) -> bool
+    {
+        if (!ctx.server_paint_batch_function || count == 0)
+        {
+            failure = "server_paint_batch_unavailable";
+            return false;
+        }
+        if (!live_uobject(ctx.component))
+        {
+            failure = "paint_component_unavailable";
+            return false;
+        }
+        sdk::RuntimePaintableComponent_ServerPaintBatch params{};
+        params.Batch.Strokes.Data = const_cast<sdk::FPaintStroke*>(strokes.data() + offset);
+        params.Batch.Strokes.Num = static_cast<std::int32_t>(count);
+        params.Batch.Strokes.Max = static_cast<std::int32_t>(count);
+        if (!process_event(ctx.component, ctx.server_paint_batch_function, reinterpret_cast<std::uint8_t*>(&params), failure))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    struct SdkFrontColorStats
+    {
+        int count{0};
+        double min_rgb{0.0};
+        double max_rgb{0.0};
+        double avg_rgb{0.0};
+        int whiteish_samples{0};
+        bool all_whiteish{false};
+    };
+
+    auto sdk_front_color_stats(const std::vector<sdk::FPaintStroke>& strokes) -> SdkFrontColorStats
+    {
+        SdkFrontColorStats stats{};
+        stats.count = static_cast<int>(strokes.size());
+        bool initialized = false;
+        double sum = 0.0;
+        int channels = 0;
+        for (const auto& stroke : strokes)
+        {
+            const double values[]{
+                stroke.ChannelData.AlbedoColor.R,
+                stroke.ChannelData.AlbedoColor.G,
+                stroke.ChannelData.AlbedoColor.B,
+            };
+            bool sample_whiteish = true;
+            for (const auto value : values)
+            {
+                if (!initialized)
+                {
+                    stats.min_rgb = value;
+                    stats.max_rgb = value;
+                    initialized = true;
+                }
+                stats.min_rgb = std::min(stats.min_rgb, value);
+                stats.max_rgb = std::max(stats.max_rgb, value);
+                sum += value;
+                ++channels;
+                if (value < 0.97)
+                {
+                    sample_whiteish = false;
+                }
+            }
+            if (sample_whiteish)
+            {
+                ++stats.whiteish_samples;
+            }
+        }
+        stats.avg_rgb = channels > 0 ? sum / static_cast<double>(channels) : 0.0;
+        stats.all_whiteish = stats.count > 0 && stats.whiteish_samples == stats.count;
+        return stats;
+    }
+
+    auto sdk_front_color_metadata(const SdkFrontColorStats& stats) -> std::string
+    {
+        return ",\"front_rgb_count\":" + std::to_string(stats.count) +
+               ",\"front_rgb_min\":" + std::to_string(stats.min_rgb) +
+               ",\"front_rgb_max\":" + std::to_string(stats.max_rgb) +
+               ",\"front_rgb_avg\":" + std::to_string(stats.avg_rgb) +
+               ",\"front_rgb_whiteish_samples\":" + std::to_string(stats.whiteish_samples) +
+               ",\"front_rgb_all_whiteish\":" + json_bool(stats.all_whiteish);
+    }
+
+    auto sdk_function_caller(Reflection& ref, std::uintptr_t function) -> std::uintptr_t
+    {
+        const auto owner_class = safe_read<std::uintptr_t>(function + OffOuter);
+        if (!owner_class)
+        {
+            return 0;
+        }
+        std::uintptr_t fallback = 0;
+        std::uintptr_t cdo = 0;
+        ref.for_each_object([&](std::uintptr_t object) {
+            if (!object || address_in_main_module(object))
+            {
+                return false;
+            }
+            if (safe_read<std::uintptr_t>(object + OffClass) != owner_class)
+            {
+                return false;
+            }
+            if (!fallback)
+            {
+                fallback = object;
+            }
+            if ((safe_read<std::uint32_t>(object + OffObjectFlags, 0) & RFClassDefaultObject) != 0)
+            {
+                cdo = object;
+                return true;
+            }
+            return false;
+        });
+        return cdo ? cdo : (fallback ? fallback : owner_class);
+    }
+
+    auto sdk_read_return_object_param(Reflection& ref, std::uintptr_t function, std::uint8_t* params) -> std::uintptr_t
+    {
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            if (lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName))) == "returnvalue")
+            {
+                return sdk_read_object(prop, params);
+            }
+        }
+        return 0;
+    }
+
+    auto sdk_read_return_number_param(Reflection& ref, std::uintptr_t function, std::uint8_t* params, double& value) -> bool
+    {
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            if (lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName))) == "returnvalue")
+            {
+                value = sdk_read_number(ref, prop, params);
+                return std::isfinite(value);
+            }
+        }
+        return false;
+    }
+
+    auto sdk_read_rotator(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, sdk::FRotator& out) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        auto* base = container + offset;
+        const auto st = struct_type(ref, prop, {"Pitch", "Yaw", "Roll"});
+        if (st)
+        {
+            bool read = false;
+            if (const auto p = find_property_any(ref, st, {"Pitch"})) { out.Pitch = sdk_read_number(ref, p, base); read = true; }
+            if (const auto p = find_property_any(ref, st, {"Yaw"})) { out.Yaw = sdk_read_number(ref, p, base); read = true; }
+            if (const auto p = find_property_any(ref, st, {"Roll"})) { out.Roll = sdk_read_number(ref, p, base); read = true; }
+            return read && std::isfinite(out.Pitch) && std::isfinite(out.Yaw) && std::isfinite(out.Roll);
+        }
+        const auto size = prop_element_size(prop);
+        if (size >= 24)
+        {
+            const auto* values = reinterpret_cast<double*>(base);
+            out = {values[0], values[1], values[2]};
+            return true;
+        }
+        if (size >= 12)
+        {
+            const auto* values = reinterpret_cast<float*>(base);
+            out = {values[0], values[1], values[2]};
+            return true;
+        }
+        return false;
+    }
+
+    auto sdk_read_return_vector3_param(Reflection& ref, std::uintptr_t function, std::uint8_t* params, sdk::FVector& value) -> bool
+    {
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            if (lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName))) == "returnvalue")
+            {
+                return sdk_read_vector3(ref, prop, params, value);
+            }
+        }
+        return false;
+    }
+
+    auto sdk_read_return_rotator_param(Reflection& ref, std::uintptr_t function, std::uint8_t* params, sdk::FRotator& value) -> bool
+    {
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            if (lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName))) == "returnvalue")
+            {
+                return sdk_read_rotator(ref, prop, params, value);
+            }
+        }
+        return false;
+    }
+
+    auto sdk_call_no_params_return_object(Reflection& ref, std::uintptr_t object, const char* function_name, std::string& failure) -> std::uintptr_t
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            failure = std::string(function_name) + "_unavailable";
+            return 0;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size < 0 || params_size > 4096)
+        {
+            failure = std::string(function_name) + "_params_size_invalid";
+            return 0;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(0, params_size)), 0);
+        if (!process_event(object, function, params.data(), failure))
+        {
+            failure = std::string(function_name) + "_process_event_failed:" + failure;
+            return 0;
+        }
+        return sdk_read_return_object_param(ref, function, params.data());
+    }
+
+    auto sdk_call_no_params_return_number(Reflection& ref, std::uintptr_t object, const char* function_name, double& value) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size < 0 || params_size > 4096)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(0, params_size)), 0);
+        std::string failure{};
+        return process_event(object, function, params.data(), failure) &&
+               sdk_read_return_number_param(ref, function, params.data(), value);
+    }
+
+    auto sdk_call_no_params_return_vector3(Reflection& ref, std::uintptr_t object, const char* function_name, sdk::FVector& value) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size < 0 || params_size > 4096)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(0, params_size)), 0);
+        std::string failure{};
+        return process_event(object, function, params.data(), failure) &&
+               sdk_read_return_vector3_param(ref, function, params.data(), value);
+    }
+
+    auto sdk_call_no_params_return_rotator(Reflection& ref, std::uintptr_t object, const char* function_name, sdk::FRotator& value) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size < 0 || params_size > 4096)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(0, params_size)), 0);
+        std::string failure{};
+        return process_event(object, function, params.data(), failure) &&
+               sdk_read_return_rotator_param(ref, function, params.data(), value);
+    }
+
+    // ---- Skeleton ESP (MechaSRC port: GetBoneName + GetSocketLocation) ---------
+    struct FNameLite
+    {
+        std::int32_t ComparisonIndex{0};
+        std::uint32_t Number{0};
+    };
+
+    struct SkelBonePairNames
+    {
+        const char* const* a;
+        std::size_t a_count;
+        const char* const* b;
+        std::size_t b_count;
+    };
+
+    static const char* const kSkelAliasHead[] = {"head", "Head", "neck", "neck_01", "Neck"};
+    static const char* const kSkelAliasNeck[] = {"neck", "neck_01", "Neck"};
+    static const char* const kSkelAliasSpine3[] = {"spine3", "spine_03", "spine_05", "Spine2", "Spine1", "spine"};
+    static const char* const kSkelAliasSpine2[] = {"spine2", "spine_02", "Spine1"};
+    static const char* const kSkelAliasSpine1[] = {"spine1", "spine_01", "spine", "pelvis", "Hips"};
+    static const char* const kSkelAliasPelvis[] = {"pelvis", "Hips", "spine1", "spine_01"};
+    static const char* const kSkelAliasClavL[] = {"shoulder_L", "clavicle_l", "LeftShoulder"};
+    static const char* const kSkelAliasUpperArmL[] = {"upper_arm_L", "upperarm_l", "LeftArm"};
+    static const char* const kSkelAliasLowerArmL[] = {"lower_arm_L", "lowerarm_l", "LeftForeArm"};
+    static const char* const kSkelAliasHandL[] = {"hand_L", "hand_l", "LeftHand"};
+    static const char* const kSkelAliasClavR[] = {"shoulder_R", "clavicle_r", "RightShoulder"};
+    static const char* const kSkelAliasUpperArmR[] = {"upper_arm_R", "upperarm_r", "RightArm"};
+    static const char* const kSkelAliasLowerArmR[] = {"lower_arm_R", "lowerarm_r", "RightForeArm"};
+    static const char* const kSkelAliasHandR[] = {"hand_R", "hand_r", "RightHand"};
+    static const char* const kSkelAliasThighL[] = {"hip_L", "thigh_l", "LeftUpLeg"};
+    static const char* const kSkelAliasCalfL[] = {"lower_leg_L", "calf_l", "LeftLeg"};
+    static const char* const kSkelAliasFootL[] = {"foot_l", "foot_L", "LeftFoot"};
+    static const char* const kSkelAliasThighR[] = {"hip_R", "thigh_r", "RightUpLeg"};
+    static const char* const kSkelAliasCalfR[] = {"lower_leg_R", "calf_r", "RightLeg"};
+    static const char* const kSkelAliasFootR[] = {"foot_r", "foot_R", "RightFoot"};
+
+    static const SkelBonePairNames kSkelConnections[] = {
+        {kSkelAliasHead, 5, kSkelAliasNeck, 3},
+        {kSkelAliasNeck, 3, kSkelAliasSpine3, 6},
+        {kSkelAliasSpine3, 6, kSkelAliasSpine2, 3},
+        {kSkelAliasSpine2, 3, kSkelAliasSpine1, 5},
+        {kSkelAliasClavL, 3, kSkelAliasSpine3, 6},
+        {kSkelAliasUpperArmL, 3, kSkelAliasClavL, 3},
+        {kSkelAliasLowerArmL, 3, kSkelAliasUpperArmL, 3},
+        {kSkelAliasHandL, 3, kSkelAliasLowerArmL, 3},
+        {kSkelAliasClavR, 3, kSkelAliasSpine3, 6},
+        {kSkelAliasUpperArmR, 3, kSkelAliasClavR, 3},
+        {kSkelAliasLowerArmR, 3, kSkelAliasUpperArmR, 3},
+        {kSkelAliasHandR, 3, kSkelAliasLowerArmR, 3},
+        {kSkelAliasThighL, 3, kSkelAliasPelvis, 4},
+        {kSkelAliasThighL, 3, kSkelAliasSpine1, 5},
+        {kSkelAliasCalfL, 3, kSkelAliasThighL, 3},
+        {kSkelAliasFootL, 3, kSkelAliasCalfL, 3},
+        {kSkelAliasThighR, 3, kSkelAliasPelvis, 4},
+        {kSkelAliasThighR, 3, kSkelAliasSpine1, 5},
+        {kSkelAliasCalfR, 3, kSkelAliasThighR, 3},
+        {kSkelAliasFootR, 3, kSkelAliasCalfR, 3},
+    };
+
+    std::mutex g_skel_cache_mutex;
+    std::unordered_map<std::uintptr_t, std::unordered_map<std::string, int>> g_skel_bone_index_cache;
+    std::atomic<std::uintptr_t> g_skel_get_bone_name_fn{0};
+    std::atomic<std::uintptr_t> g_skel_get_socket_location_fn{0};
+
+    struct SkelActorEntry
+    {
+        std::uintptr_t actor{0};
+        std::uintptr_t mesh{0};
+    };
+
+    auto skel_lower_copy(std::string value) -> std::string
+    {
+        for (auto& ch : value)
+        {
+            if (ch >= 'A' && ch <= 'Z')
+            {
+                ch = static_cast<char>(ch + 32);
+            }
+        }
+        return value;
+    }
+
+    auto skel_write_int32_prop(std::uintptr_t prop, std::uint8_t* container, std::int32_t value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        return safe_write<std::int32_t>(reinterpret_cast<std::uintptr_t>(container + offset), value);
+    }
+
+    auto skel_read_fname_prop(std::uintptr_t prop, std::uint8_t* container, FNameLite& out) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        out.ComparisonIndex = safe_read<std::int32_t>(reinterpret_cast<std::uintptr_t>(container + offset));
+        out.Number = safe_read<std::uint32_t>(reinterpret_cast<std::uintptr_t>(container + offset + 4));
+        return out.ComparisonIndex != 0;
+    }
+
+    auto skel_fname_valid(Reflection& ref, const FNameLite& name) -> bool
+    {
+        if (name.ComparisonIndex == 0)
+        {
+            return false;
+        }
+        const auto resolved = ref.names.resolve(static_cast<std::uint32_t>(name.ComparisonIndex));
+        return !resolved.empty() && resolved != "None";
+    }
+
+    auto skel_resolve_functions(Reflection& ref) -> std::pair<std::uintptr_t, std::uintptr_t>
+    {
+        auto bone_fn = g_skel_get_bone_name_fn.load();
+        auto socket_fn = g_skel_get_socket_location_fn.load();
+        if (!bone_fn)
+        {
+            if (const auto cls = ref.find_class("SkinnedMeshComponent"))
+            {
+                bone_fn = ref.find_function_in_class(cls, "GetBoneName");
+            }
+            if (!bone_fn)
+            {
+                if (const auto cls = ref.find_class("SkeletalMeshComponent"))
+                {
+                    bone_fn = ref.find_function_in_class(cls, "GetBoneName");
+                }
+            }
+            if (bone_fn)
+            {
+                g_skel_get_bone_name_fn.store(bone_fn);
+            }
+        }
+        if (!socket_fn)
+        {
+            if (const auto cls = ref.find_class("SceneComponent"))
+            {
+                socket_fn = ref.find_function_in_class(cls, "GetSocketLocation");
+            }
+            if (socket_fn)
+            {
+                g_skel_get_socket_location_fn.store(socket_fn);
+            }
+        }
+        return {bone_fn, socket_fn};
+    }
+
+    auto skel_write_fname_prop(std::uintptr_t prop, std::uint8_t* container, const FNameLite& value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        const auto base = reinterpret_cast<std::uintptr_t>(container + offset);
+        return safe_write<std::int32_t>(base, value.ComparisonIndex) &&
+               safe_write<std::uint32_t>(base + 4, value.Number);
+    }
+
+    auto skel_call_get_bone_name(Reflection& ref,
+                                 std::uintptr_t mesh,
+                                 std::uintptr_t function,
+                                 int bone_index,
+                                 FNameLite& out_name) -> bool
+    {
+        if (!live_uobject(mesh) || !function || bone_index < 0)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = skel_lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "boneindex")
+            {
+                wrote = skel_write_int32_prop(prop, params.data(), bone_index) || wrote;
+            }
+        }
+        if (!wrote)
+        {
+            // MechaSRC / UE layout: int32 BoneIndex @0, FName ReturnValue @8
+            safe_write<std::int32_t>(reinterpret_cast<std::uintptr_t>(params.data()), bone_index);
+            wrote = true;
+        }
+        std::string failure{};
+        if (!process_event(mesh, function, params.data(), failure))
+        {
+            return false;
+        }
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = skel_lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "returnvalue")
+            {
+                if (skel_read_fname_prop(prop, params.data(), out_name) && skel_fname_valid(ref, out_name))
+                {
+                    return true;
+                }
+                break;
+            }
+        }
+        out_name.ComparisonIndex = safe_read<std::int32_t>(reinterpret_cast<std::uintptr_t>(params.data() + 8));
+        out_name.Number = safe_read<std::uint32_t>(reinterpret_cast<std::uintptr_t>(params.data() + 12));
+        return skel_fname_valid(ref, out_name);
+    }
+
+    auto skel_call_get_socket_location(Reflection& ref,
+                                       std::uintptr_t mesh,
+                                       std::uintptr_t function,
+                                       const FNameLite& socket_name,
+                                       sdk::FVector& out_loc) -> bool
+    {
+        if (!live_uobject(mesh) || !function || !skel_fname_valid(ref, socket_name))
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = skel_lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "insocketname" || name == "socketname")
+            {
+                wrote = skel_write_fname_prop(prop, params.data(), socket_name) || wrote;
+            }
+        }
+        if (!wrote)
+        {
+            // MechaSRC / UE layout: FName InSocketName @0, FVector ReturnValue @8
+            safe_write<std::int32_t>(reinterpret_cast<std::uintptr_t>(params.data()),
+                                     socket_name.ComparisonIndex);
+            safe_write<std::uint32_t>(reinterpret_cast<std::uintptr_t>(params.data() + 4), socket_name.Number);
+            wrote = true;
+        }
+        std::string failure{};
+        if (!process_event(mesh, function, params.data(), failure))
+        {
+            return false;
+        }
+        if (sdk_read_return_vector3_param(ref, function, params.data(), out_loc))
+        {
+            return std::isfinite(out_loc.X) && std::isfinite(out_loc.Y) && std::isfinite(out_loc.Z);
+        }
+        out_loc.X = safe_read<double>(reinterpret_cast<std::uintptr_t>(params.data() + 8));
+        out_loc.Y = safe_read<double>(reinterpret_cast<std::uintptr_t>(params.data() + 16));
+        out_loc.Z = safe_read<double>(reinterpret_cast<std::uintptr_t>(params.data() + 24));
+        return std::isfinite(out_loc.X) && std::isfinite(out_loc.Y) && std::isfinite(out_loc.Z);
+    }
+
+    auto skel_resolve_actor_mesh(std::uintptr_t actor) -> std::uintptr_t
+    {
+        if (!live_uobject(actor))
+        {
+            return 0;
+        }
+        for (const std::uintptr_t off : {static_cast<std::uintptr_t>(0x0418),
+                                         static_cast<std::uintptr_t>(0x04C8),
+                                         static_cast<std::uintptr_t>(0x0328),
+                                         static_cast<std::uintptr_t>(0x02B0)})
+        {
+            const auto mesh = safe_read<std::uintptr_t>(actor + off);
+            if (live_uobject(mesh))
+            {
+                return mesh;
+            }
+        }
+        return 0;
+    }
+
+    auto skel_ensure_bone_map(Reflection& ref,
+                              std::uintptr_t mesh,
+                              std::uintptr_t get_bone_name_fn,
+                              std::unordered_map<std::string, int>& out_map) -> bool
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_skel_cache_mutex);
+            const auto it = g_skel_bone_index_cache.find(mesh);
+            if (it != g_skel_bone_index_cache.end() && !it->second.empty())
+            {
+                out_map = it->second;
+                return true;
+            }
+        }
+        out_map.clear();
+        for (int i = 0; i < 300; ++i)
+        {
+            FNameLite bone_name{};
+            if (!skel_call_get_bone_name(ref, mesh, get_bone_name_fn, i, bone_name))
+            {
+                if (i > 5 && !out_map.empty())
+                {
+                    break;
+                }
+                continue;
+            }
+            const std::string resolved = ref.names.resolve(static_cast<std::uint32_t>(bone_name.ComparisonIndex));
+            if (resolved.empty() || resolved == "None")
+            {
+                if (i > 5 && !out_map.empty())
+                {
+                    break;
+                }
+                continue;
+            }
+            out_map[skel_lower_copy(resolved)] = i;
+        }
+        if (out_map.empty())
+        {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(g_skel_cache_mutex);
+        g_skel_bone_index_cache[mesh] = out_map;
+        return true;
+    }
+
+    auto skel_find_bone_index(const std::unordered_map<std::string, int>& bone_map,
+                              const char* const* aliases,
+                              std::size_t alias_count) -> int
+    {
+        for (std::size_t i = 0; i < alias_count; ++i)
+        {
+            const auto it = bone_map.find(skel_lower_copy(aliases[i]));
+            if (it != bone_map.end())
+            {
+                return it->second;
+            }
+        }
+        return -1;
+    }
+
+    auto skel_bone_world_pos(Reflection& ref,
+                             std::uintptr_t mesh,
+                             std::uintptr_t get_bone_name_fn,
+                             std::uintptr_t get_socket_location_fn,
+                             int bone_index,
+                             sdk::FVector& out_loc) -> bool
+    {
+        FNameLite bone_name{};
+        if (!skel_call_get_bone_name(ref, mesh, get_bone_name_fn, bone_index, bone_name))
+        {
+            return false;
+        }
+        return skel_call_get_socket_location(ref, mesh, get_socket_location_fn, bone_name, out_loc);
+    }
+
+    auto skel_build_bones_json(Reflection& ref,
+                               std::uintptr_t mesh,
+                               std::uintptr_t get_bone_name_fn,
+                               std::uintptr_t get_socket_location_fn,
+                               const std::unordered_map<std::string, int>& bone_map,
+                               std::string& bones_json) -> bool
+    {
+        struct AimBoneSpec
+        {
+            const char* key;
+            const char* const* aliases;
+            std::size_t alias_count;
+        };
+        static const AimBoneSpec kAimBones[] = {
+            {"head", kSkelAliasHead, 5},
+            {"neck_01", kSkelAliasNeck, 3},
+            {"spine_03", kSkelAliasSpine3, 6},
+            {"spine_02", kSkelAliasSpine2, 3},
+            {"spine_01", kSkelAliasSpine1, 5},
+            {"pelvis", kSkelAliasPelvis, 4},
+            {"clavicle_l", kSkelAliasClavL, 3},
+            {"upperarm_l", kSkelAliasUpperArmL, 3},
+            {"lowerarm_l", kSkelAliasLowerArmL, 3},
+            {"hand_l", kSkelAliasHandL, 3},
+            {"clavicle_r", kSkelAliasClavR, 3},
+            {"upperarm_r", kSkelAliasUpperArmR, 3},
+            {"lowerarm_r", kSkelAliasLowerArmR, 3},
+            {"hand_r", kSkelAliasHandR, 3},
+            {"thigh_l", kSkelAliasThighL, 3},
+            {"calf_l", kSkelAliasCalfL, 3},
+            {"foot_l", kSkelAliasFootL, 3},
+            {"thigh_r", kSkelAliasThighR, 3},
+            {"calf_r", kSkelAliasCalfR, 3},
+            {"foot_r", kSkelAliasFootR, 3},
+        };
+        bool any = false;
+        bones_json.clear();
+        for (const auto& spec : kAimBones)
+        {
+            const int idx = skel_find_bone_index(bone_map, spec.aliases, spec.alias_count);
+            if (idx < 0)
+            {
+                continue;
+            }
+            sdk::FVector pos{};
+            if (!skel_bone_world_pos(ref, mesh, get_bone_name_fn, get_socket_location_fn, idx, pos))
+            {
+                continue;
+            }
+            if (!std::isfinite(pos.X) || !std::isfinite(pos.Y) || !std::isfinite(pos.Z))
+            {
+                continue;
+            }
+            if (any)
+            {
+                bones_json += ",";
+            }
+            any = true;
+            bones_json += "\"" + std::string(spec.key) + "\":[" + std::to_string(pos.X) + "," +
+                          std::to_string(pos.Y) + "," + std::to_string(pos.Z) + "]";
+        }
+        return any;
+    }
+
+    auto skel_build_for_actor(Reflection& ref,
+                              std::uintptr_t actor,
+                              std::uintptr_t mesh_override,
+                              std::string& segments_json,
+                              std::string& bones_json,
+                              bool bones_only) -> bool
+    {
+        const auto mesh = mesh_override ? mesh_override : skel_resolve_actor_mesh(actor);
+        if (!mesh)
+        {
+            return false;
+        }
+        const auto [get_bone_name_fn, get_socket_location_fn] = skel_resolve_functions(ref);
+        if (!get_bone_name_fn || !get_socket_location_fn)
+        {
+            return false;
+        }
+        std::unordered_map<std::string, int> bone_map{};
+        if (!skel_ensure_bone_map(ref, mesh, get_bone_name_fn, bone_map))
+        {
+            return false;
+        }
+        bool any = false;
+        segments_json.clear();
+        if (!bones_only)
+        {
+            for (const auto& conn : kSkelConnections)
+            {
+                const int idx_a = skel_find_bone_index(bone_map, conn.a, conn.a_count);
+                const int idx_b = skel_find_bone_index(bone_map, conn.b, conn.b_count);
+                if (idx_a < 0 || idx_b < 0)
+                {
+                    continue;
+                }
+                sdk::FVector a{};
+                sdk::FVector b{};
+                if (!skel_bone_world_pos(ref, mesh, get_bone_name_fn, get_socket_location_fn, idx_a, a) ||
+                    !skel_bone_world_pos(ref, mesh, get_bone_name_fn, get_socket_location_fn, idx_b, b))
+                {
+                    continue;
+                }
+                if (!std::isfinite(a.X) || !std::isfinite(a.Y) || !std::isfinite(a.Z) ||
+                    !std::isfinite(b.X) || !std::isfinite(b.Y) || !std::isfinite(b.Z))
+                {
+                    continue;
+                }
+                if (!any)
+                {
+                    any = true;
+                }
+                else
+                {
+                    segments_json += ",";
+                }
+                segments_json += "[" + std::to_string(a.X) + "," + std::to_string(a.Y) + "," + std::to_string(a.Z) +
+                                 "," + std::to_string(b.X) + "," + std::to_string(b.Y) + "," + std::to_string(b.Z) + "]";
+            }
+        }
+        const bool bones_ok = skel_build_bones_json(ref, mesh, get_bone_name_fn, get_socket_location_fn, bone_map, bones_json);
+        return any || bones_ok;
+    }
+
+    auto skel_parse_actor_entries(const std::string& payload) -> std::vector<SkelActorEntry>
+    {
+        std::vector<SkelActorEntry> entries{};
+        const std::string actor_list = json_extract_string(payload, "actors");
+        const std::string mesh_list = json_extract_string(payload, "meshes");
+        if (!actor_list.empty())
+        {
+            std::vector<std::uintptr_t> meshes{};
+            if (!mesh_list.empty())
+            {
+                std::size_t start = 0;
+                while (start < mesh_list.size())
+                {
+                    const auto comma = mesh_list.find(',', start);
+                    const auto token = mesh_list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                    meshes.push_back(parse_hex_address(token));
+                    if (comma == std::string::npos)
+                    {
+                        break;
+                    }
+                    start = comma + 1;
+                }
+            }
+            std::size_t start = 0;
+            std::size_t mesh_idx = 0;
+            while (start < actor_list.size())
+            {
+                const auto comma = actor_list.find(',', start);
+                const auto token = actor_list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                const auto addr = parse_hex_address(token);
+                if (addr)
+                {
+                    SkelActorEntry entry{};
+                    entry.actor = addr;
+                    if (mesh_idx < meshes.size())
+                    {
+                        entry.mesh = meshes[mesh_idx];
+                    }
+                    entries.push_back(entry);
+                }
+                ++mesh_idx;
+                if (comma == std::string::npos)
+                {
+                    break;
+                }
+                start = comma + 1;
+            }
+            return entries;
+        }
+        const auto single = json_extract_string(payload, "actor");
+        if (!single.empty())
+        {
+            SkelActorEntry entry{};
+            entry.actor = parse_hex_address(single);
+            const auto single_mesh = json_extract_string(payload, "mesh");
+            if (!single_mesh.empty())
+            {
+                entry.mesh = parse_hex_address(single_mesh);
+            }
+            if (entry.actor)
+            {
+                entries.push_back(entry);
+            }
+            return entries;
+        }
+        const double one = json_extract_double(payload, "actor");
+        if (one > 0)
+        {
+            SkelActorEntry entry{};
+            entry.actor = static_cast<std::uintptr_t>(one);
+            const double mesh_val = json_extract_double(payload, "mesh");
+            if (mesh_val > 0)
+            {
+                entry.mesh = static_cast<std::uintptr_t>(mesh_val);
+            }
+            entries.push_back(entry);
+        }
+        return entries;
+    }
+
+    auto skel_parse_actor_list(const std::string& payload) -> std::vector<std::uintptr_t>
+    {
+        std::vector<std::uintptr_t> actors{};
+        for (const auto& entry : skel_parse_actor_entries(payload))
+        {
+            if (entry.actor)
+            {
+                actors.push_back(entry.actor);
+            }
+        }
+        return actors;
+    }
+
+    auto handle_game_get_skeleton(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        (void)ctx;
+        std::string hook_failure{};
+        if (!install_process_event_hook(hook_failure))
+        {
+            return response_json(false, "skeleton_hook_failed", 0, 1, hook_failure);
+        }
+        const auto entries = skel_parse_actor_entries(payload);
+        if (entries.empty())
+        {
+            return response_json(false, "actors_unavailable", 0, 1, "no actor pointers supplied");
+        }
+        const std::string bones_only_text = json_extract_string(payload, "bones_only");
+        const bool bones_only = bones_only_text == "true" || bones_only_text == "1";
+        std::string results = "\"results\":[";
+        bool first_actor = true;
+        int ok_count = 0;
+        for (const auto& entry : entries)
+        {
+            if (!first_actor)
+            {
+                results += ",";
+            }
+            first_actor = false;
+            std::string segments = "[]";
+            std::string bones = "{}";
+            std::string bones_body{};
+            const bool ok = skel_build_for_actor(ref, entry.actor, entry.mesh, segments, bones_body, bones_only);
+            if (ok)
+            {
+                ++ok_count;
+            }
+            if (!bones_body.empty())
+            {
+                bones = "{" + bones_body + "}";
+            }
+            results += "{\"actor\":\"" + hex_address(entry.actor) + "\",\"mesh\":\"" + hex_address(entry.mesh) +
+                       "\",\"segments\":[" + segments + "],\"bones\":" + bones + "}";
+        }
+        results += "]";
+        const std::string meta = results + ",\"ok_count\":" + std::to_string(ok_count) +
+                                 ",\"method\":\"GetBoneName+GetSocketLocation\"";
+        return response_json(true, "get_skeleton", ok_count, static_cast<int>(entries.size()) - ok_count,
+                             ok_count > 0 ? "skeleton data collected" : "skeleton data empty", meta);
+    }
+
+    auto sdk_write_object_property_by_name(Reflection& ref, std::uintptr_t object, const char* name, std::uintptr_t value) -> bool
+    {
+        for (auto cls = ref.class_ptr(object); cls; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+        {
+            const auto prop = ref.find_property(cls, name);
+            const auto offset = prop ? prop_offset(prop) : -1;
+            if (offset < 0)
+            {
+                continue;
+            }
+            __try
+            {
+                *reinterpret_cast<std::uintptr_t*>(object + static_cast<std::uintptr_t>(offset)) = value;
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    auto sdk_write_number_property_by_name(Reflection& ref, std::uintptr_t object, const char* name, double value) -> bool
+    {
+        for (auto cls = ref.class_ptr(object); cls; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+        {
+            const auto prop = ref.find_property(cls, name);
+            if (prop && prop_offset(prop) >= 0)
+            {
+                return write_number(ref, prop, reinterpret_cast<std::uint8_t*>(object), value);
+            }
+        }
+        return false;
+    }
+
+    auto sdk_write_enum_byte(Reflection&, std::uintptr_t prop, std::uint8_t* container, std::uint8_t value) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        if (offset < 0)
+        {
+            return false;
+        }
+        __try
+        {
+            *(container + offset) = value;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    auto sdk_write_enum_property_by_name(Reflection& ref, std::uintptr_t object, const char* name, std::uint8_t value) -> bool
+    {
+        for (auto cls = ref.class_ptr(object); cls; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+        {
+            const auto prop = ref.find_property(cls, name);
+            if (prop && prop_offset(prop) >= 0)
+            {
+                return sdk_write_enum_byte(ref, prop, reinterpret_cast<std::uint8_t*>(object), value);
+            }
+        }
+        return false;
+    }
+
+    auto sdk_write_bool_property_by_name(Reflection&, std::uintptr_t object, const char* name, bool value) -> bool
+    {
+        Reflection ref{};
+        std::string ignored{};
+        if (!ref.init(ignored))
+        {
+            return false;
+        }
+        for (auto cls = ref.class_ptr(object); cls; cls = safe_read<std::uintptr_t>(cls + OffSuperStruct))
+        {
+            const auto prop = ref.find_property(cls, name);
+            if (prop && prop_offset(prop) >= 0)
+            {
+                return write_bool(prop, reinterpret_cast<std::uint8_t*>(object), value);
+            }
+        }
+        return false;
+    }
+
+    auto sdk_write_quat_identity(Reflection& ref, std::uintptr_t prop, std::uint8_t* container) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        const auto structure = struct_type(ref, prop, {"X", "Y", "Z", "W"});
+        if (offset < 0 || !structure)
+        {
+            return false;
+        }
+        auto* base = container + offset;
+        bool wrote = false;
+        if (const auto p = find_property_any(ref, structure, {"X"})) wrote = write_number(ref, p, base, 0.0) || wrote;
+        if (const auto p = find_property_any(ref, structure, {"Y"})) wrote = write_number(ref, p, base, 0.0) || wrote;
+        if (const auto p = find_property_any(ref, structure, {"Z"})) wrote = write_number(ref, p, base, 0.0) || wrote;
+        if (const auto p = find_property_any(ref, structure, {"W"})) wrote = write_number(ref, p, base, 1.0) || wrote;
+        return wrote;
+    }
+
+    auto sdk_write_transform(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, const sdk::FVector& location) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        const auto structure = struct_type(ref, prop, {"Rotation", "Translation", "Scale3D"});
+        if (offset < 0 || !structure)
+        {
+            return false;
+        }
+        auto* base = container + offset;
+        bool wrote = false;
+        if (const auto p = find_property_any(ref, structure, {"Rotation"}))
+        {
+            wrote = sdk_write_quat_identity(ref, p, base) || wrote;
+        }
+        if (const auto p = find_property_any(ref, structure, {"Translation", "Location"}))
+        {
+            wrote = sdk_write_vector3(ref, p, base, location) || wrote;
+        }
+        if (const auto p = find_property_any(ref, structure, {"Scale3D", "Scale"}))
+        {
+            sdk::FVector scale{};
+            scale.X = 1.0;
+            scale.Y = 1.0;
+            scale.Z = 1.0;
+            wrote = sdk_write_vector3(ref, p, base, scale) || wrote;
+        }
+        return wrote;
+    }
+
+    auto sdk_write_rotator(Reflection& ref, std::uintptr_t prop, std::uint8_t* container, const sdk::FVector& direction) -> bool
+    {
+        const auto offset = prop_offset(prop);
+        const auto structure = struct_type(ref, prop, {"Pitch", "Yaw", "Roll"});
+        if (offset < 0 || !structure)
+        {
+            return false;
+        }
+        auto* base = container + offset;
+        const auto horizontal = std::sqrt(direction.X * direction.X + direction.Y * direction.Y);
+        const auto pitch = std::atan2(direction.Z, std::max(0.000001, horizontal)) * 180.0 / 3.14159265358979323846;
+        const auto yaw = std::atan2(direction.Y, direction.X) * 180.0 / 3.14159265358979323846;
+        bool wrote = false;
+        if (const auto p = find_property_any(ref, structure, {"Pitch"})) wrote = write_number(ref, p, base, pitch) || wrote;
+        if (const auto p = find_property_any(ref, structure, {"Yaw"})) wrote = write_number(ref, p, base, yaw) || wrote;
+        if (const auto p = find_property_any(ref, structure, {"Roll"})) wrote = write_number(ref, p, base, 0.0) || wrote;
+        return wrote;
+    }
+
+    auto sdk_make_rotator(const sdk::FVector& direction) -> sdk::FRotator
+    {
+        const auto horizontal = std::sqrt(direction.X * direction.X + direction.Y * direction.Y);
+        sdk::FRotator rot{};
+        rot.Pitch = std::atan2(direction.Z, std::max(0.000001, horizontal)) * 180.0 / 3.14159265358979323846;
+        rot.Yaw = std::atan2(direction.Y, direction.X) * 180.0 / 3.14159265358979323846;
+        rot.Roll = 0.0;
+        return rot;
+    }
+
+    auto sdk_rotator_forward(const sdk::FRotator& rotator) -> sdk::FVector
+    {
+        const auto pitch = rotator.Pitch * 3.14159265358979323846 / 180.0;
+        const auto yaw = rotator.Yaw * 3.14159265358979323846 / 180.0;
+        const auto cp = std::cos(pitch);
+        return sdk_vec_normalize({cp * std::cos(yaw), cp * std::sin(yaw), std::sin(pitch)});
+    }
+
+    auto sdk_make_transform(const sdk::FVector& location) -> sdk::FTransform
+    {
+        sdk::FTransform transform{};
+        transform.Rotation.W = 1.0;
+        transform.Translation = location;
+        transform.Scale3D.X = 1.0;
+        transform.Scale3D.Y = 1.0;
+        transform.Scale3D.Z = 1.0;
+        return transform;
+    }
+
+    auto sdk_create_render_target(Reflection& ref, const SdkContext& ctx, int width, int height, std::string& failure) -> std::uintptr_t
+    {
+        const auto function = sdk_find_object_named(ref, "CreateRenderTarget2D");
+        const auto caller = sdk_function_caller(ref, function);
+        if (!function || !caller)
+        {
+            failure = "create_render_target_function_unavailable";
+            return 0;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 4096)
+        {
+            failure = "create_render_target_params_size_invalid";
+            return 0;
+        }
+        if (params_size != static_cast<int>(sizeof(sdk::KismetRenderingLibrary_CreateRenderTarget2D)))
+        {
+            failure = "create_render_target_typed_params_size_mismatch";
+            return 0;
+        }
+        sdk::KismetRenderingLibrary_CreateRenderTarget2D params{};
+        params.WorldContextObject = reinterpret_cast<void*>(ctx.pawn);
+        params.Width = width;
+        params.Height = height;
+        params.Format = sdk::ETextureRenderTargetFormat::RTF_RGBA8_SRGB;
+        params.ClearColor.R = 0.0f;
+        params.ClearColor.G = 0.0f;
+        params.ClearColor.B = 0.0f;
+        params.ClearColor.A = 1.0f;
+        params.bAutoGenerateMipMaps = false;
+        params.bSupportUAVs = false;
+        if (!process_event(caller, function, reinterpret_cast<std::uint8_t*>(&params), failure))
+        {
+            failure = "create_render_target_process_event_failed:" + failure;
+            return 0;
+        }
+        const auto rt = reinterpret_cast<std::uintptr_t>(params.ReturnValue);
+        if (!rt)
+        {
+            failure = "create_render_target_return_null";
+        }
+        return rt;
+    }
+
+    auto sdk_spawn_actor_from_class(Reflection& ref,
+                                    const SdkContext& ctx,
+                                    std::uintptr_t actor_class,
+                                    const sdk::FVector& location,
+                                    std::string& failure) -> std::uintptr_t
+    {
+        const auto function = sdk_find_object_named(ref, "BeginDeferredActorSpawnFromClass");
+        const auto caller = sdk_function_caller(ref, function);
+        if (!function || !caller || !actor_class)
+        {
+            failure = "begin_deferred_spawn_function_unavailable";
+            return 0;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size != static_cast<int>(sizeof(sdk::GameplayStatics_BeginDeferredActorSpawnFromClass)))
+        {
+            failure = "begin_deferred_spawn_typed_params_size_mismatch";
+            return 0;
+        }
+        const auto transform = sdk_make_transform(location);
+        sdk::GameplayStatics_BeginDeferredActorSpawnFromClass params{};
+        params.WorldContextObject = reinterpret_cast<void*>(ctx.pawn);
+        params.ActorClass = reinterpret_cast<void*>(actor_class);
+        params.SpawnTransform = transform;
+        params.CollisionHandlingOverride = sdk::ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        params.Owner = reinterpret_cast<void*>(ctx.pawn);
+        params.TransformScaleMethod = sdk::ESpawnActorScaleMethod::SelectDefaultAtRuntime;
+        std::string begin_failure{};
+        if (!process_event(caller, function, reinterpret_cast<std::uint8_t*>(&params), begin_failure) || !params.ReturnValue)
+        {
+            failure = "begin_deferred_spawn_process_event_failed:" + begin_failure;
+            return 0;
+        }
+
+        auto actor = reinterpret_cast<std::uintptr_t>(params.ReturnValue);
+        const auto finish = sdk_find_object_named(ref, "FinishSpawningActor");
+        const auto finish_caller = sdk_function_caller(ref, finish);
+        const auto finish_size = safe_read<int>(finish + OffPropertiesSize, 0);
+        if (finish && finish_caller && finish_size == static_cast<int>(sizeof(sdk::GameplayStatics_FinishSpawningActor)))
+        {
+            sdk::GameplayStatics_FinishSpawningActor finish_params{};
+            finish_params.Actor = reinterpret_cast<void*>(actor);
+            finish_params.SpawnTransform = transform;
+            finish_params.TransformScaleMethod = sdk::ESpawnActorScaleMethod::SelectDefaultAtRuntime;
+            std::string finish_failure{};
+            if (process_event(finish_caller, finish, reinterpret_cast<std::uint8_t*>(&finish_params), finish_failure) && finish_params.ReturnValue)
+            {
+                actor = reinterpret_cast<std::uintptr_t>(finish_params.ReturnValue);
+            }
+        }
+        failure.clear();
+        return actor;
+    }
+
+    auto sdk_set_actor_capture_transform(Reflection& ref,
+                                         std::uintptr_t actor,
+                                         const sdk::FVector& location,
+                                         const sdk::FVector& direction) -> bool
+    {
+        bool ok = false;
+        if (const auto function = ref.find_function(actor, "K2_SetActorLocation"))
+        {
+            const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+            if (params_size == static_cast<int>(sizeof(sdk::Actor_K2_SetActorLocation)))
+            {
+                sdk::Actor_K2_SetActorLocation params{};
+                params.NewLocation = location;
+                params.bSweep = false;
+                params.bTeleport = true;
+                std::string failure{};
+                ok = process_event(actor, function, reinterpret_cast<std::uint8_t*>(&params), failure) || ok;
+            }
+        }
+        if (const auto function = ref.find_function(actor, "K2_SetActorRotation"))
+        {
+            const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+            if (params_size == static_cast<int>(sizeof(sdk::Actor_K2_SetActorRotation)))
+            {
+                sdk::Actor_K2_SetActorRotation params{};
+                params.NewRotation = sdk_make_rotator(direction);
+                params.bTeleportPhysics = true;
+                std::string failure{};
+                ok = process_event(actor, function, reinterpret_cast<std::uint8_t*>(&params), failure) || ok;
+            }
+        }
+        return ok;
+    }
+
+    auto sdk_project_world_to_screen(Reflection& ref,
+                                     const SdkContext& ctx,
+                                     const sdk::FVector& world,
+                                     double& x,
+                                     double& y) -> bool
+    {
+        const auto function = ref.find_function(ctx.controller, "ProjectWorldLocationToScreen");
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 4096)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "returnvalue")
+            {
+                continue;
+            }
+            if ((contains_text(name, "world") || contains_text(name, "location")) && !contains_text(name, "screen"))
+            {
+                sdk_write_vector3(ref, prop, params.data(), world);
+            }
+            else if (contains_text(name, "viewport"))
+            {
+                write_bool(prop, params.data(), false);
+            }
+        }
+        std::string failure{};
+        if (!process_event(ctx.controller, function, params.data(), failure) || !read_return_bool(ref, function, params.data()))
+        {
+            return false;
+        }
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (name == "returnvalue")
+            {
+                continue;
+            }
+            if (contains_text(name, "screen"))
+            {
+                return sdk_read_vector2(ref, prop, params.data(), x, y);
+            }
+        }
+        return false;
+    }
+
+    auto sdk_read_return_linear_color(Reflection& ref, std::uintptr_t function, std::uint8_t* params, Color& color) -> bool
+    {
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            if (lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName))) != "returnvalue")
+            {
+                continue;
+            }
+            const auto offset = prop_offset(prop);
+            const auto structure = struct_type(ref, prop, {"R", "G", "B", "A"});
+            if (offset < 0 || !structure)
+            {
+                return false;
+            }
+            auto* base = params + offset;
+            bool read = false;
+            if (const auto p = find_property_any(ref, structure, {"R"})) { color.r = sdk_read_number(ref, p, base); read = true; }
+            if (const auto p = find_property_any(ref, structure, {"G"})) { color.g = sdk_read_number(ref, p, base); read = true; }
+            if (const auto p = find_property_any(ref, structure, {"B"})) { color.b = sdk_read_number(ref, p, base); read = true; }
+            color.r = clamp01(color.r);
+            color.g = clamp01(color.g);
+            color.b = clamp01(color.b);
+            color.roughness = 0.65;
+            color.metallic = 0.0;
+            return read;
+        }
+        return false;
+    }
+
+    auto sdk_read_render_target_raw_pixel(Reflection& ref,
+                                          const SdkContext& ctx,
+                                          std::uintptr_t render_target,
+                                          int x,
+                                          int y,
+                                          Color& color,
+                                          std::uintptr_t& function_used) -> bool
+    {
+        const auto function = sdk_find_object_named(ref, "ReadRenderTargetPixel");
+        const auto caller = sdk_function_caller(ref, function);
+        function_used = function;
+        if (!function || !caller || !render_target)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size != static_cast<int>(sizeof(sdk::KismetRenderingLibrary_ReadRenderTargetPixel)))
+        {
+            return false;
+        }
+        sdk::KismetRenderingLibrary_ReadRenderTargetPixel params{};
+        params.WorldContextObject = reinterpret_cast<void*>(ctx.pawn);
+        params.TextureRenderTarget = reinterpret_cast<void*>(render_target);
+        params.X = x;
+        params.Y = y;
+        std::string failure{};
+        if (!process_event(caller, function, reinterpret_cast<std::uint8_t*>(&params), failure))
+        {
+            return false;
+        }
+        color.r = static_cast<double>(params.ReturnValue.R) / 255.0;
+        color.g = static_cast<double>(params.ReturnValue.G) / 255.0;
+        color.b = static_cast<double>(params.ReturnValue.B) / 255.0;
+        color.roughness = 0.65;
+        color.metallic = 0.0;
+        return true;
+    }
+
+    struct SdkBulkRenderTargetImage
+    {
+        bool ok{false};
+        std::string failure{"bulk_read_not_run"};
+        std::string backend{"not_run"};
+        std::string function_name{};
+        std::string inner_type{};
+        std::string bool_variant{"none"};
+        int width{0};
+        int height{0};
+        int decoded_pixels{0};
+        std::vector<Color> pixels{};
+    };
+
+    struct SdkBulkReadbackDiagnostics
+    {
+        int function_attempts{0};
+        int process_event_ok{0};
+        int array_param_count{0};
+        int first_array_offset{-1};
+        int first_array_num{0};
+        int first_array_max{0};
+        int first_array_element_size{0};
+        std::string first_candidate_type{"none"};
+        int decoded_pixels{0};
+    };
+
+    auto sdk_color_distance_rgb(const Color& a, const Color& b) -> double
+    {
+        return std::max({std::abs(a.r - b.r), std::abs(a.g - b.g), std::abs(a.b - b.b)});
+    }
+
+    auto sdk_median(std::vector<double> values) -> double
+    {
+        if (values.empty())
+        {
+            return 1000000.0;
+        }
+        const auto mid = values.size() / 2;
+        std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid), values.end());
+        return values[mid];
+    }
+
+    enum class SdkBulkColorTransform
+    {
+        Identity,
+        SwapRedBlue,
+        SrgbToLinear,
+        LinearToSrgb,
+        SwapRedBlueSrgbToLinear,
+        SwapRedBlueLinearToSrgb,
+    };
+
+    auto sdk_srgb_to_linear_component(double value) -> double
+    {
+        value = clamp01(value);
+        return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+    }
+
+    auto sdk_linear_to_srgb_component(double value) -> double
+    {
+        value = clamp01(value);
+        return value <= 0.0031308 ? value * 12.92 : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
+    }
+
+    auto sdk_bulk_color_transform_label(SdkBulkColorTransform transform) -> const char*
+    {
+        switch (transform)
+        {
+        case SdkBulkColorTransform::Identity: return "identity";
+        case SdkBulkColorTransform::SwapRedBlue: return "swap_rb";
+        case SdkBulkColorTransform::SrgbToLinear: return "srgb_to_linear";
+        case SdkBulkColorTransform::LinearToSrgb: return "linear_to_srgb";
+        case SdkBulkColorTransform::SwapRedBlueSrgbToLinear: return "swap_rb_srgb_to_linear";
+        case SdkBulkColorTransform::SwapRedBlueLinearToSrgb: return "swap_rb_linear_to_srgb";
+        }
+        return "unknown";
+    }
+
+    auto sdk_apply_bulk_color_transform(Color color, SdkBulkColorTransform transform) -> Color
+    {
+        const auto swap_rb = [&]() {
+            std::swap(color.r, color.b);
+        };
+        const auto srgb_to_linear = [&]() {
+            color.r = sdk_srgb_to_linear_component(color.r);
+            color.g = sdk_srgb_to_linear_component(color.g);
+            color.b = sdk_srgb_to_linear_component(color.b);
+        };
+        const auto linear_to_srgb = [&]() {
+            color.r = sdk_linear_to_srgb_component(color.r);
+            color.g = sdk_linear_to_srgb_component(color.g);
+            color.b = sdk_linear_to_srgb_component(color.b);
+        };
+        switch (transform)
+        {
+        case SdkBulkColorTransform::Identity: break;
+        case SdkBulkColorTransform::SwapRedBlue: swap_rb(); break;
+        case SdkBulkColorTransform::SrgbToLinear: srgb_to_linear(); break;
+        case SdkBulkColorTransform::LinearToSrgb: linear_to_srgb(); break;
+        case SdkBulkColorTransform::SwapRedBlueSrgbToLinear: swap_rb(); srgb_to_linear(); break;
+        case SdkBulkColorTransform::SwapRedBlueLinearToSrgb: swap_rb(); linear_to_srgb(); break;
+        }
+        color.r = clamp01(color.r);
+        color.g = clamp01(color.g);
+        color.b = clamp01(color.b);
+        return color;
+    }
+
+    auto sdk_allowed_bulk_color_transforms(const std::string& inner_type) -> std::vector<SdkBulkColorTransform>
+    {
+        if (inner_type == "FLinearColor")
+        {
+            return {SdkBulkColorTransform::LinearToSrgb,
+                    SdkBulkColorTransform::SwapRedBlueLinearToSrgb};
+        }
+        return {SdkBulkColorTransform::Identity,
+                SdkBulkColorTransform::SwapRedBlue};
+    }
+
+    auto sdk_decode_bulk_array_candidates(const std::string& backend,
+                                          const std::string& function_name,
+                                          const std::string& bool_variant,
+                                          std::uintptr_t data,
+                                          int num,
+                                          int max,
+                                          int width,
+                                          int height) -> std::vector<SdkBulkRenderTargetImage>
+    {
+        std::vector<SdkBulkRenderTargetImage> out{};
+        const auto expected = width > 0 && height > 0 ? width * height : 0;
+        if (!data || expected <= 0 || num <= 0 || max < num)
+        {
+            return out;
+        }
+        auto make_base = [&]() {
+            SdkBulkRenderTargetImage image{};
+            image.ok = true;
+            image.backend = backend;
+            image.function_name = function_name;
+            image.bool_variant = bool_variant;
+            image.width = width;
+            image.height = height;
+            image.decoded_pixels = expected;
+            image.failure.clear();
+            return image;
+        };
+        const auto is_raw_function = contains_text(lower_copy(function_name), "raw");
+        if (num == expected)
+        {
+            if (!is_raw_function)
+            {
+                std::vector<sdk::FColor> raw(static_cast<std::size_t>(expected));
+                if (safe_copy(raw.data(), reinterpret_cast<void*>(data), raw.size() * sizeof(sdk::FColor)))
+                {
+                    auto image = make_base();
+                    image.inner_type = "FColor";
+                    image.pixels.reserve(raw.size());
+                    for (const auto& px : raw)
+                    {
+                        Color c{};
+                        c.r = static_cast<double>(px.R) / 255.0;
+                        c.g = static_cast<double>(px.G) / 255.0;
+                        c.b = static_cast<double>(px.B) / 255.0;
+                        c.roughness = 0.65;
+                        c.metallic = 0.0;
+                        image.pixels.push_back(c);
+                    }
+                    out.push_back(std::move(image));
+                }
+            }
+            if (is_raw_function)
+            {
+                std::vector<sdk::FLinearColor> raw(static_cast<std::size_t>(expected));
+                if (safe_copy(raw.data(), reinterpret_cast<void*>(data), raw.size() * sizeof(sdk::FLinearColor)))
+                {
+                    auto image = make_base();
+                    image.inner_type = "FLinearColor";
+                    image.pixels.reserve(raw.size());
+                    for (const auto& px : raw)
+                    {
+                        Color c{};
+                        c.r = clamp01(px.R);
+                        c.g = clamp01(px.G);
+                        c.b = clamp01(px.B);
+                        c.roughness = 0.65;
+                        c.metallic = 0.0;
+                        image.pixels.push_back(c);
+                    }
+                    out.push_back(std::move(image));
+                }
+            }
+        }
+        if (num == expected * 4)
+        {
+            std::vector<std::uint8_t> raw(static_cast<std::size_t>(num));
+            if (safe_copy(raw.data(), reinterpret_cast<void*>(data), raw.size()))
+            {
+                auto image = make_base();
+                image.inner_type = "uint8_bgra";
+                image.pixels.reserve(static_cast<std::size_t>(expected));
+                for (int i = 0; i < expected; ++i)
+                {
+                    const auto offset = static_cast<std::size_t>(i) * 4;
+                    Color c{};
+                    c.b = static_cast<double>(raw[offset + 0]) / 255.0;
+                    c.g = static_cast<double>(raw[offset + 1]) / 255.0;
+                    c.r = static_cast<double>(raw[offset + 2]) / 255.0;
+                    c.roughness = 0.65;
+                    c.metallic = 0.0;
+                    image.pixels.push_back(c);
+                }
+                out.push_back(std::move(image));
+            }
+        }
+        return out;
+    }
+
+    auto sdk_read_render_target_bulk_candidates(Reflection& ref,
+                                                const SdkContext& ctx,
+                                                std::uintptr_t render_target,
+                                                int width,
+                                                int height,
+                                                SdkBulkReadbackDiagnostics* diagnostics = nullptr) -> std::vector<SdkBulkRenderTargetImage>
+    {
+        std::vector<SdkBulkRenderTargetImage> out{};
+        const auto expected_pixels = width > 0 && height > 0 ? width * height : 0;
+        const char* function_names[]{"ReadRenderTarget", "ReadRenderTargetRaw"};
+        for (const auto* function_name : function_names)
+        {
+            const auto function = sdk_find_object_named(ref, function_name);
+            const auto caller = sdk_function_caller(ref, function);
+            if (!function || !caller || !render_target)
+            {
+                continue;
+            }
+            const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+            if (params_size <= 0 || params_size > 4096)
+            {
+                continue;
+            }
+            for (int variant = 0; variant < 3; ++variant)
+            {
+                std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+                bool wrote_bool = false;
+                bool wants_bool = variant != 0;
+                bool bool_value = variant == 2;
+                for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+                {
+                    const auto name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+                    if (name == "returnvalue")
+                    {
+                        continue;
+                    }
+                    if (contains_text(name, "worldcontext"))
+                    {
+                        sdk_write_object(prop, params.data(), ctx.pawn ? ctx.pawn : ctx.controller);
+                    }
+                    else if (contains_text(name, "rendertarget") || contains_text(name, "texture"))
+                    {
+                        sdk_write_object(prop, params.data(), render_target);
+                    }
+                    else if (contains_text(name, "normaliz") || contains_text(name, "srgb"))
+                    {
+                        if (wants_bool)
+                        {
+                            write_bool(prop, params.data(), bool_value);
+                            wrote_bool = true;
+                        }
+                    }
+                }
+                if (wants_bool && !wrote_bool)
+                {
+                    continue;
+                }
+                if (diagnostics)
+                {
+                    ++diagnostics->function_attempts;
+                }
+                std::string failure{};
+                if (!process_event(caller, function, params.data(), failure))
+                {
+                    continue;
+                }
+                if (diagnostics)
+                {
+                    ++diagnostics->process_event_ok;
+                }
+                for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+                {
+                    const auto offset = prop_offset(prop);
+                    const auto element_size = prop_element_size(prop);
+                    if (offset < 0 || offset + static_cast<int>(sizeof(sdk::TArray<std::uint8_t>)) > params_size)
+                    {
+                        continue;
+                    }
+                    const auto array = *reinterpret_cast<sdk::TArray<std::uint8_t>*>(params.data() + offset);
+                    const bool plausible_array =
+                        array.Data != nullptr &&
+                        array.Num > 0 &&
+                        array.Max >= array.Num &&
+                        expected_pixels > 0 &&
+                        (array.Num == expected_pixels || array.Num == expected_pixels * 4);
+                    if (!plausible_array)
+                    {
+                        continue;
+                    }
+                    if (diagnostics)
+                    {
+                        ++diagnostics->array_param_count;
+                        if (diagnostics->first_array_offset < 0)
+                        {
+                            diagnostics->first_array_offset = offset;
+                            diagnostics->first_array_num = array.Num;
+                            diagnostics->first_array_max = array.Max;
+                            diagnostics->first_array_element_size = element_size;
+                        }
+                    }
+                    auto images = sdk_decode_bulk_array_candidates("bulk_array",
+                                                                   function_name,
+                                                                   wants_bool ? (bool_value ? "bool_true" : "bool_false") : "no_bool",
+                                                                   reinterpret_cast<std::uintptr_t>(array.Data),
+                                                                   array.Num,
+                                                                   array.Max,
+                                                                   width,
+                                                                   height);
+                    if (diagnostics && !images.empty() && diagnostics->first_candidate_type == "none")
+                    {
+                        diagnostics->first_candidate_type = images.front().function_name + ":" + images.front().inner_type;
+                        diagnostics->decoded_pixels = images.front().decoded_pixels;
+                    }
+                    if (!images.empty())
+                    {
+                        return images;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    auto sdk_configure_scene_capture_component_typed(std::uintptr_t capture_component,
+                                                     std::uintptr_t render_target,
+                                                     double fov_degrees = 90.0) -> bool
+    {
+        if (!capture_component || !render_target)
+        {
+            return false;
+        }
+        __try
+        {
+            *reinterpret_cast<std::uintptr_t*>(capture_component + sdk::FieldOffsets::SceneCaptureComponent2D_TextureTarget) = render_target;
+            *reinterpret_cast<std::uint8_t*>(capture_component + sdk::FieldOffsets::SceneCaptureComponent_CaptureSource) =
+                static_cast<std::uint8_t>(sdk::ESceneCaptureSource::BaseColor);
+            auto* capture_flags = reinterpret_cast<std::uint8_t*>(capture_component + sdk::FieldOffsets::SceneCaptureComponent_CaptureFlags);
+            *capture_flags = static_cast<std::uint8_t>(*capture_flags & ~0x03);
+            *reinterpret_cast<bool*>(capture_component + sdk::FieldOffsets::SceneCaptureComponent_bAlwaysPersistRenderingState) = true;
+            *reinterpret_cast<std::uint8_t*>(capture_component + sdk::FieldOffsets::SceneCaptureComponent2D_ProjectionType) =
+                static_cast<std::uint8_t>(sdk::ECameraProjectionMode::Perspective);
+            const auto fov = std::isfinite(fov_degrees) ? std::max(10.0, std::min(150.0, fov_degrees)) : 90.0;
+            *reinterpret_cast<float*>(capture_component + sdk::FieldOffsets::SceneCaptureComponent2D_FOVAngle) = static_cast<float>(fov);
+            return *reinterpret_cast<std::uintptr_t*>(capture_component + sdk::FieldOffsets::SceneCaptureComponent2D_TextureTarget) == render_target;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    constexpr bool kEnableNativeSceneCaptureForF10 = true;
+
+    struct CamoQualitySettings
+    {
+        double brush_radius{0.01};
+        double sample_spacing_factor{0.25};
+        float brush_spacing{0.18f};
+        int min_direct_points{5000};
+    };
+
+    auto camo_quality_settings(int level) -> CamoQualitySettings
+    {
+        CamoQualitySettings out{};
+        level = std::max(1, std::min(20, level));
+        const double t = static_cast<double>(level - 1) / 19.0;
+        // Higher quality → smaller stamps, tighter overlap, more stroke budget.
+        out.brush_radius = 0.008 - t * 0.0065;          // 0.008 @1 → 0.0015 @20
+        out.sample_spacing_factor = 0.22 - t * 0.14;    // denser overlap for tiny stamps
+        out.brush_spacing = static_cast<float>(0.14 - t * 0.10);
+        out.min_direct_points = static_cast<int>(3000.0 + t * 32000.0);
+        return out;
+    }
+
+    auto sdk_apply_control_rotation(Reflection& ref,
+                                    std::uintptr_t controller,
+                                    const sdk::FRotator& rotation) -> bool
+    {
+        if (!live_uobject(controller))
+        {
+            return false;
+        }
+        const auto set_cr_fn = ref.find_function(controller, "SetControlRotation");
+        if (!set_cr_fn)
+        {
+            return false;
+        }
+        sdk::Controller_SetControlRotation params{};
+        params.NewRotation = rotation;
+        std::string failure{};
+        return process_event(controller, set_cr_fn, reinterpret_cast<std::uint8_t*>(&params), failure);
+    }
+
+    auto sdk_apply_wrap_camera_yaw(Reflection& ref,
+                                   std::uintptr_t controller,
+                                   const sdk::FRotator& baseline,
+                                   double yaw_offset) -> bool
+    {
+        if (!live_uobject(controller) || std::abs(yaw_offset) < 0.001)
+        {
+            return true;
+        }
+        const auto set_cr_fn = ref.find_function(controller, "SetControlRotation");
+        if (!set_cr_fn)
+        {
+            return false;
+        }
+        sdk::Controller_SetControlRotation params{};
+        params.NewRotation = baseline;
+        params.NewRotation.Yaw += yaw_offset;
+        std::string failure{};
+        return process_event(controller, set_cr_fn, reinterpret_cast<std::uint8_t*>(&params), failure);
+    }
+
+    auto sdk_capture_front_colors(Reflection& ref,
+                                  const SdkContext& ctx,
+                                  const SdkNativeFrontSampleResult& native_front,
+                                  int target_width,
+                                  int target_height,
+                                  const sdk::FRotator* forced_control_rotation = nullptr,
+                                  bool use_body_anchor = false,
+                                  double body_anchor_pullback = 150.0) -> SdkFrontCaptureResult
+    {
+        SdkFrontCaptureResult out{};
+        if (native_front.samples.empty())
+        {
+            out.failure = "front_capture_no_surface_samples";
+            return out;
+        }
+        const auto viewport = sdk_get_viewport_info(ref, ctx);
+        out.width = viewport.width;
+        out.height = viewport.height;
+        if (out.width <= 0 || out.height <= 0)
+        {
+            out.failure = "front_capture_viewport_unavailable";
+            return out;
+        }
+        if (!kEnableNativeSceneCaptureForF10)
+        {
+            out.failure = "front_capture_backend_disabled_after_d3d12_crash";
+            return out;
+        }
+        const int viewport_width = out.width;
+        const int viewport_height = out.height;
+        out.viewport_width = viewport_width;
+        out.viewport_height = viewport_height;
+        out.viewport_aspect = static_cast<double>(std::max(1, viewport_width)) / static_cast<double>(std::max(1, viewport_height));
+        if (target_width > 0 && target_height > 0)
+        {
+            out.requested_texture_width = target_width;
+            out.requested_texture_height = target_height;
+            int capture_width = std::max(1, target_width);
+            int capture_height = std::max(1, target_height);
+            constexpr int max_capture_dimension = 4096;
+            const auto max_dimension = std::max(capture_width, capture_height);
+            if (max_dimension > max_capture_dimension)
+            {
+                const auto scale = static_cast<double>(max_capture_dimension) / static_cast<double>(max_dimension);
+                capture_width = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_width) * scale)));
+                capture_height = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_height) * scale)));
+            }
+            out.width = capture_width;
+            out.height = capture_height;
+            out.capture_resolution_source = "viewport_full_38923_parity";
+        }
+        out.capture_aspect = static_cast<double>(std::max(1, out.width)) / static_cast<double>(std::max(1, out.height));
+        const double capture_scale_x = static_cast<double>(out.width) / static_cast<double>(viewport_width);
+        const double capture_scale_y = static_cast<double>(out.height) / static_cast<double>(viewport_height);
+        out.capture_scale_x = capture_scale_x;
+        out.capture_scale_y = capture_scale_y;
+        const auto center_ray = sdk_deproject_screen_position(ref, ctx, static_cast<double>(viewport_width) * 0.5, static_cast<double>(viewport_height) * 0.5);
+        if (!center_ray.ok)
+        {
+            out.failure = "front_capture_camera_deproject_failed:" + center_ray.failure;
+            return out;
+        }
+        auto capture_location = center_ray.location;
+        auto capture_direction = center_ray.direction;
+        bool deproject_fov_valid = false;
+        if (forced_control_rotation != nullptr)
+        {
+            capture_direction = sdk_rotator_forward(*forced_control_rotation);
+            out.camera_rotation_used = true;
+            out.camera_rotation_source = "forced_control_rotation";
+            if (use_body_anchor)
+            {
+                const auto& body = ctx.body_world_position;
+                const bool body_valid = std::isfinite(body.X) && std::isfinite(body.Y) && std::isfinite(body.Z) &&
+                                        (std::abs(body.X) + std::abs(body.Y) + std::abs(body.Z)) > 0.001;
+                if (body_valid)
+                {
+                    const auto forward = sdk_vec_normalize(capture_direction);
+                    const double pullback = std::max(40.0, body_anchor_pullback);
+                    capture_location = body;
+                    capture_location.Z += 85.0;
+                    capture_location.X -= forward.X * pullback;
+                    capture_location.Y -= forward.Y * pullback;
+                    capture_location.Z -= forward.Z * pullback;
+                    out.camera_location_used = true;
+                    out.camera_location_source = "body_torso_anchor_pullback";
+                }
+            }
+        }
+        const auto left_ray = sdk_deproject_screen_position(ref, ctx, 0.0, static_cast<double>(viewport_height) * 0.5);
+        const auto right_ray = sdk_deproject_screen_position(ref, ctx, static_cast<double>(std::max(1, viewport_width - 1)), static_cast<double>(viewport_height) * 0.5);
+        if (left_ray.ok && right_ray.ok)
+        {
+            const auto left_dir = sdk_vec_normalize(left_ray.direction);
+            const auto right_dir = sdk_vec_normalize(right_ray.direction);
+            const auto dot = std::max(-1.0, std::min(1.0, sdk_vec_dot(left_dir, right_dir)));
+            const auto fov = std::acos(dot) * 180.0 / 3.14159265358979323846;
+            if (std::isfinite(fov) && fov >= 10.0 && fov <= 150.0)
+            {
+                out.capture_fov = fov;
+                deproject_fov_valid = true;
+            }
+        }
+        std::string camera_failure{};
+        out.camera_manager = sdk_call_no_params_return_object(ref, ctx.controller, "GetPlayerCameraManager", camera_failure);
+        std::string camera_manager_source = "function:GetPlayerCameraManager";
+        if (!live_uobject(out.camera_manager) && ctx.controller)
+        {
+            const auto field_camera_manager = safe_read<std::uintptr_t>(
+                ctx.controller + sdk::FieldOffsets::PlayerController_PlayerCameraManager,
+                0);
+            if (live_uobject(field_camera_manager))
+            {
+                out.camera_manager = field_camera_manager;
+                camera_manager_source = "field:APlayerController.PlayerCameraManager@0x360";
+            }
+        }
+        if (!out.camera_rotation_used && live_uobject(out.camera_manager))
+        {
+            sdk::FVector camera_location{};
+            if (sdk_call_no_params_return_vector3(ref, out.camera_manager, "GetCameraLocation", camera_location))
+            {
+                capture_location = camera_location;
+                out.camera_location_used = true;
+                out.camera_location_source = "player_camera_manager";
+            }
+            sdk::FRotator camera_rotation{};
+            if (sdk_call_no_params_return_rotator(ref, out.camera_manager, "GetCameraRotation", camera_rotation))
+            {
+                const auto camera_forward = sdk_rotator_forward(camera_rotation);
+                const auto center_forward = sdk_vec_normalize(center_ray.direction);
+                const auto dot = sdk_vec_dot(sdk_vec_normalize(camera_forward), center_forward);
+                if (std::isfinite(dot) && dot > 0.80)
+                {
+                    capture_direction = camera_forward;
+                    out.camera_rotation_used = true;
+                    out.camera_rotation_source = "player_camera_manager";
+                }
+                else
+                {
+                    out.camera_rotation_used = false;
+                    out.camera_rotation_source = "deproject_center_ray_rejected_player_camera_rotation";
+                }
+            }
+            double camera_fov = 0.0;
+            if (sdk_call_no_params_return_number(ref, out.camera_manager, "GetFOVAngle", camera_fov) &&
+                std::isfinite(camera_fov) && camera_fov >= 10.0 && camera_fov <= 150.0)
+            {
+                if (!deproject_fov_valid)
+                {
+                    out.capture_fov = camera_fov;
+                    out.camera_fov_used = true;
+                    out.camera_fov_source = "player_camera_manager";
+                }
+                else
+                {
+                    out.camera_fov_used = false;
+                    out.camera_fov_source = "deproject_horizontal_preferred_over_player_camera_manager";
+                }
+            }
+        }
+        if (!out.camera_rotation_used && ctx.controller)
+        {
+            const auto control_rotation = safe_read<sdk::FRotator>(
+                ctx.controller + sdk::FieldOffsets::Controller_ControlRotation,
+                sdk::FRotator{});
+            const auto control_forward = sdk_rotator_forward(control_rotation);
+            const auto center_forward = sdk_vec_normalize(center_ray.direction);
+            const auto dot = sdk_vec_dot(sdk_vec_normalize(control_forward), center_forward);
+            if (std::isfinite(control_forward.X) && std::isfinite(control_forward.Y) && std::isfinite(control_forward.Z) &&
+                (std::abs(control_forward.X) + std::abs(control_forward.Y) + std::abs(control_forward.Z)) > 0.001 &&
+                std::isfinite(dot) && dot > 0.80)
+            {
+                capture_direction = control_forward;
+                out.camera_rotation_used = true;
+                out.camera_rotation_source = "field:AController.ControlRotation@0x320";
+            }
+        }
+        if (forced_control_rotation != nullptr && live_uobject(out.camera_manager))
+        {
+            if (!use_body_anchor)
+            {
+                sdk::FVector camera_location{};
+                if (sdk_call_no_params_return_vector3(ref, out.camera_manager, "GetCameraLocation", camera_location))
+                {
+                    capture_location = camera_location;
+                    out.camera_location_used = true;
+                    out.camera_location_source = "player_camera_manager_forced_rotation";
+                }
+            }
+            double camera_fov = 0.0;
+            if (sdk_call_no_params_return_number(ref, out.camera_manager, "GetFOVAngle", camera_fov) &&
+                std::isfinite(camera_fov) && camera_fov >= 10.0 && camera_fov <= 150.0)
+            {
+                out.capture_fov = camera_fov;
+                out.camera_fov_used = true;
+                out.camera_fov_source = use_body_anchor
+                    ? "player_camera_manager_body_anchor"
+                    : "player_camera_manager_forced_rotation";
+                deproject_fov_valid = true;
+            }
+        }
+        out.camera_manager_source = camera_manager_source;
+        out.capture_location = capture_location;
+        out.capture_direction = sdk_vec_normalize(capture_direction);
+        std::string failure{};
+        out.render_target = sdk_create_render_target(ref, ctx, out.width, out.height, failure);
+        out.render_target_created = out.render_target != 0;
+        if (!out.render_target)
+        {
+            out.failure = failure.empty() ? "front_capture_render_target_unavailable" : failure;
+            return out;
+        }
+        const auto scene_capture_class = ref.find_class("SceneCapture2D");
+        out.capture_actor = sdk_spawn_actor_from_class(ref, ctx, scene_capture_class, out.capture_location, failure);
+        out.capture_actor_spawned = out.capture_actor != 0;
+        if (!out.capture_actor)
+        {
+            out.failure = failure.empty() ? "front_capture_actor_spawn_failed" : failure;
+            return out;
+        }
+        sdk_set_actor_capture_transform(ref, out.capture_actor, out.capture_location, out.capture_direction);
+        out.capture_component = safe_read<std::uintptr_t>(out.capture_actor + sdk::FieldOffsets::SceneCapture2D_CaptureComponent2D, 0);
+        if (!out.capture_component)
+        {
+            out.capture_component = sdk_call_no_params_return_object(ref, out.capture_actor, "GetCaptureComponent2D", failure);
+        }
+        out.capture_component_found = out.capture_component != 0;
+        if (!out.capture_component)
+        {
+            out.failure = failure.empty() ? "front_capture_component_unavailable" : failure;
+            sdk_call_no_params(ref, out.capture_actor, "K2_DestroyActor");
+            return out;
+        }
+        out.texture_target_written = sdk_configure_scene_capture_component_typed(out.capture_component, out.render_target, out.capture_fov);
+        out.hide_component_called = native_front.mesh && sdk_call_object_param(ref, out.capture_component, "HideComponent", native_front.mesh);
+        if (!out.texture_target_written)
+        {
+            out.failure = "front_capture_texture_target_write_failed";
+            sdk_call_no_params(ref, out.capture_actor, "K2_DestroyActor");
+            return out;
+        }
+        out.capture_scene_called = sdk_call_no_params(ref, out.capture_component, "CaptureScene");
+        if (!out.capture_scene_called)
+        {
+            out.failure = "front_capture_scene_failed";
+            sdk_call_no_params(ref, out.capture_actor, "K2_DestroyActor");
+            return out;
+        }
+        Sleep(12);
+
+        struct ProjectedFrontSample
+        {
+            FrontSample surface{};
+            int x{0};
+            int y{0};
+            Color pixel_color{};
+            bool has_pixel{false};
+        };
+        std::vector<ProjectedFrontSample> projected{};
+        projected.reserve(native_front.samples.size());
+        double sum = 0.0;
+        int channels = 0;
+        bool initialized = false;
+        double raw_sum = 0.0;
+        int raw_channels = 0;
+        bool raw_initialized = false;
+        double resolved_delta_sum = 0.0;
+        double resolved_delta_max = 0.0;
+        int resolved_delta_samples = 0;
+        for (const auto& surface : native_front.samples)
+        {
+            ++out.project_attempts;
+            const double original_sx = clamp01(surface.screen_nx) * static_cast<double>(viewport_width);
+            const double original_sy = clamp01(surface.screen_ny) * static_cast<double>(viewport_height);
+            double sx = original_sx;
+            double sy = original_sy;
+            if (surface.has_world_position)
+            {
+                double projected_x = 0.0;
+                double projected_y = 0.0;
+                if (sdk_project_world_to_viewport(out.capture_location,
+                                                  out.capture_direction,
+                                                  out.capture_fov,
+                                                  viewport_width,
+                                                  viewport_height,
+                                                  surface.world_position,
+                                                  projected_x,
+                                                  projected_y))
+                {
+                    sx = projected_x;
+                    sy = projected_y;
+                    ++out.project_world_capture;
+                    const auto dx = sx - original_sx;
+                    const auto dy = sy - original_sy;
+                    const auto delta = std::sqrt(dx * dx + dy * dy);
+                    out.project_delta_sum_px += delta;
+                    out.project_delta_max_px = std::max(out.project_delta_max_px, delta);
+                }
+                else
+                {
+                    ++out.project_failed;
+                    continue;
+                }
+            }
+            const bool outside = sx < 0.0 || sy < 0.0 ||
+                                 sx >= static_cast<double>(viewport_width) ||
+                                 sy >= static_cast<double>(viewport_height);
+            if (outside)
+            {
+                ++out.project_out_of_view;
+                continue;
+            }
+            ++out.project_success;
+            const auto px = std::max(0, std::min(out.width - 1, static_cast<int>(std::round(sx * capture_scale_x))));
+            const auto py = std::max(0, std::min(out.height - 1, static_cast<int>(std::round(sy * capture_scale_y))));
+            auto projected_surface = surface;
+            projected.push_back(ProjectedFrontSample{projected_surface, px, py, {}, false});
+        }
+        if (projected.empty())
+        {
+            out.failure = "front_capture_project_world_to_screen_failed";
+            sdk_call_no_params(ref, out.capture_actor, "K2_DestroyActor");
+            return out;
+        }
+
+        SdkBulkReadbackDiagnostics bulk_diagnostics{};
+        auto bulk_candidates = sdk_read_render_target_bulk_candidates(ref, ctx, out.render_target, out.width, out.height, &bulk_diagnostics);
+        out.bulk_candidates = static_cast<int>(bulk_candidates.size());
+        out.bulk_available = out.bulk_candidates;
+        out.bulk_function_attempts = bulk_diagnostics.function_attempts;
+        out.bulk_process_event_ok = bulk_diagnostics.process_event_ok;
+        out.bulk_array_param_count = bulk_diagnostics.array_param_count;
+        out.bulk_array_offset = bulk_diagnostics.first_array_offset;
+        out.bulk_array_num = bulk_diagnostics.first_array_num;
+        out.bulk_array_max = bulk_diagnostics.first_array_max;
+        out.bulk_array_element_size = bulk_diagnostics.first_array_element_size;
+        out.bulk_decode_candidate_type = bulk_diagnostics.first_candidate_type;
+        out.bulk_decoded_pixels = bulk_diagnostics.decoded_pixels;
+        double best_median = 1000000.0;
+        double runner_up_median = 1000000.0;
+        int best_pairs = 0;
+        int best_candidate = -1;
+        bool best_flip_x = false;
+        bool best_flip_y = false;
+        SdkBulkColorTransform best_transform = SdkBulkColorTransform::Identity;
+        const std::pair<bool, bool> flip_candidates[]{{false, false}, {true, false}, {false, true}, {true, true}};
+        const int calibration_limit = std::min<int>(128, static_cast<int>(projected.size()));
+        const double stride = static_cast<double>(std::max<std::size_t>(1, projected.size())) / static_cast<double>(std::max(1, calibration_limit));
+        for (int i = 0; i < calibration_limit; ++i)
+        {
+            const auto sample_index = std::min<std::size_t>(projected.size() - 1,
+                                                            static_cast<std::size_t>(std::floor((static_cast<double>(i) + 0.5) * stride)));
+            auto& sample = projected[sample_index];
+            Color color{};
+            ++out.read_attempts;
+            const bool pixel_ok = sdk_read_render_target_raw_pixel(ref, ctx, out.render_target, sample.x, sample.y, color, out.read_function);
+            if (!pixel_ok)
+            {
+                ++out.missing_color;
+                continue;
+            }
+            sample.pixel_color = color;
+            sample.has_pixel = true;
+            ++out.read_success;
+        }
+        for (int candidate_index = 0; candidate_index < static_cast<int>(bulk_candidates.size()); ++candidate_index)
+        {
+            const auto& candidate = bulk_candidates[static_cast<std::size_t>(candidate_index)];
+            if (!candidate.ok || candidate.pixels.size() < static_cast<std::size_t>(out.width) * static_cast<std::size_t>(out.height))
+            {
+                continue;
+            }
+            const auto color_candidates = sdk_allowed_bulk_color_transforms(candidate.inner_type);
+            for (const auto& flip : flip_candidates)
+            {
+                for (const auto transform : color_candidates)
+                {
+                    std::vector<double> distances{};
+                    distances.reserve(static_cast<std::size_t>(calibration_limit));
+                    for (int i = 0; i < calibration_limit; ++i)
+                    {
+                        const auto sample_index = std::min<std::size_t>(projected.size() - 1,
+                                                                        static_cast<std::size_t>(std::floor((static_cast<double>(i) + 0.5) * stride)));
+                        const auto& sample = projected[sample_index];
+                        if (!sample.has_pixel)
+                        {
+                            continue;
+                        }
+                        const int bx = flip.first ? (out.width - 1 - sample.x) : sample.x;
+                        const int by = flip.second ? (out.height - 1 - sample.y) : sample.y;
+                        const auto pixel_index = static_cast<std::size_t>(by) * static_cast<std::size_t>(out.width) + static_cast<std::size_t>(bx);
+                        if (pixel_index >= candidate.pixels.size())
+                        {
+                            continue;
+                        }
+                        distances.push_back(sdk_color_distance_rgb(sample.pixel_color,
+                                                                   sdk_apply_bulk_color_transform(candidate.pixels[pixel_index], transform)));
+                    }
+                    const int pairs = static_cast<int>(distances.size());
+                    const double median = sdk_median(std::move(distances));
+                    if (median < best_median)
+                    {
+                        runner_up_median = best_median;
+                        best_median = median;
+                        best_pairs = pairs;
+                        best_candidate = candidate_index;
+                        best_flip_x = flip.first;
+                        best_flip_y = flip.second;
+                        best_transform = transform;
+                    }
+                    else if (median < runner_up_median)
+                    {
+                        runner_up_median = median;
+                    }
+                }
+            }
+        }
+        out.bulk_calibration_samples = calibration_limit;
+        out.bulk_calibration_pairs = best_pairs;
+        out.bulk_calibration_best_median = best_median < 999999.0 ? best_median : 0.0;
+        out.bulk_calibration_runner_up_median = runner_up_median < 999999.0 ? runner_up_median : 0.0;
+        const bool separated_from_runner = runner_up_median >= 999999.0 ||
+                                           best_median <= runner_up_median * 0.90 ||
+                                           (runner_up_median - best_median) >= 0.012;
+        out.image_bulk_calibration_ok = best_candidate >= 0 &&
+                                        best_pairs >= std::min(16, std::max(1, calibration_limit / 2)) &&
+                                        best_median <= 0.18 &&
+                                        separated_from_runner;
+        if (!out.image_bulk_calibration_ok)
+        {
+            out.ok = false;
+            out.failure = "front_texture_bulk_calibration_unavailable";
+            sdk_call_no_params(ref, out.capture_actor, "K2_DestroyActor");
+            return out;
+        }
+
+        const auto& bulk = bulk_candidates[static_cast<std::size_t>(best_candidate)];
+        out.bulk_readback_used = true;
+        out.texture_source = "bulk_calibrated_direct_texture";
+        out.bulk_backend = bulk.backend;
+        out.bulk_inner_type = bulk.inner_type;
+        out.bulk_bool_variant = bulk.bool_variant;
+        out.bulk_decoded_pixels = bulk.decoded_pixels;
+        out.bulk_decode_candidate_type = bulk.function_name + ":" + bulk.inner_type;
+        out.bulk_color_transform = sdk_bulk_color_transform_label(best_transform);
+        out.bulk_calibration_backend = bulk.function_name + "|" + bulk.bool_variant + "|" +
+                                       std::string(best_flip_x ? "flip_x" : "identity_x") + "|" +
+                                       std::string(best_flip_y ? "flip_y" : "identity_y") + "|" +
+                                       out.bulk_color_transform;
+        out.capture_transform_backend = std::string(best_flip_x || best_flip_y ? "bulk_calibrated_flip" : "bulk_calibrated_identity");
+
+        out.samples.reserve(projected.size());
+        for (const auto& projected_sample : projected)
+        {
+            const int bx = best_flip_x ? (out.width - 1 - projected_sample.x) : projected_sample.x;
+            const int by = best_flip_y ? (out.height - 1 - projected_sample.y) : projected_sample.y;
+            const auto pixel_index = static_cast<std::size_t>(by) * static_cast<std::size_t>(out.width) + static_cast<std::size_t>(bx);
+            if (pixel_index >= bulk.pixels.size())
+            {
+                ++out.missing_color;
+                continue;
+            }
+            const auto raw_color = sdk_apply_bulk_color_transform(bulk.pixels[pixel_index], best_transform);
+            const double raw_values[]{clamp01(raw_color.r), clamp01(raw_color.g), clamp01(raw_color.b)};
+            bool raw_whiteish = true;
+            for (const auto value : raw_values)
+            {
+                if (!raw_initialized)
+                {
+                    out.raw_rgb_min = value;
+                    out.raw_rgb_max = value;
+                    raw_initialized = true;
+                }
+                out.raw_rgb_min = std::min(out.raw_rgb_min, value);
+                out.raw_rgb_max = std::max(out.raw_rgb_max, value);
+                raw_sum += value;
+                ++raw_channels;
+                if (value < 0.97)
+                {
+                    raw_whiteish = false;
+                }
+            }
+            if (raw_whiteish)
+            {
+                ++out.raw_whiteish_samples;
+            }
+            auto resolved_color = raw_color;
+            resolved_color.roughness = 0.65;
+            resolved_color.metallic = 0.0;
+            const auto resolved_delta = sdk_color_distance_rgb(raw_color, resolved_color);
+            if (std::isfinite(resolved_delta))
+            {
+                resolved_delta_sum += resolved_delta;
+                resolved_delta_max = std::max(resolved_delta_max, resolved_delta);
+                ++resolved_delta_samples;
+            }
+            FrontSample sample = projected_sample.surface;
+            sample.r = clamp01(resolved_color.r);
+            sample.g = clamp01(resolved_color.g);
+            sample.b = clamp01(resolved_color.b);
+            sample.metallic = clamp01(resolved_color.metallic);
+            sample.roughness = clamp01(resolved_color.roughness);
+            out.samples.push_back(sample);
+            const double values[]{sample.r, sample.g, sample.b};
+            bool whiteish = true;
+            for (const auto value : values)
+            {
+                if (!initialized)
+                {
+                    out.rgb_min = value;
+                    out.rgb_max = value;
+                    initialized = true;
+                }
+                out.rgb_min = std::min(out.rgb_min, value);
+                out.rgb_max = std::max(out.rgb_max, value);
+                sum += value;
+                ++channels;
+                if (value < 0.97)
+                {
+                    whiteish = false;
+                }
+            }
+            if (whiteish)
+            {
+                ++out.whiteish_samples;
+            }
+        }
+        out.rgb_avg = channels > 0 ? sum / static_cast<double>(channels) : 0.0;
+        out.luma_range = out.rgb_max - out.rgb_min;
+        out.raw_rgb_avg = raw_channels > 0 ? raw_sum / static_cast<double>(raw_channels) : 0.0;
+        out.raw_luma_range = out.raw_rgb_max - out.raw_rgb_min;
+        out.resolved_rgb_delta_avg = resolved_delta_samples > 0 ? resolved_delta_sum / static_cast<double>(resolved_delta_samples) : 0.0;
+        out.resolved_rgb_delta_max = resolved_delta_max;
+        out.resolved_rgb_delta_samples = resolved_delta_samples;
+        out.uniform = out.samples.size() > 0 && out.luma_range < 0.006;
+        out.all_whiteish = out.samples.size() > 0 && out.whiteish_samples == static_cast<int>(out.samples.size());
+        out.ok = static_cast<int>(out.samples.size()) >= native_front.min_front_hits && !out.uniform && !out.all_whiteish;
+        out.failure = out.ok ? "ok" : (out.samples.empty() ? "front_capture_color_empty" : "front_capture_quality_failed");
+        sdk_call_no_params(ref, out.capture_actor, "K2_DestroyActor");
+        return out;
+    }
+
+    auto sdk_capture_metadata(const SdkFrontCaptureResult& capture) -> std::string
+    {
+        return ",\"front_capture_ok\":" + std::string(json_bool(capture.ok)) +
+               ",\"front_capture_failure\":\"" + json_escape(capture.failure) + "\"" +
+               ",\"capture_resolution\":\"" + std::to_string(capture.width) + "x" + std::to_string(capture.height) + "\"" +
+               ",\"capture_fov\":" + std::to_string(capture.capture_fov) +
+               ",\"capture_resolution_source\":\"" + json_escape(capture.capture_resolution_source) + "\"" +
+               ",\"capture_requested_texture_width\":" + std::to_string(capture.requested_texture_width) +
+               ",\"capture_requested_texture_height\":" + std::to_string(capture.requested_texture_height) +
+               ",\"capture_viewport_width\":" + std::to_string(capture.viewport_width) +
+               ",\"capture_viewport_height\":" + std::to_string(capture.viewport_height) +
+               ",\"capture_viewport_aspect\":" + std::to_string(capture.viewport_aspect) +
+               ",\"capture_aspect\":" + std::to_string(capture.capture_aspect) +
+               ",\"capture_scale_x\":" + std::to_string(capture.capture_scale_x) +
+               ",\"capture_scale_y\":" + std::to_string(capture.capture_scale_y) +
+               ",\"front_capture_render_target\":\"" + hex_address(capture.render_target) + "\"" +
+               ",\"front_capture_actor\":\"" + hex_address(capture.capture_actor) + "\"" +
+               ",\"front_capture_component\":\"" + hex_address(capture.capture_component) + "\"" +
+               ",\"front_capture_read_function\":\"" + hex_address(capture.read_function) + "\"" +
+               ",\"front_capture_render_target_created\":" + std::string(json_bool(capture.render_target_created)) +
+               ",\"front_capture_actor_spawned\":" + std::string(json_bool(capture.capture_actor_spawned)) +
+               ",\"front_capture_component_found\":" + std::string(json_bool(capture.capture_component_found)) +
+               ",\"front_capture_texture_target_written\":" + std::string(json_bool(capture.texture_target_written)) +
+               ",\"front_capture_hide_component_called\":" + std::string(json_bool(capture.hide_component_called)) +
+               ",\"front_capture_scene_called\":" + std::string(json_bool(capture.capture_scene_called)) +
+               ",\"capture_camera_manager\":\"" + hex_address(capture.camera_manager) + "\"" +
+               ",\"capture_camera_manager_source\":\"" + json_escape(capture.camera_manager_source) + "\"" +
+               ",\"capture_camera_location_used\":" + std::string(json_bool(capture.camera_location_used)) +
+               ",\"capture_camera_rotation_used\":" + std::string(json_bool(capture.camera_rotation_used)) +
+               ",\"capture_camera_fov_used\":" + std::string(json_bool(capture.camera_fov_used)) +
+               ",\"capture_camera_location_source\":\"" + json_escape(capture.camera_location_source) + "\"" +
+               ",\"capture_camera_rotation_source\":\"" + json_escape(capture.camera_rotation_source) + "\"" +
+               ",\"capture_camera_fov_source\":\"" + json_escape(capture.camera_fov_source) + "\"" +
+               ",\"capture_location_x\":" + std::to_string(capture.capture_location.X) +
+               ",\"capture_location_y\":" + std::to_string(capture.capture_location.Y) +
+               ",\"capture_location_z\":" + std::to_string(capture.capture_location.Z) +
+               ",\"capture_direction_x\":" + std::to_string(capture.capture_direction.X) +
+               ",\"capture_direction_y\":" + std::to_string(capture.capture_direction.Y) +
+               ",\"capture_direction_z\":" + std::to_string(capture.capture_direction.Z) +
+               ",\"front_capture_project_attempts\":" + std::to_string(capture.project_attempts) +
+               ",\"front_capture_project_success\":" + std::to_string(capture.project_success) +
+               ",\"front_capture_project_failed\":" + std::to_string(capture.project_failed) +
+               ",\"front_capture_project_world_capture\":" + std::to_string(capture.project_world_capture) +
+               ",\"front_capture_project_out_of_view\":" + std::to_string(capture.project_out_of_view) +
+               ",\"front_capture_project_delta_avg_px\":" + std::to_string(capture.project_success > 0 ? capture.project_delta_sum_px / static_cast<double>(capture.project_success) : 0.0) +
+               ",\"front_capture_project_delta_max_px\":" + std::to_string(capture.project_delta_max_px) +
+               ",\"front_capture_read_attempts\":" + std::to_string(capture.read_attempts) +
+               ",\"front_capture_read_success\":" + std::to_string(capture.read_success) +
+               ",\"front_capture_missing_color\":" + std::to_string(capture.missing_color) +
+               ",\"front_raw_rgb_min\":" + std::to_string(capture.raw_rgb_min) +
+               ",\"front_raw_rgb_max\":" + std::to_string(capture.raw_rgb_max) +
+               ",\"front_raw_rgb_avg\":" + std::to_string(capture.raw_rgb_avg) +
+               ",\"front_raw_luma_range\":" + std::to_string(capture.raw_luma_range) +
+               ",\"front_raw_rgb_whiteish_samples\":" + std::to_string(capture.raw_whiteish_samples) +
+               ",\"front_resolved_rgb_delta_avg\":" + std::to_string(capture.resolved_rgb_delta_avg) +
+               ",\"front_resolved_rgb_delta_max\":" + std::to_string(capture.resolved_rgb_delta_max) +
+               ",\"front_resolved_rgb_delta_samples\":" + std::to_string(capture.resolved_rgb_delta_samples) +
+               ",\"front_rgb_min\":" + std::to_string(capture.rgb_min) +
+               ",\"front_rgb_max\":" + std::to_string(capture.rgb_max) +
+               ",\"front_rgb_avg\":" + std::to_string(capture.rgb_avg) +
+               ",\"front_luma_range\":" + std::to_string(capture.luma_range) +
+               ",\"front_rgb_whiteish_samples\":" + std::to_string(capture.whiteish_samples) +
+               ",\"front_rgb_uniform\":" + std::string(json_bool(capture.uniform)) +
+               ",\"front_rgb_all_whiteish\":" + std::string(json_bool(capture.all_whiteish)) +
+               ",\"front_texture_source\":\"" + json_escape(capture.texture_source) + "\"" +
+               ",\"bulk_readback_used\":" + std::string(json_bool(capture.bulk_readback_used)) +
+               ",\"image_bulk_calibration_ok\":" + std::string(json_bool(capture.image_bulk_calibration_ok)) +
+               ",\"bulk_candidates\":" + std::to_string(capture.bulk_candidates) +
+               ",\"bulk_available\":" + std::to_string(capture.bulk_available) +
+               ",\"bulk_decoded_pixels\":" + std::to_string(capture.bulk_decoded_pixels) +
+               ",\"bulk_function_attempts\":" + std::to_string(capture.bulk_function_attempts) +
+               ",\"bulk_process_event_ok\":" + std::to_string(capture.bulk_process_event_ok) +
+               ",\"bulk_array_param_count\":" + std::to_string(capture.bulk_array_param_count) +
+               ",\"bulk_array_offset\":" + std::to_string(capture.bulk_array_offset) +
+               ",\"bulk_array_num\":" + std::to_string(capture.bulk_array_num) +
+               ",\"bulk_array_max\":" + std::to_string(capture.bulk_array_max) +
+               ",\"bulk_array_element_size\":" + std::to_string(capture.bulk_array_element_size) +
+               ",\"bulk_decode_candidate_type\":\"" + json_escape(capture.bulk_decode_candidate_type) + "\"" +
+               ",\"bulk_decode_pixels\":" + std::to_string(capture.bulk_decoded_pixels) +
+               ",\"bulk_calibration_samples\":" + std::to_string(capture.bulk_calibration_samples) +
+               ",\"bulk_calibration_pairs\":" + std::to_string(capture.bulk_calibration_pairs) +
+               ",\"bulk_calibration_best_median\":" + std::to_string(capture.bulk_calibration_best_median) +
+               ",\"bulk_calibration_runner_up_median\":" + std::to_string(capture.bulk_calibration_runner_up_median) +
+               ",\"bulk_backend\":\"" + json_escape(capture.bulk_backend) + "\"" +
+               ",\"bulk_inner_type\":\"" + json_escape(capture.bulk_inner_type) + "\"" +
+               ",\"bulk_bool_variant\":\"" + json_escape(capture.bulk_bool_variant) + "\"" +
+               ",\"bulk_color_transform\":\"" + json_escape(capture.bulk_color_transform) + "\"" +
+               ",\"bulk_calibration_backend\":\"" + json_escape(capture.bulk_calibration_backend) + "\"" +
+               ",\"capture_transform_backend\":\"" + json_escape(capture.capture_transform_backend) + "\"" +
+               ",\"texture_source_verified\":" + std::string(json_bool(capture.bulk_readback_used &&
+                                                                        capture.image_bulk_calibration_ok &&
+                                                                        capture.texture_source == "bulk_calibrated_direct_texture"));
+    }
+
+    auto sdk_find_color_picker_caller(Reflection& ref) -> std::uintptr_t
+    {
+        if (const auto instance = ref.find_first_instance("ColorPicker"))
+        {
+            return instance;
+        }
+        const auto cls = ref.find_class("ColorPicker");
+        if (!cls)
+        {
+            return 0;
+        }
+        std::uintptr_t cdo = 0;
+        ref.for_each_object([&](std::uintptr_t obj) {
+            if (ref.class_ptr(obj) == cls && (safe_read<std::uint32_t>(obj + OffObjectFlags, 0) & RFClassDefaultObject) != 0)
+            {
+                cdo = obj;
+                return true;
+            }
+            return false;
+        });
+        return cdo ? cdo : cls;
+    }
+
+    struct TemplateUvBrushAsyncJob
+    {
+        enum class Phase
+        {
+            CameraSettle,
+            Phase0BaseGrid,
+            Phase0Dense,
+            CaptureSource,
+            BeginPaint,
+            ReplicateStrokes,
+            Finish
+        };
+
+        struct TemplatePoint
+        {
+            double x{0.0};
+            double y{0.0};
+            double u{0.0};
+            double v{0.0};
+            double world_x{0.0};
+            double world_y{0.0};
+            double world_z{0.0};
+            bool has_world{false};
+            double r{0.0};
+            double g{0.0};
+            double b{0.0};
+            double metallic{0.0};
+            double roughness{0.85};
+            double stroke_radius{0.01};
+            int paint_pass{0};
+            bool has_color{false};
+        };
+
+        struct ScreenCandidate
+        {
+            double nx{0.0};
+            double ny{0.0};
+        };
+
+        std::shared_ptr<QueuedPaintJob> queued{};
+        Phase phase{Phase::Phase0BaseGrid};
+        std::uintptr_t world{0};
+        std::uintptr_t controller{0};
+        std::uintptr_t component{0};
+        std::uintptr_t mesh{0};
+        std::uintptr_t hit_test_function{0};
+        std::uintptr_t server_paint_batch_function{0};
+        int viewport_width{0};
+        int viewport_height{0};
+        int base_cols{0};
+        int base_rows{0};
+        int dense_rows{0};
+        int next_index{0};
+        int capture_index{0};
+        int replicate_index{0};
+        int point_target{0};
+        int coverage_sample_target{0};
+        int coverage_candidate_target{0};
+        int paint_sample_attempts{0};
+        int paint_sample_success{0};
+        int paint_sample_failures{0};
+        int sampler_probe_attempts{0};
+        int sampler_probe_misses{0};
+        int candidate_count{0};
+        int points_before_downsample{0};
+        int downsample_removed{0};
+        int sample_pool_points{0};
+        int fill_sample_target{0};
+        int coverage_strokes{0};
+        int detail_strokes{0};
+        double silhouette_area_px{0.0};
+        int base_attempts{0};
+        int base_hits{0};
+        int dense_attempts{0};
+        int dense_hits{0};
+        int dedupe_skipped{0};
+        int runtime_hit_test_attempts{0};
+        int runtime_hit_test_hits{0};
+        int runtime_hit_test_failures{0};
+        int basecolor_samples{0};
+        int server_batch_success{0};
+        int server_batch_failures{0};
+        int server_batch_calls{0};
+        int server_strokes_sent{0};
+        int server_batch_limit{0};
+        int server_batch_delay_ms{0};
+        int commit_pulses{0};
+        int progress_percent{-1};
+        double template_point_elapsed_ms{0.0};
+        double template_capture_elapsed_ms{0.0};
+        double server_batch_elapsed_ms{0.0};
+        double base_probe_radius{0.010};
+        double base_probe_spacing_px{0.0};
+        double coverage_brush_screen_radius_px{0.0};
+        double coverage_sample_spacing_px{0.0};
+        double fill_sample_spacing_px{0.0};
+        double detail_sample_spacing_px{0.0};
+        double coverage_candidate_spacing_px{0.0};
+        double coverage_estimated_acceptance{0.0};
+        double sampling_brush_radius{0.010};
+        double bbox_min_nx{1.0};
+        double bbox_min_ny{1.0};
+        double bbox_max_nx{0.0};
+        double bbox_max_ny{0.0};
+        bool source_sorted{false};
+        sdk::FRuntimeBrushSettings old_brush{};
+        sdk::FRuntimeBrushSettings brush{};
+        bool explicit_stroke_batch_used{false};
+        SdkReplicationSnapshot replication_after_explicit_batches{};
+        double brush_radius{0.01};
+        double brush_radius_raw{0.01};
+        double sample_spacing_factor{0.25};
+        int min_direct_points{5000};
+        int paint_quality{8};
+        double camera_yaw_offset{0.0};
+        sdk::FRotator camera_yaw_baseline{};
+        bool camera_yaw_baseline_set{false};
+        sdk::FRotator camera_target_rotation{};
+        bool camera_target_set{false};
+        bool camera_use_body_anchor{false};
+        double camera_body_pullback{150.0};
+        int camera_settle_ms{1500};
+        std::chrono::steady_clock::time_point camera_settle_started{};
+        bool camera_settle_started_set{false};
+        double rgb_min{1.0};
+        double rgb_max{0.0};
+        double rgb_sum_r{0.0};
+        double rgb_sum_g{0.0};
+        double rgb_sum_b{0.0};
+        double metallic_sum{0.0};
+        double roughness_sum{0.0};
+        std::string metadata{};
+        std::string first_failure{};
+        std::string server_batch_rpc{"<none>"};
+        std::string color_source{"scene_capture_basecolor_bulk_readback"};
+        std::vector<TemplatePoint> points{};
+        std::vector<TemplatePoint> sample_pool{};
+        std::vector<ScreenCandidate> dense_candidates{};
+        std::vector<int> silhouette_min_ix{};
+        std::vector<int> silhouette_max_ix{};
+        std::vector<std::uint8_t> uv_bins{};
+        std::chrono::steady_clock::time_point started{};
+        std::chrono::steady_clock::time_point server_batch_started{};
+        std::chrono::steady_clock::time_point server_next_batch_time{};
+        UINT_PTR server_batch_timer_id{0};
+        std::chrono::steady_clock::time_point last_tick{};
+    };
+
+    std::mutex g_template_uv_brush_mutex;
+    std::shared_ptr<TemplateUvBrushAsyncJob> g_template_uv_brush_job{};
+
+    auto is_template_uv_brush_request(const std::string& request) -> bool
+    {
+        return request.find("\"native_apply_mode\":\"template_brush_paint\"") != std::string::npos ||
+               request.find("\"route\":\"f10_template_brush_paint\"") != std::string::npos;
+    }
+
+    void complete_template_uv_brush_job(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, const std::string& response)
+    {
+        if (!job || !job->queued)
+        {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            job->queued->response = response;
+            job->queued->done = true;
+        }
+        g_paint_jobs_cv.notify_all();
+    }
+
+    auto template_add_template_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job,
+                                   double screen_x,
+                                   double screen_y,
+                                   double u,
+                                   double v,
+                                   const sdk::FVector* world_position = nullptr) -> bool
+    {
+        if (!job)
+        {
+            return false;
+        }
+        if (!std::isfinite(screen_x) || !std::isfinite(screen_y) || !std::isfinite(u) || !std::isfinite(v))
+        {
+            return false;
+        }
+        u = clamp01(u);
+        v = clamp01(v);
+        constexpr int Quant = 2048;
+        if (job->uv_bins.empty())
+        {
+            job->uv_bins.assign(Quant * Quant, 0);
+        }
+        const int qu = std::max(0, std::min(Quant - 1, static_cast<int>(u * static_cast<double>(Quant - 1) + 0.5)));
+        const int qv = std::max(0, std::min(Quant - 1, static_cast<int>(v * static_cast<double>(Quant - 1) + 0.5)));
+        const int qi = qv * Quant + qu;
+        if (job->uv_bins[static_cast<std::size_t>(qi)] != 0)
+        {
+            ++job->dedupe_skipped;
+            return false;
+        }
+        job->uv_bins[static_cast<std::size_t>(qi)] = 1;
+        TemplateUvBrushAsyncJob::TemplatePoint point{};
+        point.x = screen_x;
+        point.y = screen_y;
+        point.u = u;
+        point.v = v;
+        if (world_position != nullptr &&
+            std::isfinite(world_position->X) && std::isfinite(world_position->Y) && std::isfinite(world_position->Z))
+        {
+            point.world_x = world_position->X;
+            point.world_y = world_position->Y;
+            point.world_z = world_position->Z;
+            point.has_world = true;
+        }
+        job->points.push_back(point);
+        return true;
+    }
+
+    auto template_hit_to_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, double screen_x, double screen_y) -> bool
+    {
+        ++job->runtime_hit_test_attempts;
+        sdk::RuntimePaintableComponent_HitTestAtScreenPosition hit{};
+        hit.MeshComponent = reinterpret_cast<void*>(job->mesh);
+        hit.ScreenPosition = sdk::FVector2D{screen_x, screen_y};
+        hit.PlayerController = reinterpret_cast<void*>(job->controller);
+        hit.bUseCachedTriangles = true;
+        std::string failure{};
+        if (!process_event(job->component, job->hit_test_function, reinterpret_cast<std::uint8_t*>(&hit), failure) || !hit.ReturnValue.bSuccess)
+        {
+            ++job->runtime_hit_test_failures;
+            return false;
+        }
+        const sdk::FVector* world = nullptr;
+        sdk::FVector world_position{};
+        if (std::isfinite(hit.ReturnValue.HitWorldPosition.X) &&
+            std::isfinite(hit.ReturnValue.HitWorldPosition.Y) &&
+            std::isfinite(hit.ReturnValue.HitWorldPosition.Z))
+        {
+            world_position = hit.ReturnValue.HitWorldPosition;
+            world = &world_position;
+        }
+        if (template_add_template_point(job,
+                                        screen_x,
+                                        screen_y,
+                                        hit.ReturnValue.HitUV.X,
+                                        hit.ReturnValue.HitUV.Y,
+                                        world))
+        {
+            ++job->runtime_hit_test_hits;
+            return true;
+        }
+        return false;
+    }
+
+    auto template_build_dense_candidates(const std::shared_ptr<TemplateUvBrushAsyncJob>& job) -> void
+    {
+        if (!job || job->base_rows <= 0 || job->base_cols <= 0 || job->viewport_width <= 0 || job->viewport_height <= 0)
+        {
+            return;
+        }
+        job->dense_candidates.clear();
+        job->silhouette_area_px = 0.0;
+
+        struct RowInterval
+        {
+            double min_nx{0.0};
+            double max_nx{0.0};
+            bool valid{false};
+        };
+
+        std::vector<RowInterval> rows(static_cast<std::size_t>(std::max(1, job->dense_rows)));
+        const double min_ny = clamp01(job->bbox_min_ny);
+        const double max_ny = clamp01(job->bbox_max_ny);
+        const double span_ny = std::max(0.001, max_ny - min_ny);
+        const double span_height_px = std::max(1.0, span_ny * static_cast<double>(job->viewport_height));
+
+        auto nearest_base_row = [&](double ny) -> int {
+            const double normalized = clamp01((ny - 0.02) / 0.96);
+            const int preferred = std::max(0, std::min(job->base_rows - 1, static_cast<int>(std::round(normalized * static_cast<double>(job->base_rows - 1)))));
+            int best = -1;
+            int best_distance = 1000000;
+            for (int row = 0; row < job->base_rows; ++row)
+            {
+                if (row >= static_cast<int>(job->silhouette_min_ix.size()) ||
+                    row >= static_cast<int>(job->silhouette_max_ix.size()) ||
+                    job->silhouette_min_ix[static_cast<std::size_t>(row)] > job->silhouette_max_ix[static_cast<std::size_t>(row)])
+                {
+                    continue;
+                }
+                const int distance = std::abs(row - preferred);
+                if (distance < best_distance)
+                {
+                    best = row;
+                    best_distance = distance;
+                }
+            }
+            return best;
+        };
+
+        auto build_rows = [&](int row_count, std::vector<RowInterval>& out_rows) -> double {
+            row_count = std::max(1, row_count);
+            out_rows.assign(static_cast<std::size_t>(row_count), RowInterval{});
+            double area_px = 0.0;
+            const double row_height_px = span_height_px / static_cast<double>(row_count);
+            for (int row = 0; row < row_count; ++row)
+            {
+                const double ty = (static_cast<double>(row) + 0.5) / static_cast<double>(row_count);
+                const double ny = min_ny + span_ny * ty;
+                const int base_row = nearest_base_row(ny);
+                if (base_row < 0)
+                {
+                    continue;
+                }
+                const int min_ix = std::max(0, job->silhouette_min_ix[static_cast<std::size_t>(base_row)] - 1);
+                const int max_ix = std::min(job->base_cols - 1, job->silhouette_max_ix[static_cast<std::size_t>(base_row)] + 1);
+                if (min_ix > max_ix)
+                {
+                    continue;
+                }
+                const double min_nx = clamp01(0.06 + (static_cast<double>(min_ix) / static_cast<double>(job->base_cols)) * 0.88);
+                const double max_nx = clamp01(0.06 + (static_cast<double>(max_ix + 1) / static_cast<double>(job->base_cols)) * 0.88);
+                if (max_nx <= min_nx)
+                {
+                    continue;
+                }
+                out_rows[static_cast<std::size_t>(row)] = RowInterval{min_nx, max_nx, true};
+                area_px += (max_nx - min_nx) * static_cast<double>(job->viewport_width) * row_height_px;
+            }
+            return area_px;
+        };
+
+        const int probe_rows = std::max(1, job->base_rows * 2);
+        job->silhouette_area_px = build_rows(probe_rows, rows);
+        if (job->silhouette_area_px <= 0.0)
+        {
+            return;
+        }
+
+        const double paint_radius = std::max(0.0001, job->brush_radius);
+        const double sampling_radius = std::max(0.0001, job->sampling_brush_radius);
+        const double viewport_short_px = static_cast<double>(std::max(1, std::min(job->viewport_width, job->viewport_height)));
+        job->coverage_brush_screen_radius_px = std::max(1.0, viewport_short_px * paint_radius);
+        job->fill_sample_spacing_px = std::max(1.0, job->coverage_brush_screen_radius_px * job->sample_spacing_factor);
+        job->fill_sample_target = std::max(
+            1,
+            static_cast<int>(std::ceil(job->silhouette_area_px /
+                                       std::max(1.0, job->fill_sample_spacing_px * job->fill_sample_spacing_px))));
+        const double sampling_brush_screen_radius_px = std::max(1.0, viewport_short_px * sampling_radius);
+        job->detail_sample_spacing_px = std::max(1.0, sampling_brush_screen_radius_px * job->sample_spacing_factor);
+        job->coverage_sample_spacing_px = job->detail_sample_spacing_px;
+        job->coverage_sample_target = std::max(
+            job->fill_sample_target,
+            static_cast<int>(std::ceil(job->silhouette_area_px /
+                                       std::max(1.0, job->coverage_sample_spacing_px * job->coverage_sample_spacing_px))));
+        const double base_acceptance = job->base_attempts > 0
+                                           ? static_cast<double>(job->base_hits) / static_cast<double>(job->base_attempts)
+                                           : 0.0;
+        job->coverage_estimated_acceptance = std::max(0.18, std::min(0.78, base_acceptance * 16.0));
+        job->coverage_candidate_target = std::max(
+            job->coverage_sample_target,
+            static_cast<int>(std::ceil(static_cast<double>(job->coverage_sample_target) /
+                                       std::max(0.01, job->coverage_estimated_acceptance))));
+        job->coverage_candidate_spacing_px = std::max(
+            1.0,
+            std::sqrt(job->silhouette_area_px / static_cast<double>(std::max(1, job->coverage_candidate_target))));
+        job->point_target = job->coverage_sample_target;
+        if (job->min_direct_points > 0)
+        {
+            job->point_target = std::max(job->point_target, job->min_direct_points);
+        }
+        job->dense_rows = std::max(
+            1,
+            std::min(job->viewport_height,
+                     static_cast<int>(std::ceil(span_height_px / job->coverage_candidate_spacing_px))));
+        job->silhouette_area_px = build_rows(job->dense_rows, rows);
+        if (job->silhouette_area_px <= 0.0)
+        {
+            return;
+        }
+        job->points.reserve(static_cast<std::size_t>(std::max(job->point_target, static_cast<int>(job->points.size()))));
+
+        std::vector<TemplateUvBrushAsyncJob::ScreenCandidate> candidates{};
+        candidates.reserve(static_cast<std::size_t>(std::max(1, job->coverage_candidate_target)));
+        for (int row = 0; row < job->dense_rows; ++row)
+        {
+            const auto& interval = rows[static_cast<std::size_t>(row)];
+            if (!interval.valid)
+            {
+                continue;
+            }
+            const double ty = (static_cast<double>(row) + 0.5) / static_cast<double>(std::max(1, job->dense_rows));
+            const double ny = min_ny + span_ny * ty;
+            const double width_px = std::max(1.0, (interval.max_nx - interval.min_nx) * static_cast<double>(job->viewport_width));
+            const int cols = std::max(1, static_cast<int>(std::ceil(width_px / job->coverage_candidate_spacing_px)));
+            for (int col = 0; col < cols; ++col)
+            {
+                const double tx = (static_cast<double>(col) + 0.5) / static_cast<double>(cols);
+                candidates.push_back(TemplateUvBrushAsyncJob::ScreenCandidate{interval.min_nx + (interval.max_nx - interval.min_nx) * tx, ny});
+            }
+        }
+
+        if (static_cast<int>(candidates.size()) > job->coverage_candidate_target)
+        {
+            job->dense_candidates.reserve(static_cast<std::size_t>(job->coverage_candidate_target));
+            for (int i = 0; i < job->coverage_candidate_target; ++i)
+            {
+                const std::size_t index = static_cast<std::size_t>((static_cast<unsigned long long>(i) * static_cast<unsigned long long>(candidates.size())) / static_cast<unsigned long long>(job->coverage_candidate_target));
+                job->dense_candidates.push_back(candidates[std::min(index, candidates.size() - 1)]);
+            }
+        }
+        else
+        {
+            job->dense_candidates.swap(candidates);
+        }
+        job->candidate_count = static_cast<int>(job->dense_candidates.size());
+    }
+
+    auto template_point_yx_less(const TemplateUvBrushAsyncJob::TemplatePoint& a,
+                                const TemplateUvBrushAsyncJob::TemplatePoint& b) -> bool
+    {
+        if (a.y == b.y) return a.x < b.x;
+        return a.y < b.y;
+    }
+
+    auto template_select_uniform_yx(std::vector<TemplateUvBrushAsyncJob::TemplatePoint> source,
+                                    int target) -> std::vector<TemplateUvBrushAsyncJob::TemplatePoint>
+    {
+        if (target <= 0 || static_cast<int>(source.size()) <= target)
+        {
+            std::sort(source.begin(), source.end(), template_point_yx_less);
+            return source;
+        }
+
+        std::sort(source.begin(), source.end(), template_point_yx_less);
+        std::vector<TemplateUvBrushAsyncJob::TemplatePoint> selected{};
+        selected.reserve(static_cast<std::size_t>(target));
+        const auto source_count = source.size();
+        for (int i = 0; i < target; ++i)
+        {
+            const auto index = static_cast<std::size_t>(
+                std::min<double>(
+                    static_cast<double>(source_count - 1),
+                    std::floor(((static_cast<double>(i) + 0.5) * static_cast<double>(source_count)) /
+                               static_cast<double>(target))));
+            selected.push_back(source[index]);
+        }
+        return selected;
+    }
+
+    auto template_downsample_points_to_target(const std::shared_ptr<TemplateUvBrushAsyncJob>& job) -> void
+    {
+        if (!job)
+        {
+            return;
+        }
+        job->points_before_downsample = static_cast<int>(job->points.size());
+        job->downsample_removed = 0;
+        if (job->point_target <= 0 || static_cast<int>(job->points.size()) <= job->point_target)
+        {
+            std::sort(job->points.begin(), job->points.end(), template_point_yx_less);
+            return;
+        }
+
+        auto selected = template_select_uniform_yx(job->points, job->point_target);
+        job->downsample_removed = static_cast<int>(job->points.size() - selected.size());
+        job->points.swap(selected);
+    }
+
+    auto template_configure_server_batch_stream(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, int total_points) -> void
+    {
+        if (!job)
+        {
+            return;
+        }
+        (void)total_points;
+        job->server_batch_limit = ServerPaintBatchStrokeLimit;
+        job->server_batch_delay_ms = ServerPaintBatchDelayMs;
+    }
+
+    auto start_template_uv_brush_async_job(const std::string& request, const std::shared_ptr<QueuedPaintJob>& queued_job) -> bool
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+            if (g_template_uv_brush_job)
+            {
+                complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                               response_json(false,
+                                                             "template_busy",
+                                                             0,
+                                                             1,
+                                                             "template brush job is already running",
+                                                             "\"route\":\"template_brush_paint\""));
+                return true;
+            }
+        }
+
+        Reflection ref{};
+        std::string failure{};
+        if (!ref.init(failure))
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false,
+                                                         "sdk_update_required",
+                                                         0,
+                                                         1,
+                                                         failure.empty() ? "SDK reflection init failed" : failure,
+                                                         "\"route\":\"template_brush_paint\",\"sdk_resolution_exception\":true"));
+            return true;
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false,
+                                                         ex.stage.c_str(),
+                                                         0,
+                                                         1,
+                                                         ex.what(),
+                                                         "\"route\":\"template_brush_paint\",\"sdk_resolution_exception\":true"));
+            return true;
+        }
+        std::string metadata = sdk_context_metadata(ref, ctx);
+        metadata += ",\"route\":\"template_brush_paint\"";
+        metadata += ",\"template_apply_backend\":\"server_paint_batch\"";
+        metadata += ",\"replication\":\"server_paint_batch\"";
+        metadata += ",\"template_pipeline\":\"phase0_template_points_server_batch\"";
+        metadata += ",\"texture_import_used\":false";
+        metadata += ",\"local_paint_used\":false";
+        metadata += ",\"paint_at_uv_with_brush_used\":false";
+        metadata += ",\"paint_at_uv_with_brush_production_forbidden\":true";
+        metadata += ",\"server_paint_batch_used\":true";
+        metadata += ",\"explicit_stroke_batch_used\":true";
+        metadata += ",\"paint_at_screen_position_used\":false";
+        metadata += ",\"live_set_hidden_in_game_used\":false";
+        metadata += ",\"scene_capture_basecolor_required\":true";
+        metadata += ",\"template_min_direct_points\":0";
+        metadata += ",\"template_sample_count_fixed\":false";
+        metadata += ",\"template_sample_target_mode\":\"sampling_radius_dynamic\"";
+        metadata += ",\"two_pass_enabled\":false";
+        metadata += ",\"single_pass_enabled\":true";
+        metadata += ",\"single_pass_strategy\":\"fixed_radius_server_batch\"";
+        metadata += ",\"template_paint_target_channel\":\"Albedo\"";
+        metadata += ",\"template_material_channel_overwrite\":false";
+        metadata += ",\"template_material_source\":\"preserve_existing_material_channels\"";
+        metadata += ",\"template_paint_albedo_transfer\":\"basecolor_srgb_to_linear_flinearcolor\"";
+        metadata += ",\"template_color_source\":\"scene_capture_basecolor_bulk_readback\"";
+        metadata += ",\"template_profile\":\"high_density_basecolor_scene_capture_template\"";
+        metadata += ",\"inferred_fields\":[\"brush_radius_fixed_0_01\",\"scene_capture_basecolor_srgb_to_linear\"]";
+        metadata += ",\"phase0_lower_rescan_used\":false";
+        metadata += ",\"template_fill_enabled\":false";
+        metadata += ",\"template_clone_enabled\":false";
+        if (!ctx.ok)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, metadata));
+            return true;
+        }
+
+        const auto viewport = sdk_get_viewport_info(ref, ctx);
+        const auto mesh_candidates = sdk_collect_front_mesh_candidates(ref, ctx);
+        const auto mesh = mesh_candidates.empty() ? 0 : mesh_candidates.front().mesh;
+        const auto hit_test_function = ref.find_function(ctx.component, "HitTestAtScreenPosition");
+        const auto screen_query = sdk_find_screen_space_brush_query(ref, ctx);
+        const auto query_at_screen_function = screen_query ? ref.find_function(screen_query, "QueryAtScreenPosition") : 0;
+        constexpr bool screen_query_configured = false;
+        const auto server_paint_batch_function = ctx.server_paint_batch_function ?
+            ctx.server_paint_batch_function :
+            ref.find_function(ctx.component, "ServerPaintBatch");
+
+        metadata += std::string(",\"viewport_available\":") + json_bool(viewport.width > 0 && viewport.height > 0);
+        metadata += ",\"viewport_width\":" + std::to_string(viewport.width);
+        metadata += ",\"viewport_height\":" + std::to_string(viewport.height);
+        metadata += ",\"front_mesh_candidate_count\":" + std::to_string(mesh_candidates.size());
+        metadata += ",\"front_mesh_candidates\":" + sdk_front_mesh_candidates_json(ref, mesh_candidates);
+        metadata += std::string(",\"front_mesh_source\":\"") + (mesh_candidates.empty() ? "" : json_escape(mesh_candidates.front().source)) + "\"";
+        metadata += std::string(",\"front_mesh_available\":") + json_bool(mesh != 0);
+        metadata += std::string(",\"function_hit_test_at_screen_position_available\":") + json_bool(hit_test_function != 0);
+        metadata += std::string(",\"screen_space_brush_query_available\":") + json_bool(screen_query != 0);
+        metadata += std::string(",\"screen_space_brush_query\":\"") + hex_address(screen_query) + "\"";
+        metadata += std::string(",\"function_query_at_screen_position_available\":") + json_bool(query_at_screen_function != 0);
+        metadata += std::string(",\"screen_space_brush_query_configured\":") + json_bool(screen_query_configured);
+        metadata += std::string(",\"screen_space_brush_query_used\":") + json_bool(screen_query_configured);
+        metadata += ",\"screen_space_brush_query_production_disabled\":true";
+        metadata += ",\"screen_space_brush_query_production_disabled_reason\":\"query_at_screen_position_caused_working_set_spike_and_slower_dense_sampling\"";
+        metadata += ",\"runtime_hit_test_used\":true";
+        metadata += std::string(",\"template_dense_sampling_backend\":\"") +
+            (screen_query_configured ? "screen_space_brush_query_at_screen_position" : "runtime_paintable_hit_test_cached_triangles") + "\"";
+        metadata += std::string(",\"function_server_paint_batch_available_for_production\":") + json_bool(server_paint_batch_function != 0);
+
+        if (viewport.width <= 0 || viewport.height <= 0)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, "viewport_unavailable", 0, 1, "viewport size is unavailable", metadata));
+            return true;
+        }
+        if (!mesh || !hit_test_function)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, "template_phase0_surface_unavailable", 0, 1, "front mesh HitTestAtScreenPosition is unavailable", metadata));
+            return true;
+        }
+        if (!server_paint_batch_function)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false,
+                                                         "template_server_batch_unavailable",
+                                                         0,
+                                                         1,
+                                                         "ServerPaintBatch is unavailable; local paint path is disabled",
+                                                         metadata));
+            return true;
+        }
+
+        constexpr std::uintptr_t OffCurrentBrushSettings = sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings;
+
+        auto job = std::make_shared<TemplateUvBrushAsyncJob>();
+        job->queued = queued_job;
+        job->world = ctx.world;
+        job->controller = ctx.controller;
+        job->component = ctx.component;
+        job->mesh = mesh;
+        job->hit_test_function = hit_test_function;
+        job->server_paint_batch_function = server_paint_batch_function;
+        job->viewport_width = viewport.width;
+        job->viewport_height = viewport.height;
+        safe_copy(&job->old_brush, reinterpret_cast<const void*>(ctx.component + OffCurrentBrushSettings), sizeof(job->old_brush));
+        job->brush = job->old_brush;
+        job->brush.Hardness = 1.0f;
+        job->brush.Opacity = 1.0f;
+        {
+            const std::string payload = json_extract_payload(request);
+            int quality_level = static_cast<int>(json_extract_double(payload, "paint_quality"));
+            if (quality_level <= 0)
+            {
+                quality_level = static_cast<int>(json_extract_double(payload, "camo_quality"));
+            }
+            if (quality_level <= 0)
+            {
+                quality_level = 8;
+            }
+            job->paint_quality = std::max(1, std::min(20, quality_level));
+            const auto quality = camo_quality_settings(job->paint_quality);
+            job->brush_radius_raw = quality.brush_radius;
+            job->brush_radius = quality.brush_radius;
+            job->sampling_brush_radius = job->brush_radius;
+            job->base_probe_radius = job->brush_radius;
+            job->sample_spacing_factor = quality.sample_spacing_factor;
+            job->min_direct_points = static_cast<int>(json_extract_double(payload, "template_min_direct_points"));
+            if (job->min_direct_points <= 0)
+            {
+                job->min_direct_points = quality.min_direct_points;
+            }
+            const double payload_brush = json_extract_double(payload, "brush_radius");
+            if (payload_brush > 0.0 && payload_brush < 0.05)
+            {
+                job->brush_radius_raw = payload_brush;
+                job->brush_radius = payload_brush;
+                job->sampling_brush_radius = payload_brush;
+                job->base_probe_radius = payload_brush;
+            }
+            job->brush.Radius = static_cast<float>(job->brush_radius);
+            job->brush.Spacing = quality.brush_spacing;
+            job->camera_yaw_offset = json_extract_double(payload, "camera_yaw_offset");
+            if (std::abs(job->camera_yaw_offset) < 0.001)
+            {
+                job->camera_yaw_offset = json_extract_double(payload, "yaw");
+            }
+            if (ctx.controller)
+            {
+                job->camera_yaw_baseline = safe_read<sdk::FRotator>(
+                    ctx.controller + sdk::FieldOffsets::Controller_ControlRotation,
+                    sdk::FRotator{});
+                job->camera_yaw_baseline_set = true;
+            }
+            if (json_extract_bool(payload, "camera_rotation_absolute"))
+            {
+                job->camera_target_rotation.Pitch = json_extract_double(payload, "camera_pitch");
+                job->camera_target_rotation.Yaw = json_extract_double(payload, "camera_yaw");
+                job->camera_target_rotation.Roll = json_extract_double(payload, "camera_roll");
+                job->camera_target_set = true;
+                job->camera_use_body_anchor = json_extract_bool(payload, "camera_use_body_anchor");
+                const double pullback = json_extract_double(payload, "camera_body_pullback");
+                if (pullback > 0.0)
+                {
+                    job->camera_body_pullback = pullback;
+                }
+            }
+            else if (job->camera_yaw_baseline_set)
+            {
+                job->camera_target_rotation = job->camera_yaw_baseline;
+                if (std::abs(job->camera_yaw_offset) > 0.001)
+                {
+                    job->camera_target_rotation.Yaw += job->camera_yaw_offset;
+                    job->camera_target_set = true;
+                }
+            }
+            job->camera_settle_ms = static_cast<int>(json_extract_double(payload, "camera_settle_ms"));
+            if (job->camera_settle_ms <= 0)
+            {
+                job->camera_settle_ms = 1500;
+            }
+        }
+        const double visible_probe_width_px = std::max(1.0, static_cast<double>(job->viewport_width) * 0.88);
+        const double visible_probe_height_px = std::max(1.0, static_cast<double>(job->viewport_height) * 0.96);
+        job->base_probe_spacing_px = std::max(
+            1.0,
+            std::sqrt(visible_probe_width_px * visible_probe_height_px) * job->base_probe_radius * 0.75);
+        job->base_cols = std::max(1, static_cast<int>(std::ceil(visible_probe_width_px / job->base_probe_spacing_px)));
+        job->base_rows = std::max(1, static_cast<int>(std::ceil(visible_probe_height_px / job->base_probe_spacing_px)));
+        job->brush.Falloff = sdk::EBrushFalloff::Spherical;
+        job->brush.BlendMode = sdk::EPaintBlendMode::Normal;
+        job->metadata = metadata;
+        job->metadata += ",\"paint_quality\":" + std::to_string(job->paint_quality);
+        job->metadata += ",\"template_min_direct_points\":" + std::to_string(job->min_direct_points);
+        job->metadata += ",\"template_sample_spacing_factor\":" + std::to_string(job->sample_spacing_factor);
+        job->metadata += ",\"camera_settle_ms\":" + std::to_string(job->camera_settle_ms);
+        if (job->camera_target_set)
+        {
+            job->metadata += ",\"camera_rotation_absolute\":true";
+            job->metadata += ",\"camera_target_pitch\":" + std::to_string(job->camera_target_rotation.Pitch);
+            job->metadata += ",\"camera_target_yaw\":" + std::to_string(job->camera_target_rotation.Yaw);
+            job->metadata += ",\"camera_target_roll\":" + std::to_string(job->camera_target_rotation.Roll);
+            if (job->camera_use_body_anchor)
+            {
+                job->metadata += ",\"camera_use_body_anchor\":true";
+                job->metadata += ",\"camera_body_pullback\":" + std::to_string(job->camera_body_pullback);
+            }
+        }
+        else if (job->camera_yaw_baseline_set && std::abs(job->camera_yaw_offset) > 0.001)
+        {
+            job->metadata += ",\"camera_yaw_offset\":" + std::to_string(job->camera_yaw_offset);
+            job->metadata += ",\"camera_yaw_baseline_yaw\":" + std::to_string(job->camera_yaw_baseline.Yaw);
+        }
+        job->metadata += ",\"template_base_cols\":" + std::to_string(job->base_cols);
+        job->metadata += ",\"template_base_rows\":" + std::to_string(job->base_rows);
+        job->metadata += ",\"template_base_probe_spacing_px\":" + std::to_string(job->base_probe_spacing_px);
+        job->metadata += ",\"template_base_probe_radius\":" + std::to_string(job->base_probe_radius);
+        job->metadata += ",\"template_base_probe_policy\":\"fixed_brush_radius\"";
+        job->metadata += ",\"template_base_probe_formula\":\"ceil(visible_probe_extent/(sqrt(visible_probe_area)*base_probe_radius*0.75))\"";
+        job->metadata += ",\"template_explicit_stroke_batch_enabled\":true";
+        job->metadata += ",\"template_explicit_stroke_batch_mode\":\"fixed_50_strokes_150ms_timer_drained\"";
+        job->metadata += ",\"template_dense_order\":\"front_silhouette_interval_top_down\"";
+        job->metadata += ",\"template_hittest_tick_chunk\":256";
+        job->metadata += ",\"single_pass_radius\":0.01";
+        job->metadata += ",\"template_sampling_radius_policy\":\"fixed_brush_radius\"";
+        job->metadata += ",\"template_sampling_brush_radius\":" + std::to_string(job->sampling_brush_radius);
+        job->started = std::chrono::steady_clock::now();
+        job->last_tick = job->started;
+
+        {
+            std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+            g_template_uv_brush_job = job;
+        }
+        job->phase = TemplateUvBrushAsyncJob::Phase::CameraSettle;
+        if (const auto thread_id = g_game_thread_id.load())
+        {
+            PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+        }
+        return true;
+    }
+
+    auto tick_template_uv_brush_async_job() -> void
+    {
+        if (g_paint_cancelled.load())
+        {
+            std::shared_ptr<TemplateUvBrushAsyncJob> job{};
+            {
+                std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+                job = g_template_uv_brush_job;
+                g_template_uv_brush_job.reset();
+            }
+            if (job && job->queued)
+            {
+                std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+                job->queued->response = response_json(false, "cancelled", job->server_strokes_sent, 0, "paint cancelled", "");
+                job->queued->done = true;
+            }
+            g_paint_jobs_cv.notify_all();
+            g_paint_cancelled.store(false);
+            return;
+        }
+        std::shared_ptr<TemplateUvBrushAsyncJob> job{};
+        {
+            std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+            job = g_template_uv_brush_job;
+        }
+        if (!job)
+        {
+            return;
+        }
+
+        auto clear_server_timer = [&]() {
+            if (job->server_batch_timer_id)
+            {
+                KillTimer(nullptr, job->server_batch_timer_id);
+                job->server_batch_timer_id = 0;
+            }
+        };
+        clear_server_timer();
+        auto post_next_after = [&](int delay_ms) {
+            if (const auto thread_id = g_game_thread_id.load())
+            {
+                if (delay_ms <= 0)
+                {
+                    PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+                    return;
+                }
+                const auto timer_id = SetTimer(nullptr, 0, static_cast<UINT>(std::max(1, delay_ms)), nullptr);
+                if (timer_id)
+                {
+                    job->server_batch_timer_id = timer_id;
+                    return;
+                }
+                PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+            }
+        };
+        auto post_next = [&]() {
+            post_next_after(0);
+        };
+        auto cleanup_state = [&]() {
+            clear_server_timer();
+        };
+        auto fail_job = [&](const char* stage, const std::string& message) {
+            cleanup_state();
+            complete_template_uv_brush_job(job,
+                                           response_json(false,
+                                                         stage,
+                                                         job->server_strokes_sent,
+                                                         1,
+                                                         message,
+                                                         job->metadata + ",\"route\":\"template_brush_paint\",\"async_phase_failed\":true"));
+            {
+                std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+                if (g_template_uv_brush_job == job)
+                {
+                    g_template_uv_brush_job.reset();
+                }
+            }
+        };
+        auto job_elapsed_ms = [&]() {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->started).count();
+        };
+        auto capture_replication_snapshot = [&]() -> SdkReplicationSnapshot {
+            Reflection ref{};
+            std::string failure{};
+            if (!ref.init(failure))
+            {
+                SdkReplicationSnapshot snapshot{};
+                snapshot.failure = "reflection_unavailable:" + failure;
+                return snapshot;
+            }
+            return sdk_capture_replication_snapshot(ref, job->component);
+        };
+
+        job->last_tick = std::chrono::steady_clock::now();
+
+        auto ensure_pass_camera = [&]() {
+            if (!job->camera_target_set || !job->controller)
+            {
+                return;
+            }
+            Reflection ref{};
+            std::string failure{};
+            if (!ref.init(failure))
+            {
+                return;
+            }
+            sdk_apply_control_rotation(ref, job->controller, job->camera_target_rotation);
+        };
+
+        switch (job->phase)
+        {
+        case TemplateUvBrushAsyncJob::Phase::CameraSettle:
+        {
+            if (!job->camera_settle_started_set)
+            {
+                if (job->camera_target_set)
+                {
+                    ensure_pass_camera();
+                }
+                else if (job->camera_yaw_baseline_set && std::abs(job->camera_yaw_offset) > 0.001)
+                {
+                    Reflection ref{};
+                    std::string failure{};
+                    if (ref.init(failure))
+                    {
+                        sdk_apply_wrap_camera_yaw(ref, job->controller, job->camera_yaw_baseline, job->camera_yaw_offset);
+                    }
+                }
+                job->camera_settle_started = std::chrono::steady_clock::now();
+                job->camera_settle_started_set = true;
+                write_bridge_progress("camera_settle_begin",
+                                      "camera rotation applied; waiting before UV/color sampling",
+                                      0,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"camera_settle_ms\":" + std::to_string(job->camera_settle_ms));
+            }
+            const auto settle_elapsed_ms = std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now() - job->camera_settle_started)
+                                              .count();
+            if (settle_elapsed_ms < static_cast<double>(job->camera_settle_ms))
+            {
+                post_next_after(16);
+                return;
+            }
+            write_bridge_progress("camera_settle_done",
+                                  "camera settled; starting UV surface sampling",
+                                  1,
+                                  100,
+                                  job_elapsed_ms(),
+                                  "\"camera_settle_elapsed_ms\":" + std::to_string(settle_elapsed_ms));
+            write_bridge_progress("template_phase0_begin",
+                                  "template phase0 source generation started",
+                                  2,
+                                  100,
+                                  job_elapsed_ms(),
+                                  "\"color_source\":\"scene_capture_basecolor_bulk_readback\"");
+            job->phase = TemplateUvBrushAsyncJob::Phase::Phase0BaseGrid;
+            job->next_index = 0;
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Phase0BaseGrid:
+        {
+            if (job->next_index == 0)
+            {
+                ensure_pass_camera();
+            }
+            constexpr int chunk = 256;
+            const int total = job->base_cols * job->base_rows;
+            if (job->silhouette_min_ix.empty() || job->silhouette_max_ix.empty())
+            {
+                job->silhouette_min_ix.assign(static_cast<std::size_t>(std::max(1, job->base_rows)), 1000000);
+                job->silhouette_max_ix.assign(static_cast<std::size_t>(std::max(1, job->base_rows)), -1);
+            }
+            const int end = std::min(total, job->next_index + chunk);
+            for (; job->next_index < end; ++job->next_index)
+            {
+                const int ix = job->next_index % job->base_cols;
+                const int iy = job->next_index / job->base_cols;
+                const double nx = 0.06 + ((static_cast<double>(ix) + 0.5) / static_cast<double>(job->base_cols)) * 0.88;
+                const double ny = 0.02 + ((static_cast<double>(iy) + 0.5) / static_cast<double>(job->base_rows)) * 0.96;
+                const double screen_x = nx * static_cast<double>(job->viewport_width);
+                const double screen_y = ny * static_cast<double>(job->viewport_height);
+                ++job->base_attempts;
+
+                sdk::RuntimePaintableComponent_HitTestAtScreenPosition hit{};
+                hit.MeshComponent = reinterpret_cast<void*>(job->mesh);
+                hit.ScreenPosition = sdk::FVector2D{screen_x, screen_y};
+                hit.PlayerController = reinterpret_cast<void*>(job->controller);
+                hit.bUseCachedTriangles = true;
+                std::string failure{};
+                if (!process_event(job->component, job->hit_test_function, reinterpret_cast<std::uint8_t*>(&hit), failure) || !hit.ReturnValue.bSuccess)
+                {
+                    continue;
+                }
+                ++job->base_hits;
+                if (iy >= 0 && iy < job->base_rows)
+                {
+                    auto row = static_cast<std::size_t>(iy);
+                    job->silhouette_min_ix[row] = std::min(job->silhouette_min_ix[row], ix);
+                    job->silhouette_max_ix[row] = std::max(job->silhouette_max_ix[row], ix);
+                }
+                job->bbox_min_nx = std::min(job->bbox_min_nx, nx);
+                job->bbox_min_ny = std::min(job->bbox_min_ny, ny);
+                job->bbox_max_nx = std::max(job->bbox_max_nx, nx);
+                job->bbox_max_ny = std::max(job->bbox_max_ny, ny);
+            }
+            const int percent = total > 0 ? static_cast<int>((static_cast<long long>(job->next_index) * 8LL) / total) : 8;
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("template_phase0_base_grid",
+                                      "phase0 base grid bounds",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"base_hits\":" + std::to_string(job->base_hits) +
+                                          ",\"base_attempts\":" + std::to_string(job->base_attempts));
+            }
+            if (job->next_index >= total)
+            {
+                if (job->base_hits <= 0 || job->bbox_max_nx <= job->bbox_min_nx || job->bbox_max_ny <= job->bbox_min_ny)
+                {
+                    fail_job("template_phase0_no_surface_bounds", "template phase0 base grid found no surface bounds");
+                    return;
+                }
+                const double span_x = std::max(0.04, job->bbox_max_nx - job->bbox_min_nx);
+                const double span_y = std::max(0.04, job->bbox_max_ny - job->bbox_min_ny);
+                job->bbox_min_nx = clamp01(job->bbox_min_nx - span_x * 0.16);
+                job->bbox_max_nx = clamp01(job->bbox_max_nx + span_x * 0.16);
+                job->bbox_min_ny = clamp01(job->bbox_min_ny - span_y * 0.08);
+                job->bbox_max_ny = clamp01(job->bbox_max_ny + span_y * 0.14);
+                template_build_dense_candidates(job);
+                if (job->dense_candidates.empty())
+                {
+                    fail_job("template_phase0_no_dense_candidates", "template phase0 silhouette produced no dense candidates");
+                    return;
+                }
+                job->next_index = 0;
+                job->progress_percent = -1;
+                job->phase = TemplateUvBrushAsyncJob::Phase::Phase0Dense;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Phase0Dense:
+        {
+            if (job->next_index == 0)
+            {
+                ensure_pass_camera();
+            }
+            constexpr int chunk = 256;
+            const int total = static_cast<int>(job->dense_candidates.size());
+            const int end = std::min(total, job->next_index + chunk);
+            for (; job->next_index < end; ++job->next_index)
+            {
+                const auto& candidate = job->dense_candidates[static_cast<std::size_t>(job->next_index)];
+                ++job->dense_attempts;
+                if (template_hit_to_point(job,
+                                          candidate.nx * static_cast<double>(job->viewport_width),
+                                          candidate.ny * static_cast<double>(job->viewport_height)))
+                {
+                    ++job->dense_hits;
+                }
+            }
+            const int percent = 8 + (total > 0 ? static_cast<int>((static_cast<long long>(job->next_index) * 24LL) / total) : 24);
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("template_phase0_dense",
+                                      "phase0 dense surface samples",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"dense_hits\":" + std::to_string(job->dense_hits) +
+                                          ",\"dense_attempts\":" + std::to_string(job->dense_attempts) +
+                                          ",\"dense_candidates\":" + std::to_string(job->candidate_count));
+            }
+            if (job->next_index >= total)
+            {
+                job->sampler_probe_attempts = job->base_attempts + job->dense_attempts;
+                job->sampler_probe_misses = std::max(0, job->sampler_probe_attempts - job->base_hits - job->dense_hits);
+                job->sample_pool = job->points;
+                job->sample_pool_points = static_cast<int>(job->sample_pool.size());
+                template_downsample_points_to_target(job);
+                job->template_point_elapsed_ms = job_elapsed_ms();
+                job->progress_percent = -1;
+                std::sort(job->points.begin(), job->points.end(), template_point_yx_less);
+                job->source_sorted = true;
+                write_bridge_progress("template_points_done",
+                                      "phase0 direct surface samples complete",
+                                      34,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"sample_pool_points\":" + std::to_string(job->sample_pool_points) +
+                                          ",\"points_before_downsample\":" + std::to_string(job->points_before_downsample) +
+                                          ",\"downsample_removed\":" + std::to_string(job->downsample_removed) +
+                                          ",\"sampler_probe_attempts\":" + std::to_string(job->sampler_probe_attempts) +
+                                          ",\"sampler_probe_misses\":" + std::to_string(job->sampler_probe_misses));
+                job->progress_percent = -1;
+                job->phase = TemplateUvBrushAsyncJob::Phase::CaptureSource;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::CaptureSource:
+        {
+            if (job->sample_pool.empty())
+            {
+                job->sample_pool = job->points;
+                job->sample_pool_points = static_cast<int>(job->sample_pool.size());
+            }
+            if (job->sample_pool.empty())
+            {
+                fail_job("template_phase0_no_template_points", "template phase0 produced no template points");
+                return;
+            }
+            Reflection ref{};
+            std::string init_failure{};
+            if (!ref.init(init_failure))
+            {
+                fail_job("sdk_update_required", init_failure.empty() ? "SDK reflection init failed" : init_failure);
+                return;
+            }
+            SdkContext ctx{};
+            try
+            {
+                ctx = sdk_resolve_context(ref);
+            }
+            catch (const SdkResolutionException& ex)
+            {
+                fail_job(ex.stage.c_str(), ex.what());
+                return;
+            }
+            const auto live_viewport = sdk_get_viewport_info(ref, ctx);
+            if (live_viewport.width > 0 && live_viewport.height > 0 &&
+                (live_viewport.width != job->viewport_width || live_viewport.height != job->viewport_height))
+            {
+                const double sx = static_cast<double>(live_viewport.width) / static_cast<double>(std::max(1, job->viewport_width));
+                const double sy = static_cast<double>(live_viewport.height) / static_cast<double>(std::max(1, job->viewport_height));
+                for (auto& point : job->points)
+                {
+                    point.x *= sx;
+                    point.y *= sy;
+                }
+                for (auto& point : job->sample_pool)
+                {
+                    point.x *= sx;
+                    point.y *= sy;
+                }
+                job->viewport_width = live_viewport.width;
+                job->viewport_height = live_viewport.height;
+                job->metadata += ",\"template_viewport_refreshed_before_capture\":true";
+                job->metadata += ",\"template_live_viewport_width\":" + std::to_string(live_viewport.width);
+                job->metadata += ",\"template_live_viewport_height\":" + std::to_string(live_viewport.height);
+            }
+
+            SdkNativeFrontSampleResult native_front{};
+            native_front.mesh = job->mesh;
+            native_front.hit_test_function = job->hit_test_function;
+            native_front.viewport_width = job->viewport_width;
+            native_front.viewport_height = job->viewport_height;
+            native_front.sampling_backend = "template_points_cached_hit_test";
+            native_front.min_front_hits = std::max(64, std::min(2048, static_cast<int>(job->sample_pool.size())));
+            native_front.target_front_hits = static_cast<int>(job->sample_pool.size());
+            native_front.hard_attempt_budget = job->base_attempts + job->dense_attempts;
+            native_front.samples.reserve(job->sample_pool.size());
+            for (const auto& point : job->sample_pool)
+            {
+                FrontSample sample{};
+                sample.u = clamp01(point.u);
+                sample.v = clamp01(point.v);
+                sample.screen_nx = clamp01(point.x / static_cast<double>(std::max(1, job->viewport_width)));
+                sample.screen_ny = clamp01(point.y / static_cast<double>(std::max(1, job->viewport_height)));
+                if (point.has_world)
+                {
+                    sample.has_world_position = true;
+                    sample.world_position.X = point.world_x;
+                    sample.world_position.Y = point.world_y;
+                    sample.world_position.Z = point.world_z;
+                }
+                sample.metallic = 0.0;
+                sample.roughness = 0.65;
+                native_front.samples.push_back(sample);
+            }
+
+            write_bridge_progress("template_phase0_basecolor_capture",
+                                  "capturing hidden-target SceneCapture BaseColor",
+                                  52,
+                                  100,
+                                  job_elapsed_ms(),
+                                  "\"template_points\":" + std::to_string(job->points.size()) +
+                                      ",\"sample_pool_points\":" + std::to_string(job->sample_pool.size()) +
+                                      ",\"color_source\":\"scene_capture_basecolor_bulk_readback\"");
+
+            constexpr int kTemplateCaptureMaxDimension = 4096;
+            int capture_request_width = std::max(1, job->viewport_width);
+            int capture_request_height = std::max(1, job->viewport_height);
+            const int request_max_dimension = std::max(capture_request_width, capture_request_height);
+            if (request_max_dimension > kTemplateCaptureMaxDimension)
+            {
+                const double scale = static_cast<double>(kTemplateCaptureMaxDimension) / static_cast<double>(request_max_dimension);
+                capture_request_width = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_request_width) * scale)));
+                capture_request_height = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_request_height) * scale)));
+            }
+            if (job->camera_target_set)
+            {
+                ensure_pass_camera();
+            }
+            else if (job->camera_yaw_baseline_set)
+            {
+                sdk_apply_wrap_camera_yaw(ref, ctx.controller, job->camera_yaw_baseline, job->camera_yaw_offset);
+            }
+            const auto capture_started = std::chrono::steady_clock::now();
+            const sdk::FRotator* forced_capture_rotation =
+                job->camera_target_set ? &job->camera_target_rotation : nullptr;
+            const auto capture = sdk_capture_front_colors(
+                ref,
+                ctx,
+                native_front,
+                capture_request_width,
+                capture_request_height,
+                forced_capture_rotation,
+                job->camera_use_body_anchor,
+                job->camera_body_pullback);
+            const auto capture_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - capture_started).count();
+            job->template_capture_elapsed_ms = capture_elapsed_ms;
+            job->metadata += sdk_capture_metadata(capture);
+            job->metadata += ",\"scene_capture_source\":\"BaseColor\"";
+            job->metadata += ",\"template_capture_request_width\":" + std::to_string(capture_request_width);
+            job->metadata += ",\"template_capture_request_height\":" + std::to_string(capture_request_height);
+            job->metadata += ",\"template_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
+            if (!capture.bulk_readback_used || !capture.image_bulk_calibration_ok || capture.samples.empty())
+            {
+                fail_job("template_basecolor_capture_unavailable", "SceneCapture BaseColor bulk capture failed: " + capture.failure);
+                return;
+            }
+            job->sample_pool.clear();
+            job->sample_pool.reserve(capture.samples.size());
+            for (const auto& sample : capture.samples)
+            {
+                TemplateUvBrushAsyncJob::TemplatePoint point{};
+                point.x = clamp01(sample.screen_nx) * static_cast<double>(job->viewport_width);
+                point.y = clamp01(sample.screen_ny) * static_cast<double>(job->viewport_height);
+                point.u = clamp01(sample.u);
+                point.v = clamp01(sample.v);
+                point.r = sdk_srgb_to_linear_component(sample.r);
+                point.g = sdk_srgb_to_linear_component(sample.g);
+                point.b = sdk_srgb_to_linear_component(sample.b);
+                point.metallic = clamp01(sample.metallic);
+                point.roughness = clamp01(std::max(0.35, sample.roughness));
+                point.stroke_radius = job->brush_radius;
+                point.paint_pass = 0;
+                point.has_color = true;
+                job->sample_pool.push_back(point);
+                ++job->basecolor_samples;
+                job->rgb_min = std::min(job->rgb_min, std::min(point.r, std::min(point.g, point.b)));
+                job->rgb_max = std::max(job->rgb_max, std::max(point.r, std::max(point.g, point.b)));
+                job->rgb_sum_r += point.r;
+                job->rgb_sum_g += point.g;
+                job->rgb_sum_b += point.b;
+                job->metallic_sum += point.metallic;
+                job->roughness_sum += point.roughness;
+            }
+            job->sample_pool_points = static_cast<int>(job->sample_pool.size());
+            job->color_source = "scene_capture_basecolor_bulk_readback";
+            auto paint_points = template_select_uniform_yx(job->sample_pool, job->point_target);
+            for (auto& point : paint_points)
+            {
+                point.stroke_radius = job->brush_radius;
+                point.paint_pass = 0;
+            }
+            job->coverage_strokes = static_cast<int>(paint_points.size());
+            job->detail_strokes = 0;
+            job->points = std::move(paint_points);
+            job->paint_sample_attempts = static_cast<int>(job->points.size());
+            job->paint_sample_success = static_cast<int>(job->points.size());
+            job->paint_sample_failures = 0;
+            write_bridge_progress("template_phase0_basecolor_capture_done",
+                                  "SceneCapture BaseColor bulk capture done",
+                                  60,
+                                  100,
+                                  job_elapsed_ms(),
+                                  std::string("\"color_source\":\"scene_capture_basecolor_bulk_readback\"") +
+                                      ",\"bulk_readback_used\":" + json_bool(capture.bulk_readback_used) +
+                                      ",\"capture_samples\":" + std::to_string(capture.samples.size()) +
+                                      ",\"coverage_strokes\":" + std::to_string(job->coverage_strokes) +
+                                      ",\"detail_strokes\":" + std::to_string(job->detail_strokes) +
+                                      ",\"bulk_backend\":\"" + json_escape(capture.bulk_backend) + "\"");
+            job->phase = TemplateUvBrushAsyncJob::Phase::BeginPaint;
+            job->progress_percent = -1;
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::BeginPaint:
+        {
+            const int template_count = static_cast<int>(job->points.size());
+            if (template_count <= 0)
+            {
+                fail_job("template_points_unavailable", "template route produced no direct template points");
+                return;
+            }
+            job->brush_radius_raw = job->brush_radius;
+            job->brush.Radius = static_cast<float>(job->brush_radius);
+            job->brush.Spacing = 0.08f;
+            template_configure_server_batch_stream(job, template_count);
+            job->server_batch_started = std::chrono::steady_clock::now();
+            write_bridge_progress("template_server_batch_begin",
+                                  "template server batch stream prepared",
+                                  62,
+                                  100,
+                                  job_elapsed_ms(),
+                                      "\"template_points\":" + std::to_string(job->points.size()) +
+                                      ",\"sample_pool_points\":" + std::to_string(job->sample_pool_points) +
+                                      ",\"fill_sample_target\":" + std::to_string(job->fill_sample_target) +
+                                      ",\"detail_sample_target\":" + std::to_string(job->point_target) +
+                                      ",\"coverage_strokes\":" + std::to_string(job->coverage_strokes) +
+                                      ",\"detail_strokes\":" + std::to_string(job->detail_strokes) +
+                                      ",\"basecolor_samples\":" + std::to_string(job->basecolor_samples) +
+                                      ",\"color_source\":\"" + json_escape(job->color_source) + "\"" +
+                                      ",\"albedo_transfer\":\"basecolor_srgb_to_linear_flinearcolor\"" +
+                                      ",\"paint_target_channel\":\"Albedo\"" +
+                                      ",\"material_channel_overwrite\":false" +
+                                      ",\"local_paint_used\":false" +
+                                      ",\"brush_radius_mode\":\"fixed\"" +
+                                      ",\"brush_radius_formula\":\"fixed(0.01)\"" +
+                                      ",\"brush_radius_raw\":" + std::to_string(job->brush_radius_raw) +
+                                      ",\"brush_radius\":" + std::to_string(job->brush_radius) +
+                                      ",\"two_pass_enabled\":false" +
+                                      ",\"single_pass_enabled\":true" +
+                                      ",\"paint_send_order\":\"single_pass_top_down\"" +
+                                      ",\"server_rpc\":\"ServerPaintBatch\"" +
+                                      ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit) +
+                                      ",\"server_batch_limit_formula\":\"fixed_50_strokes_per_rpc\"" +
+                                      ",\"server_batch_delay_ms\":" + std::to_string(job->server_batch_delay_ms) +
+                                      ",\"server_batch_delay_formula\":\"fixed_150ms\"" +
+                                      ",\"server_batch_pacing_profile\":\"50_strokes_per_150ms\"");
+            job->replicate_index = 0;
+            job->phase = TemplateUvBrushAsyncJob::Phase::ReplicateStrokes;
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::ReplicateStrokes:
+        {
+            const int total_points = static_cast<int>(job->points.size());
+            if (job->replicate_index >= total_points)
+            {
+                if (job->server_batch_started.time_since_epoch().count() != 0)
+                {
+                    job->server_batch_elapsed_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - job->server_batch_started).count();
+                }
+                job->replication_after_explicit_batches = capture_replication_snapshot();
+                job->phase = TemplateUvBrushAsyncJob::Phase::Finish;
+                post_next();
+                return;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (job->server_next_batch_time.time_since_epoch().count() != 0 &&
+                now < job->server_next_batch_time)
+            {
+                const int remaining_ms = std::max(
+                    1,
+                    static_cast<int>(std::ceil(std::chrono::duration<double, std::milli>(
+                        job->server_next_batch_time - now).count())));
+                post_next_after(remaining_ms);
+                return;
+            }
+            job->server_next_batch_time = {};
+
+            const int count = std::max(1, std::min(job->server_batch_limit, total_points - job->replicate_index));
+            std::vector<sdk::FPaintStroke> strokes{};
+            strokes.reserve(static_cast<std::size_t>(count));
+            for (int i = 0; i < count; ++i)
+            {
+                const auto& point = job->points[static_cast<std::size_t>(job->replicate_index + i)];
+                auto stroke_brush = job->brush;
+                stroke_brush.Radius = static_cast<float>(point.stroke_radius > 0.0 ? point.stroke_radius : job->brush_radius);
+                const auto channel = sdk_make_channel(point.r,
+                                                      point.g,
+                                                      point.b,
+                                                      point.metallic,
+                                                      point.roughness,
+                                                      sdk::EPaintChannelApplyMode::Override);
+                strokes.push_back(sdk_make_uv_stroke(point.u,
+                                                     point.v,
+                                                     channel,
+                                                     stroke_brush,
+                                                     sdk::EPaintChannel::Albedo));
+            }
+
+            SdkContext ctx{};
+            ctx.component = job->component;
+            ctx.server_paint_batch_function = job->server_paint_batch_function;
+            std::string failure{};
+            bool sent = false;
+            if (job->server_paint_batch_function)
+            {
+                sent = sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), failure);
+                if (sent)
+                {
+                    job->server_batch_rpc = "ServerPaintBatch";
+                }
+            }
+
+            if (!sent)
+            {
+                ++job->server_batch_failures;
+                if (job->first_failure.empty())
+                {
+                    job->first_failure = failure.empty() ? "ServerPaintBatch_failed" : failure;
+                }
+                fail_job("template_explicit_stroke_batch_failed",
+                         "ServerPaintBatch failed: " + job->first_failure);
+                return;
+            }
+
+            job->explicit_stroke_batch_used = true;
+            ++job->server_batch_success;
+            ++job->server_batch_calls;
+            job->server_strokes_sent += count;
+            job->replicate_index += count;
+            job->server_next_batch_time = std::chrono::steady_clock::now() +
+                                          std::chrono::milliseconds(std::max(1, job->server_batch_delay_ms));
+
+            const int percent = 98 + static_cast<int>((static_cast<long long>(job->replicate_index) * 1LL) / std::max(1, total_points));
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("template_explicit_stroke_batch",
+                                      "template explicit stroke batch stream",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent) +
+                                          ",\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"coverage_strokes\":" + std::to_string(job->coverage_strokes) +
+                                          ",\"detail_strokes\":" + std::to_string(job->detail_strokes) +
+                                          ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls) +
+                                          ",\"server_batch_rpc\":\"" + json_escape(job->server_batch_rpc) + "\"" +
+                                          ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit) +
+                                          ",\"server_batch_delay_ms\":" + std::to_string(job->server_batch_delay_ms));
+            }
+            post_next_after(job->server_batch_delay_ms);
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Finish:
+        {
+            cleanup_state();
+
+            const double denom = std::max(1, job->basecolor_samples);
+            const double total_elapsed_ms = job_elapsed_ms();
+            std::string metadata = job->metadata;
+            metadata += ",\"template_artifacts_written\":false";
+            metadata += ",\"color_source\":\"" + json_escape(job->color_source) + "\"";
+            metadata += ",\"template_base_probe_spacing_px\":" + std::to_string(job->base_probe_spacing_px);
+            metadata += ",\"phase0_base_hits\":" + std::to_string(job->base_hits);
+            metadata += ",\"phase0_base_attempts\":" + std::to_string(job->base_attempts);
+            metadata += ",\"phase0_dense_hits\":" + std::to_string(job->dense_hits);
+            metadata += ",\"phase0_dense_attempts\":" + std::to_string(job->dense_attempts);
+            metadata += ",\"template_candidate_rows\":" + std::to_string(job->dense_rows);
+            metadata += ",\"dense_candidate_count\":" + std::to_string(job->candidate_count);
+            metadata += ",\"silhouette_area_px\":" + std::to_string(job->silhouette_area_px);
+            metadata += ",\"template_sample_count_fixed\":false";
+            metadata += ",\"template_sample_target_mode\":\"sampling_radius_dynamic\"";
+            metadata += ",\"template_sample_target_formula\":\"ceil(silhouette_area_px / pow(min(viewport_width,viewport_height)*brush_radius*0.25,2))\"";
+            metadata += ",\"fill_sample_target\":" + std::to_string(job->fill_sample_target);
+            metadata += ",\"template_sample_target\":" + std::to_string(job->coverage_sample_target);
+            metadata += ",\"template_candidate_target_formula\":\"ceil(template_sample_target / estimated_dense_acceptance)\"";
+            metadata += ",\"template_candidate_target\":" + std::to_string(job->coverage_candidate_target);
+            metadata += ",\"template_brush_screen_radius_px\":" + std::to_string(job->coverage_brush_screen_radius_px);
+            metadata += ",\"fill_sample_spacing_px\":" + std::to_string(job->fill_sample_spacing_px);
+            metadata += ",\"detail_sample_spacing_px\":" + std::to_string(job->detail_sample_spacing_px);
+            metadata += ",\"template_sample_spacing_px\":" + std::to_string(job->coverage_sample_spacing_px);
+            metadata += ",\"template_candidate_spacing_px\":" + std::to_string(job->coverage_candidate_spacing_px);
+            metadata += ",\"template_estimated_dense_acceptance\":" + std::to_string(job->coverage_estimated_acceptance);
+            metadata += ",\"sampler_probe_attempts\":" + std::to_string(job->sampler_probe_attempts);
+            metadata += ",\"sampler_probe_misses\":" + std::to_string(job->sampler_probe_misses);
+            metadata += ",\"runtime_hit_test_attempts\":" + std::to_string(job->runtime_hit_test_attempts);
+            metadata += ",\"runtime_hit_test_hits\":" + std::to_string(job->runtime_hit_test_hits);
+            metadata += ",\"runtime_hit_test_failures\":" + std::to_string(job->runtime_hit_test_failures);
+            metadata += ",\"template_fill_enabled\":false";
+            metadata += ",\"template_fill_strategy\":\"disabled\"";
+            metadata += ",\"template_clone_enabled\":false";
+            metadata += ",\"template_clone_strategy\":\"disabled\"";
+            metadata += ",\"phase0_lower_rescan_used\":false";
+            metadata += ",\"template_points\":" + std::to_string(job->points.size());
+            metadata += ",\"paint_samples_total\":" + std::to_string(job->points.size());
+            metadata += ",\"sample_pool_points\":" + std::to_string(job->sample_pool_points);
+            metadata += ",\"template_points_before_downsample\":" + std::to_string(job->points_before_downsample);
+            metadata += ",\"template_downsample_removed\":" + std::to_string(job->downsample_removed);
+            metadata += ",\"template_downsample_strategy\":\"uniform_yx_after_full_candidate_scan\"";
+            metadata += ",\"template_color_sample_target\":" + std::to_string(job->point_target);
+            metadata += std::string(",\"template_dense_early_stopped\":") +
+                        json_bool(job->next_index < job->candidate_count);
+            metadata += ",\"two_pass_enabled\":false";
+            metadata += ",\"single_pass_enabled\":true";
+            metadata += ",\"single_pass_strategy\":\"fixed_radius_server_batch\"";
+            metadata += ",\"coverage_strokes\":" + std::to_string(job->coverage_strokes);
+            metadata += ",\"detail_strokes\":" + std::to_string(job->detail_strokes);
+            metadata += ",\"paint_send_order\":\"single_pass_top_down\"";
+            metadata += ",\"paint_samples\":" + std::to_string(job->paint_sample_success);
+            metadata += ",\"paint_sample_attempts\":" + std::to_string(job->paint_sample_attempts);
+            metadata += ",\"paint_sample_success\":" + std::to_string(job->paint_sample_success);
+            metadata += ",\"paint_sample_failures\":" + std::to_string(job->paint_sample_failures);
+            metadata += ",\"template_dedupe_skipped\":" + std::to_string(job->dedupe_skipped);
+            metadata += ",\"template_brush_radius_mode\":\"fixed\"";
+            metadata += ",\"template_brush_radius_formula\":\"fixed(0.01)\"";
+            metadata += ",\"template_brush_radius_raw\":" + std::to_string(job->brush_radius_raw);
+            metadata += ",\"template_brush_radius\":" + std::to_string(job->brush_radius);
+            metadata += ",\"template_sampling_radius_policy\":\"fixed_brush_radius\"";
+            metadata += ",\"template_sampling_brush_radius\":" + std::to_string(job->sampling_brush_radius);
+            metadata += ",\"template_point_elapsed_ms\":" + std::to_string(job->template_point_elapsed_ms);
+            metadata += ",\"capture_elapsed_ms\":" + std::to_string(job->template_capture_elapsed_ms);
+            metadata += ",\"server_batch_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
+            metadata += ",\"total_elapsed_ms\":" + std::to_string(total_elapsed_ms);
+            metadata += ",\"local_paint_used\":false";
+            metadata += ",\"local_paint_success\":0";
+            metadata += ",\"basecolor_samples\":" + std::to_string(job->basecolor_samples);
+            metadata += ",\"paint_uv_success\":0";
+            metadata += ",\"paint_process_failures\":0";
+            metadata += ",\"template_commit_pulses\":" + std::to_string(job->commit_pulses);
+            metadata += ",\"clear_recorded_strokes_called\":false";
+            metadata += ",\"begin_stroke_called\":false";
+            metadata += ",\"end_stroke_called\":false";
+            metadata += ",\"flush_recorded_strokes_to_server_called\":false";
+            metadata += ",\"send_stroke_batch_to_server_called\":false";
+            metadata += std::string(",\"explicit_stroke_batch_used\":") + json_bool(job->explicit_stroke_batch_used);
+            metadata += ",\"server_paint_batch_used\":true";
+            metadata += ",\"server_batch_rpc\":\"" + json_escape(job->server_batch_rpc) + "\"";
+            metadata += ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit);
+            metadata += ",\"server_batch_limit_formula\":\"fixed_50_strokes_per_rpc\"";
+            metadata += ",\"server_batch_delay_ms\":" + std::to_string(job->server_batch_delay_ms);
+            metadata += ",\"server_batch_delay_formula\":\"fixed_150ms\"";
+            metadata += ",\"server_batch_pacing_profile\":\"50_strokes_per_150ms\"";
+            metadata += ",\"server_batch_schedule\":\"timer_drained\"";
+            metadata += ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls);
+            metadata += ",\"server_batch_success\":" + std::to_string(job->server_batch_success);
+            metadata += ",\"server_batch_failures\":" + std::to_string(job->server_batch_failures);
+            metadata += ",\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent);
+            metadata += ",\"recorded_stroke_replication_diagnostics\":false";
+            metadata += sdk_replication_snapshot_metadata("rep_after_explicit_batches", job->replication_after_explicit_batches);
+            metadata += ",\"basecolor_rgb_min\":" + std::to_string(job->rgb_min);
+            metadata += ",\"basecolor_rgb_max\":" + std::to_string(job->rgb_max);
+            metadata += ",\"basecolor_rgb_avg_r\":" + std::to_string(job->rgb_sum_r / denom);
+            metadata += ",\"basecolor_rgb_avg_g\":" + std::to_string(job->rgb_sum_g / denom);
+            metadata += ",\"basecolor_rgb_avg_b\":" + std::to_string(job->rgb_sum_b / denom);
+            metadata += ",\"basecolor_metallic_avg\":" + std::to_string(job->metallic_sum / denom);
+            metadata += ",\"basecolor_roughness_avg\":" + std::to_string(job->roughness_sum / denom);
+            metadata += std::string(",\"first_failure\":\"") + json_escape(job->first_failure) + "\"";
+            metadata += ",\"bridge_events\":[\"template_phase0_begin\",\"template_points_done\",\"template_load_done\"]";
+
+            write_bridge_progress("template_load_done",
+                                  "template brush paint completed",
+                                  100,
+                                  100,
+                                  job_elapsed_ms(),
+                                  "\"server_strokes_sent\":" + std::to_string(job->server_strokes_sent) +
+                                      ",\"basecolor_samples\":" + std::to_string(job->basecolor_samples) +
+                                      ",\"coverage_strokes\":" + std::to_string(job->coverage_strokes) +
+                                      ",\"points\":" + std::to_string(job->points.size()));
+            const bool explicit_replication_ok = job->explicit_stroke_batch_used &&
+                                                 job->server_strokes_sent > 0 &&
+                                                 job->server_batch_failures == 0;
+            const bool ok = explicit_replication_ok;
+            complete_template_uv_brush_job(job,
+                                           response_json(ok,
+                                                         ok ? "template_brush_paint_done" : "template_commit_failed",
+                                                         job->server_strokes_sent,
+                                                         ok ? 0 : 1,
+                                                         ok ? "template server batch paint dispatched" : "template server batch paint did not replicate",
+                                                         metadata));
+            {
+                std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+                if (g_template_uv_brush_job == job)
+                {
+                    g_template_uv_brush_job.reset();
+                }
+            }
+            return;
+        }
+        }
+    }
+
+
+    auto sdk_paint_full_route_native_direct(const std::string& request) -> std::string
+    {
+        const bool is_probe = request.find("\"type\":\"sdk_probe\"") != std::string::npos;
+        const bool is_deep_probe = request.find("\"type\":\"sdk_deep_probe\"") != std::string::npos ||
+                                   request.find("\"native_apply_mode\":\"sdk_deep_probe_only\"") != std::string::npos;
+        if (!is_probe && !is_deep_probe)
+        {
+            return response_json(false,
+                                 "unsupported_route",
+                                 0,
+                                 1,
+                                 "unsupported native apply mode; only template_brush_paint is available",
+                                 "\"supported_native_apply_modes\":[\"template_brush_paint\"]");
+        }
+
+        Reflection ref{};
+        std::string failure{};
+        if (!ref.init(failure))
+        {
+            return response_json(false,
+                                 "sdk_update_required",
+                                 0,
+                                 1,
+                                 failure.empty() ? "SDK reflection init failed" : failure,
+                                 std::string("\"route\":\"") + (is_deep_probe ? "sdk_deep_probe" : "sdk_probe") +
+                                     "\",\"sdk_resolution_exception\":true");
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            return response_json(false,
+                                 ex.stage.c_str(),
+                                 0,
+                                 1,
+                                 ex.what(),
+                                 std::string("\"route\":\"") + (is_deep_probe ? "sdk_deep_probe" : "sdk_probe") +
+                                     "\",\"sdk_resolution_exception\":true");
+        }
+        std::string metadata = sdk_context_metadata(ref, ctx);
+        metadata += std::string(",\"route\":\"") + (is_deep_probe ? "sdk_deep_probe" : "sdk_probe") + "\"";
+        metadata += ",\"probe_read_only\":true";
+        metadata += ",\"texture_import_used\":false";
+        metadata += ",\"local_paint_used\":false";
+        metadata += ",\"paint_at_uv_with_brush_used\":false";
+        metadata += ",\"paint_at_screen_position_used\":false";
+        metadata += ",\"server_paint_batch_used\":false";
+        if (!ctx.ok)
+        {
+            return response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, metadata);
+        }
+
+        const auto viewport = sdk_get_viewport_info(ref, ctx);
+        const auto mesh_candidates = sdk_collect_front_mesh_candidates(ref, ctx);
+        const auto hit_test_function = ref.find_function(ctx.component, "HitTestAtScreenPosition");
+        metadata += std::string(",\"viewport_available\":") + json_bool(viewport.width > 0 && viewport.height > 0);
+        metadata += ",\"viewport_width\":" + std::to_string(viewport.width);
+        metadata += ",\"viewport_height\":" + std::to_string(viewport.height);
+        metadata += ",\"front_mesh_candidate_count\":" + std::to_string(mesh_candidates.size());
+        metadata += ",\"front_mesh_candidates\":" + sdk_front_mesh_candidates_json(ref, mesh_candidates);
+        metadata += std::string(",\"front_mesh_available\":") + json_bool(!mesh_candidates.empty());
+        metadata += std::string(",\"function_hit_test_at_screen_position_available\":") + json_bool(hit_test_function != 0);
+        metadata += std::string(",\"function_server_paint_batch_available_for_production\":") + json_bool(ctx.server_paint_batch_function != 0);
+        return response_json(true,
+                             is_deep_probe ? "sdk_deep_probe" : "sdk_probe",
+                             0,
+                             0,
+                             "SDK context probe completed without paint mutation",
+                             metadata);
+    }
+
+
+    auto paint_full_route_native_direct(const std::string& request) -> std::string
+    {
+        return sdk_paint_full_route_native_direct(request);
+    }
+
+    auto drain_paint_jobs_on_game_thread() -> void
+    {
+        tick_template_uv_brush_async_job();
+        std::vector<std::shared_ptr<QueuedPaintJob>> jobs{};
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            jobs.swap(g_paint_jobs);
+        }
+        for (const auto& job : jobs)
+        {
+            if (!job)
+            {
+                continue;
+            }
+            if (is_template_uv_brush_request(job->request))
+            {
+                start_template_uv_brush_async_job(job->request, job);
+                continue;
+            }
+            const auto response = paint_full_route_native_direct(job->request);
+            {
+                std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+                job->response = response;
+                job->done = true;
+            }
+            g_paint_jobs_cv.notify_all();
+        }
+        drain_game_commands_on_game_thread();
+    }
+
+    void __fastcall hooked_process_event(void* object, void* function, void* params)
+    {
+        anti_kick_capture_probe(object, function);
+        anti_kick_capture_reason(function, params);
+        if (anti_kick_should_block(object, function, params))
+        {
+            return;
+        }
+        if (god_mode_should_block(object, function))
+        {
+            return;
+        }
+        const auto original = g_original_process_event.load();
+        if (original && is_executable_code(original))
+        {
+            reinterpret_cast<ProcessEventFn>(original)(object, function, params);
+        }
+    }
+
+    LRESULT CALLBACK message_hook_proc(int code, WPARAM wparam, LPARAM lparam)
+    {
+        if (code >= 0)
+        {
+            __try
+            {
+                drain_paint_jobs_on_game_thread();
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        return CallNextHookEx(g_message_hook.load(), code, wparam, lparam);
+    }
+
+    auto paint_full_route_native(const std::string& request) -> std::string
+    {
+        std::string failure{};
+        if (!install_process_event_hook(failure))
+        {
+            return response_json(false, failure.c_str(), 0, 1, failure);
+        }
+        auto job = std::make_shared<QueuedPaintJob>();
+        job->request = request;
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            g_paint_jobs.push_back(job);
+        }
+        g_paint_jobs_cv.notify_all();
+        if (const auto thread_id = g_game_thread_id.load())
+        {
+            PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+        }
+        std::unique_lock<std::mutex> lock(g_paint_jobs_mutex);
+        const bool completed = g_paint_jobs_cv.wait_for(lock, std::chrono::seconds(240), [&]() {
+            return job->done;
+        });
+        if (!completed)
+        {
+            return response_json(false, "game_thread_dispatch_timeout", 0, 1, "game thread did not process paint job");
+        }
+        return job->response;
+    }
+
+    auto execute_game_command_on_game_thread(const std::string& request) -> std::string
+    {
+        std::string failure{};
+        if (!install_process_event_hook(failure))
+        {
+            return response_json(false, failure.c_str(), 0, 1, failure);
+        }
+        auto job = std::make_shared<QueuedGameCommand>();
+        job->request = request;
+        {
+            std::lock_guard<std::mutex> lock(g_game_cmd_mutex);
+            g_game_cmds.push_back(job);
+        }
+        if (const auto thread_id = g_game_thread_id.load())
+        {
+            PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+        }
+        std::unique_lock<std::mutex> lock(g_game_cmd_mutex);
+        const bool completed = g_game_cmd_cv.wait_for(lock, std::chrono::seconds(30), [&]() {
+            return job->done;
+        });
+        if (!completed)
+        {
+            return response_json(false, "game_thread_dispatch_timeout", 0, 1, "game thread did not process command");
+        }
+        return job->response;
+    }
+
+    auto drain_game_commands_on_game_thread() -> void
+    {
+        std::vector<std::shared_ptr<QueuedGameCommand>> jobs{};
+        {
+            std::lock_guard<std::mutex> lock(g_game_cmd_mutex);
+            jobs.swap(g_game_cmds);
+        }
+        for (const auto& job : jobs)
+        {
+            if (!job) continue;
+            const auto response = handle_game_command_direct(job->request);
+            {
+                std::lock_guard<std::mutex> lock(g_game_cmd_mutex);
+                job->response = response;
+                job->done = true;
+            }
+            g_game_cmd_cv.notify_all();
+        }
+    }
+
+    auto handle_game_teleport(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        const double x = json_extract_double(payload, "x");
+        const double y = json_extract_double(payload, "y");
+        const double z = json_extract_double(payload, "z");
+
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1, "local pawn not available");
+        }
+
+        const auto set_location_fn = ref.find_function(ctx.pawn, "K2_SetActorLocation");
+        if (!set_location_fn)
+        {
+            return response_json(false, "function_unavailable", 0, 1, "K2_SetActorLocation not found");
+        }
+
+        sdk::Actor_K2_SetActorLocation params{};
+        params.NewLocation = {x, y, z};
+        params.bTeleport = true;
+
+        std::string pe_failure{};
+        if (!process_event(ctx.pawn, set_location_fn, reinterpret_cast<std::uint8_t*>(&params), pe_failure))
+        {
+            return response_json(false, "process_event_failed", 0, 1, pe_failure);
+        }
+
+        std::string meta = "\"target_x\":" + std::to_string(x) +
+                           ",\"target_y\":" + std::to_string(y) +
+                           ",\"target_z\":" + std::to_string(z) +
+                           ",\"return_value\":" + (params.ReturnValue ? "true" : "false");
+        return response_json(true, "teleport", 0, 0, "teleported", meta);
+    }
+
+    auto handle_game_set_fov(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        const double fov = json_extract_double(payload, "fov");
+        if (fov < 1.0 || fov > 179.0)
+        {
+            return response_json(false, "invalid_fov", 0, 1, "FOV must be between 1 and 179");
+        }
+
+        if (!live_uobject(ctx.controller))
+        {
+            return response_json(false, "controller_unavailable", 0, 1, "player controller not available");
+        }
+
+        const auto camera_manager = safe_read<std::uintptr_t>(ctx.controller + sdk::FieldOffsets::PlayerController_PlayerCameraManager);
+        if (!live_uobject(camera_manager))
+        {
+            return response_json(false, "camera_manager_unavailable", 0, 1, "PlayerCameraManager not available");
+        }
+
+        const auto set_fov_fn = ref.find_function(camera_manager, "SetFOV");
+        if (set_fov_fn)
+        {
+            sdk_call_single_number(ref, camera_manager, "SetFOV", fov);
+            return response_json(true, "set_fov", 0, 0, "FOV set via SetFOV function",
+                                "\"fov\":" + std::to_string(fov) + ",\"method\":\"SetFOV\"");
+        }
+
+        const auto fov_offset = ref.resolve_property_offset("PlayerCameraManager", "FOVAngle");
+        if (fov_offset >= 0)
+        {
+            *reinterpret_cast<float*>(camera_manager + static_cast<std::uintptr_t>(fov_offset)) = static_cast<float>(fov);
+            return response_json(true, "set_fov", 0, 0, "FOV set via FOVAngle property",
+                                "\"fov\":" + std::to_string(fov) + ",\"method\":\"FOVAngle\"");
+        }
+
+        const auto default_fov_offset = ref.resolve_property_offset("PlayerCameraManager", "DefaultFOV");
+        if (default_fov_offset >= 0)
+        {
+            *reinterpret_cast<float*>(camera_manager + static_cast<std::uintptr_t>(default_fov_offset)) = static_cast<float>(fov);
+            return response_json(true, "set_fov", 0, 0, "FOV set via DefaultFOV property",
+                                "\"fov\":" + std::to_string(fov) + ",\"method\":\"DefaultFOV\"");
+        }
+
+        return response_json(false, "fov_method_unavailable", 0, 1,
+                            "could not find SetFOV function or FOVAngle/DefaultFOV property");
+    }
+
+    auto handle_game_kill(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1, "local pawn not available");
+        }
+
+        const bool kill_enemies = json_extract_bool(payload, "enemies");
+
+        if (kill_enemies)
+        {
+            return response_json(false, "not_implemented", 0, 1, "enemy kill not yet implemented via bridge");
+        }
+
+        {
+            const auto destroy_fn = ref.find_function(ctx.pawn, "K2_DestroyActor");
+            if (destroy_fn)
+            {
+                const auto params_size = safe_read<int>(destroy_fn + OffPropertiesSize, 0);
+                if (params_size >= 0 && params_size <= 1024)
+                {
+                    std::vector<std::uint8_t> p(std::max(1, params_size), 0);
+                    std::string pe_failure{};
+                    if (process_event(ctx.pawn, destroy_fn, p.data(), pe_failure))
+                    {
+                        return response_json(true, "kill", 0, 0, "K2_DestroyActor called", "\"method\":\"K2_DestroyActor\"");
+                    }
+                }
+            }
+        }
+
+        {
+            const auto pawn_class_name = ref.class_name(ctx.pawn);
+            for (const auto* prop_name : {"Health", "HP", "CurrentHealth"})
+            {
+                const auto offset = ref.resolve_property_offset(pawn_class_name.c_str(), prop_name);
+                if (offset >= 0)
+                {
+                    *reinterpret_cast<float*>(ctx.pawn + static_cast<std::uintptr_t>(offset)) = 0.0f;
+                    return response_json(true, "kill", 0, 0,
+                                        std::string("set ") + prop_name + " to 0",
+                                        "\"method\":\"property_" + std::string(prop_name) + "\"");
+                }
+            }
+        }
+
+        {
+            const auto suicide_fn = ref.find_function(ctx.pawn, "Suicide");
+            if (suicide_fn)
+            {
+                const auto params_size = safe_read<int>(suicide_fn + OffPropertiesSize, 0);
+                if (params_size >= 0 && params_size <= 1024)
+                {
+                    std::vector<std::uint8_t> p(std::max(1, params_size), 0);
+                    std::string pe_failure{};
+                    if (process_event(ctx.pawn, suicide_fn, p.data(), pe_failure))
+                    {
+                        return response_json(true, "kill", 0, 0, "Suicide called", "\"method\":\"Suicide\"");
+                    }
+                }
+            }
+        }
+
+        {
+            const auto damage_fn = ref.find_function(ctx.pawn, "ReceiveDamage");
+            if (damage_fn)
+            {
+                const auto params_size = safe_read<int>(damage_fn + OffPropertiesSize, 0);
+                if (params_size > 0 && params_size <= 1024)
+                {
+                    std::vector<std::uint8_t> p(static_cast<std::size_t>(params_size), 0);
+                    for (auto prop = safe_read<std::uintptr_t>(damage_fn + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+                    {
+                        const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+                        if (name != "ReturnValue")
+                        {
+                            write_number(ref, prop, p.data(), 99999.0);
+                            break;
+                        }
+                    }
+                    std::string pe_failure{};
+                    if (process_event(ctx.pawn, damage_fn, p.data(), pe_failure))
+                    {
+                        return response_json(true, "kill", 0, 0, "ReceiveDamage called", "\"method\":\"ReceiveDamage\"");
+                    }
+                }
+            }
+        }
+
+        {
+            const auto console_fn = ref.find_function(ctx.controller, "ConsoleCommand");
+            if (console_fn)
+            {
+                const auto params_size = safe_read<int>(console_fn + OffPropertiesSize, 0);
+                if (params_size > 0 && params_size <= 4096)
+                {
+                    std::vector<std::uint8_t> p(static_cast<std::size_t>(params_size), 0);
+                    std::vector<std::wstring> backing{};
+                    for (auto prop = safe_read<std::uintptr_t>(console_fn + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+                    {
+                        const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+                        if (name == "Command" || name == "command")
+                        {
+                            sdk_write_fstring_param(prop, p.data(), "kill", backing);
+                        }
+                    }
+                    std::string pe_failure{};
+                    if (process_event(ctx.controller, console_fn, p.data(), pe_failure))
+                    {
+                        return response_json(true, "kill", 0, 0, "ConsoleCommand 'kill'", "\"method\":\"ConsoleCommand\"");
+                    }
+                }
+            }
+        }
+
+        return response_json(false, "kill_failed", 0, 1, "all kill strategies failed");
+    }
+
+    // SEH-safe hex dump of a memory window (byte-by-byte, never faults).
+    auto netconn_hex_window(std::uintptr_t addr, std::size_t count) -> std::string
+    {
+        std::string out;
+        out.reserve(count * 2);
+        char buf[3];
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const std::uint8_t b = safe_read<std::uint8_t>(addr + i, 0);
+            std::snprintf(buf, sizeof(buf), "%02x", b);
+            out += buf;
+        }
+        return out;
+    }
+
+    auto netconn_resolve_from_context(const SdkContext& ctx) -> std::uintptr_t
+    {
+        std::uintptr_t conn = 0;
+        if (live_uobject(ctx.local_player))
+        {
+            conn = safe_read<std::uintptr_t>(ctx.local_player + OffUPlayerConnection);
+        }
+        if (!live_uobject(conn))
+        {
+            conn = anti_kick_resolve_local_net_connection();
+        }
+        return conn;
+    }
+
+    auto netconn_watch_loop() -> void
+    {
+        g_netconn_watch_thread_alive.store(true);
+        const auto conn = g_netconn_watch_conn.load();
+        const auto local_player = g_netconn_watch_local_player.load();
+        const auto start = GetTickCount64();
+
+        // Baseline: connection pointer, its vtable, and a memory window that
+        // should span EConnectionState + close/disconnect bookkeeping fields.
+        constexpr std::size_t WindowBytes = 0x80;
+        const auto baseline_vtable = safe_read<std::uintptr_t>(conn);
+        append_anti_kick_log_file(
+            "[netconn-watch] armed conn=" + hex_address(conn) +
+            " local_player=" + hex_address(local_player) +
+            " vtable=" + hex_address(baseline_vtable) +
+            " window[0x00..0x80]=" + netconn_hex_window(conn, WindowBytes) + "\n");
+
+        bool reported = false;
+        while (g_netconn_watch_enabled.load())
+        {
+            Sleep(100);
+            const auto elapsed = GetTickCount64() - start;
+
+            // The local player's Connection pointer being nulled/swapped is the
+            // cleanest "you were disconnected" signal.
+            std::uintptr_t cur_conn = conn;
+            if (live_uobject(local_player))
+            {
+                cur_conn = safe_read<std::uintptr_t>(local_player + OffUPlayerConnection);
+            }
+
+            const bool ptr_changed = live_uobject(local_player) && cur_conn != conn;
+            const bool obj_invalid = !live_uobject(conn);
+
+            if (ptr_changed || obj_invalid)
+            {
+                std::string reason = ptr_changed ? "local_player.Connection changed"
+                                                 : "connection object became invalid";
+                append_anti_kick_log_file(
+                    "[netconn-watch] CLOSED after +" + std::to_string(elapsed) + "ms — " + reason +
+                    " old_conn=" + hex_address(conn) +
+                    " new_conn=" + hex_address(cur_conn) +
+                    " vtable_now=" + hex_address(safe_read<std::uintptr_t>(conn)) +
+                    " window[0x00..0x80]=" + netconn_hex_window(conn, WindowBytes) + "\n");
+                reported = true;
+                break;
+            }
+        }
+        if (!reported)
+        {
+            append_anti_kick_log_file("[netconn-watch] stopped (no close observed)\n");
+        }
+        g_netconn_watch_thread_alive.store(false);
+    }
+
+    auto handle_game_set_netconn_watch(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        (void)ref;
+        const bool enabled = json_extract_bool(payload, "enabled");
+        if (!enabled)
+        {
+            g_netconn_watch_enabled.store(false);
+            return response_json(true, "set_netconn_watch", 0, 0, "netconn watch disabled",
+                                 "\"enabled\":false");
+        }
+        if (g_netconn_watch_thread_alive.load())
+        {
+            return response_json(true, "set_netconn_watch", 0, 0, "netconn watch already running",
+                                 "\"enabled\":true,\"already_running\":true");
+        }
+        const auto conn = netconn_resolve_from_context(ctx);
+        if (!live_uobject(conn))
+        {
+            return response_json(false, "net_connection_unavailable", 0, 1,
+                                 "local NetConnection not resolvable — join a match first");
+        }
+        g_netconn_watch_conn.store(conn);
+        g_netconn_watch_local_player.store(ctx.local_player);
+        g_netconn_watch_enabled.store(true);
+        std::thread(netconn_watch_loop).detach();
+        return response_json(true, "set_netconn_watch", 0, 0, "netconn watch armed",
+                             "\"enabled\":true,\"net_connection\":\"" + hex_address(conn) + "\"");
+    }
+
+    auto handle_game_dump_netconn_vtable(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        (void)ref;
+        const std::size_t slots = std::min<std::size_t>(
+            static_cast<std::size_t>(std::max(0.0, json_extract_double(payload, "slots"))), 256);
+        const std::size_t slot_count = slots ? slots : 128;
+        const auto conn = netconn_resolve_from_context(ctx);
+        if (!live_uobject(conn))
+        {
+            return response_json(false, "net_connection_unavailable", 0, 1,
+                                 "local NetConnection not resolvable — join a match first");
+        }
+        const auto vtable = safe_read<std::uintptr_t>(conn);
+        if (!vtable)
+        {
+            return response_json(false, "vtable_unavailable", 0, 1, "NetConnection vtable pointer null");
+        }
+        const auto module = main_module_range();
+        const auto cls = safe_read<std::uintptr_t>(conn + OffClass);
+        const std::uint32_t cls_name_idx = cls ? safe_read<std::uint32_t>(cls + OffName, 0) : 0;
+        const std::string cls_name = cls_name_idx ? ref.names.resolve(cls_name_idx) : std::string("?");
+        append_anti_kick_log_file(
+            "[netconn-vtable] class=" + cls_name +
+            " conn=" + hex_address(conn) +
+            " vtable=" + hex_address(vtable) +
+            " module_base=" + hex_address(module.base) +
+            " slots=" + std::to_string(slot_count) + "\n");
+        std::size_t in_module = 0;
+        for (std::size_t i = 0; i < slot_count; ++i)
+        {
+            const auto fn = safe_read<std::uintptr_t>(vtable + i * sizeof(std::uintptr_t));
+            if (!fn)
+            {
+                continue;
+            }
+            const bool in_mod = address_in_main_module(fn);
+            std::string line = "[netconn-vtable] slot " + std::to_string(i) +
+                               " (0x" + early_hex_address(i * sizeof(std::uintptr_t)).substr(2) + ")" +
+                               " = " + hex_address(fn);
+            if (in_mod)
+            {
+                ++in_module;
+                line += " rva=" + hex_address(fn - module.base);
+            }
+            else
+            {
+                line += " (off-module)";
+            }
+            append_anti_kick_log_file(line + "\n");
+        }
+        const std::string meta =
+            "\"class\":\"" + json_escape(cls_name) + "\"" +
+            ",\"net_connection\":\"" + hex_address(conn) + "\"" +
+            ",\"vtable\":\"" + hex_address(vtable) + "\"" +
+            ",\"module_base\":\"" + hex_address(module.base) + "\"" +
+            ",\"slots\":" + std::to_string(slot_count) +
+            ",\"in_module\":" + std::to_string(in_module);
+        return response_json(true, "dump_netconn_vtable", 0, 0,
+                             "vtable dumped to anti_kick.log", meta);
+    }
+
+    auto handle_game_set_anti_kick(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        const bool enabled = json_extract_bool(payload, "enabled");
+        if (!enabled)
+        {
+            g_anti_kick_enabled.store(false);
+            g_anti_kick_capture_enabled.store(false);
+            g_anti_kick_local_controller.store(0);
+            g_anti_kick_local_player.store(0);
+            g_anti_kick_local_player_state.store(0);
+            g_anti_kick_local_net_connection.store(0);
+            g_anti_kick_local_pawn.store(0);
+            {
+                std::lock_guard<std::mutex> lock(g_anti_kick_capture_mutex);
+                g_anti_kick_capture_seen.clear();
+            }
+            capture_reset_seen_table();
+            g_anti_kick_blocked_function_count.store(0);
+            g_anti_kick_last_logged_blocked_count = static_cast<std::size_t>(-1);
+            g_anti_kick_last_logged_net_connection = 0;
+            g_anti_kick_last_logged_no_player_state = false;
+            g_anti_kick_last_logged_no_net_connection = false;
+            for (std::size_t i = 0; i < AntiKickMaxBlockedFunctions; ++i)
+            {
+                g_anti_kick_blocked_functions[i].store(0);
+            }
+            g_anti_kick_blocked_name_count.store(0);
+            for (std::size_t i = 0; i < AntiKickMaxBlockedNames; ++i)
+            {
+                g_anti_kick_blocked_name_indices[i].store(0);
+            }
+            g_anti_kick_session = {};
+            {
+                std::lock_guard<std::mutex> lock(g_anti_kick_host_name_mutex);
+                g_anti_kick_host_name[0] = '\0';
+                g_anti_kick_host_name_ms = 0;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+                g_anti_kick_func_meta_count = 0;
+            }
+            uninstall_anti_kick_vtable_hooks();
+            append_anti_kick_log_file("[anti-kick] disabled\n");
+            return response_json(true, "set_anti_kick", 0, 0, "anti-kick disabled",
+                                "\"enabled\":false,\"blocked_functions\":0");
+        }
+
+        if (!live_uobject(ctx.controller))
+        {
+            return response_json(false, "controller_unavailable", 0, 1, "local PlayerController not available");
+        }
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1,
+                                "wait until spawned in before enabling anti-kick (hook installs on match load)");
+        }
+
+        g_anti_kick_session.world = ctx.world;
+        g_anti_kick_session.gamestate_off = ref.resolve_property_offset("World", "GameState");
+        g_anti_kick_session.playerarray_off = ref.resolve_property_offset("GameStateBase", "PlayerArray");
+        for (const char* prop_name :
+             {"HostPlayerState", "SessionOwnerPlayerState", "HostingPlayerState", "OwnerPlayerState"})
+        {
+            const int off = ref.resolve_property_offset("GameState", prop_name);
+            if (off > 0)
+            {
+                g_anti_kick_session.host_ps_direct_off = off;
+                break;
+            }
+        }
+        for (const char* prop_name :
+             {"bIsSessionHost", "bIsHost", "bIsHosting", "bIsSessionOwner", "bIsLobbyHost", "bIsHostPlayer"})
+        {
+            const int off = ref.resolve_property_offset("PlayerState", prop_name);
+            if (off > 0)
+            {
+                g_anti_kick_session.host_flag_off = off;
+                break;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_host_name_mutex);
+            g_anti_kick_host_name[0] = '\0';
+            g_anti_kick_host_name_ms = 0;
+        }
+
+        std::uintptr_t blocked[AntiKickMaxBlockedFunctions]{};
+        std::size_t blocked_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+            g_anti_kick_func_meta_count = 0;
+        }
+
+        auto remember_blocked = [&](std::uintptr_t function, const char* owner, const char* name) {
+            if (!function || blocked_count >= AntiKickMaxBlockedFunctions)
+            {
+                return;
+            }
+            for (std::size_t i = 0; i < blocked_count; ++i)
+            {
+                if (blocked[i] == function)
+                {
+                    return;
+                }
+            }
+            blocked[blocked_count++] = function;
+            std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+            if (g_anti_kick_func_meta_count < AntiKickMaxBlockedFunctions)
+            {
+                auto& meta = g_anti_kick_func_meta[g_anti_kick_func_meta_count++];
+                meta.func = function;
+                std::snprintf(meta.name, sizeof(meta.name), "%s", name ? name : "?");
+                std::snprintf(meta.owner, sizeof(meta.owner), "%s", owner ? owner : "local");
+            }
+        };
+
+        auto add_named = [&](std::uintptr_t object, const char* owner, const char* function_name) {
+            if (!live_uobject(object))
+            {
+                return;
+            }
+            const auto function = ref.find_function(object, function_name);
+            if (function)
+            {
+                remember_blocked(function, owner, function_name);
+            }
+        };
+
+        auto add_class_named = [&](const char* class_name_text, const char* owner, const char* function_name) {
+            const auto cls = ref.find_class_any(class_name_text);
+            if (!cls)
+            {
+                append_anti_kick_log_file(std::string("[anti-kick] class not found: ") + class_name_text + "\n");
+                return;
+            }
+            const auto function = ref.find_function_in_class(cls, function_name);
+            if (function)
+            {
+                remember_blocked(function, owner, function_name);
+            }
+            else
+            {
+                append_anti_kick_log_file(std::string("[anti-kick] function not found: ") + class_name_text + "." + function_name + "\n");
+            }
+        };
+
+        add_named(ctx.controller, "PlayerController", "ClientWasKicked");
+        add_named(ctx.controller, "PlayerController", "ClientReturnToMainMenuWithTextReason");
+        add_named(ctx.controller, "PlayerController", "ClientReturnToMainMenu");
+
+        // The kick RPCs this game actually uses (ported from chameleonEsp):
+        // Kick on the online PlayerState and on the LINK character. Resolve
+        // them from the classes themselves — instance-based lookup misses the
+        // LINK variant entirely, and the local PlayerState pointer can be
+        // stale/null at enable time.
+        add_class_named("BP_FirstPersonPlayerState_Online_C", "PlayerStateOnline", "Kick");
+        add_class_named("BP_FirstPersonCharacter_LINK_C", "CharacterLINK", "Kick");
+
+        std::uintptr_t player_state = safe_read<std::uintptr_t>(ctx.controller + OffPlayerControllerPlayerState);
+        if (!live_uobject(player_state) && live_uobject(ctx.pawn))
+        {
+            player_state = safe_read<std::uintptr_t>(ctx.pawn + OffPawnPlayerState);
+        }
+        if (!live_uobject(player_state))
+        {
+            player_state = g_anti_kick_local_player_state.load();
+        }
+
+        std::uintptr_t net_connection = 0;
+        if (live_uobject(ctx.local_player))
+        {
+            net_connection = safe_read<std::uintptr_t>(ctx.local_player + OffUPlayerConnection);
+        }
+        if (!live_uobject(net_connection))
+        {
+            net_connection = g_anti_kick_local_net_connection.load();
+        }
+
+        const std::function<void(std::uintptr_t, const char*, const char*)> remember_fn = remember_blocked;
+        scan_kick_functions_on_object(ref, ctx.controller, "PlayerController", remember_fn);
+        // Also register PlayerState / NetConnection kick+close RPCs. These are
+        // caught by the global inline ProcessEvent hook (installed below), which
+        // sees calls on every object, so they no longer depend on the controller
+        // vtable. add_named resolves the well-known ones explicitly; the scan
+        // picks up any class-specific variants.
+        if (live_uobject(player_state))
+        {
+            add_named(player_state, "PlayerState", "Kick");
+            add_named(player_state, "PlayerState", "ServerKick");
+            scan_kick_functions_on_object(ref, player_state, "PlayerState", remember_fn);
+        }
+        if (live_uobject(net_connection))
+        {
+            add_named(net_connection, "NetConnection", "Close");
+            add_named(net_connection, "NetConnection", "ConditionalCleanUp");
+            add_named(net_connection, "NetConnection", "CleanUp");
+            scan_kick_functions_on_object(ref, net_connection, "NetConnection", remember_fn);
+        }
+
+        if (blocked_count == 0)
+        {
+            return response_json(false, "kick_functions_unavailable", 0, 1,
+                                "could not resolve kick RPC functions on local controller/player state");
+        }
+
+        if (!live_uobject(ctx.controller))
+        {
+            return response_json(false, "controller_unavailable", 0, 1, "local PlayerController not available");
+        }
+
+        std::string hook_failure{};
+        if (!g_anti_kick_vtable_hook_installed)
+        {
+            if (!install_anti_kick_vtable_hooks(ctx.controller, player_state, net_connection, hook_failure))
+            {
+                return response_json(false, "anti_kick_hook_failed", 0, 1, hook_failure);
+            }
+        }
+        if (!g_anti_kick_vtable_hook_installed)
+        {
+            return response_json(false, "anti_kick_hook_failed", 0, 1, "anti_kick_vtable_hook_missing");
+        }
+        // Install the global inline ProcessEvent hook too. The controller vtable
+        // hook only sees RPCs dispatched on the local controller; kick paths that
+        // run on PlayerState or NetConnection (e.g. host-initiated Kick / Close)
+        // only pass through the engine-wide ProcessEvent. This is the same hook
+        // paint uses, so it is already crash-tested on this build.
+        std::string pe_hook_failure{};
+        if (!install_process_event_hook(pe_hook_failure))
+        {
+            // Non-fatal: fall back to controller vtable coverage only.
+            append_anti_kick_log_file(
+                "[anti-kick] warning: global ProcessEvent hook unavailable (" +
+                pe_hook_failure + ") — coverage limited to controller RPCs\n");
+        }
+        if (!g_original_process_event.load() || !is_executable_code(g_original_process_event.load()))
+        {
+            return response_json(false, "anti_kick_hook_failed", 0, 1, "process_event_original_unavailable");
+        }
+
+        g_anti_kick_local_controller.store(ctx.controller);
+        g_anti_kick_local_player.store(ctx.local_player);
+        g_anti_kick_local_player_state.store(player_state);
+        g_anti_kick_local_net_connection.store(net_connection);
+        g_anti_kick_local_pawn.store(ctx.pawn);
+        // Arm capture mode: log distinct UFunctions dispatched on our local
+        // objects so a host kick's real call path becomes visible in the log.
+        g_anti_kick_capture_names_pool.store(ref.names.pool);
+        g_anti_kick_capture_names_table_offset.store(ref.names.table_offset);
+        g_anti_kick_capture_names_style.store(ref.names.style);
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_capture_mutex);
+            g_anti_kick_capture_seen.clear();
+        }
+        capture_reset_seen_table();
+        g_anti_kick_capture_enabled.store(true);
+        g_anti_kick_blocked_function_count.store(blocked_count);
+        for (std::size_t i = 0; i < AntiKickMaxBlockedFunctions; ++i)
+        {
+            g_anti_kick_blocked_functions[i].store(i < blocked_count ? blocked[i] : 0);
+        }
+        // Record the FName comparison indices of the well-known kick RPC names
+        // so the by-name fallback keeps blocking after the engine recreates the
+        // Blueprint UFunction objects on a round transition.
+        {
+            std::size_t name_count = 0;
+            std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+            for (std::size_t i = 0; i < g_anti_kick_func_meta_count && name_count < AntiKickMaxBlockedNames; ++i)
+            {
+                if (!anti_kick_is_global_kick_name(g_anti_kick_func_meta[i].name))
+                {
+                    continue;
+                }
+                const auto name_index = safe_read<std::uint32_t>(g_anti_kick_func_meta[i].func + OffName, 0);
+                if (!name_index)
+                {
+                    continue;
+                }
+                bool duplicate = false;
+                for (std::size_t j = 0; j < name_count; ++j)
+                {
+                    if (g_anti_kick_blocked_name_indices[j].load() == name_index)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate)
+                {
+                    continue;
+                }
+                std::snprintf(g_anti_kick_blocked_name_texts[name_count],
+                              sizeof(g_anti_kick_blocked_name_texts[name_count]),
+                              "%s", g_anti_kick_func_meta[i].name);
+                g_anti_kick_blocked_name_indices[name_count].store(name_index);
+                ++name_count;
+            }
+            g_anti_kick_blocked_name_count.store(name_count);
+        }
+        g_anti_kick_enabled.store(true);
+
+        std::string monitored = "\"monitored_functions\":[";
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+            for (std::size_t i = 0; i < g_anti_kick_func_meta_count; ++i)
+            {
+                if (i > 0)
+                {
+                    monitored += ",";
+                }
+                monitored += "\"" + json_escape(g_anti_kick_func_meta[i].name) + "\"";
+            }
+        }
+        monitored += "]";
+
+        std::string summary = "[anti-kick] enabled — monitoring " + std::to_string(blocked_count) + " RPC(s): ";
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+            for (std::size_t i = 0; i < g_anti_kick_func_meta_count; ++i)
+            {
+                if (i > 0)
+                {
+                    summary += ", ";
+                }
+                summary += g_anti_kick_func_meta[i].owner;
+                summary += ".";
+                summary += g_anti_kick_func_meta[i].name;
+            }
+        }
+        summary += "\n";
+        if (blocked_count != g_anti_kick_last_logged_blocked_count
+            || net_connection != g_anti_kick_last_logged_net_connection)
+        {
+            g_anti_kick_last_logged_blocked_count = blocked_count;
+            g_anti_kick_last_logged_net_connection = net_connection;
+            append_anti_kick_log_file(summary);
+        }
+
+        std::string meta = "\"enabled\":true,\"hook_mode\":\"vtable\",\"hooks_locked\":"
+                           + std::string(g_anti_kick_vtable_hook_installed ? "true" : "false") +
+                           ",\"blocked_functions\":" + std::to_string(blocked_count) +
+                           ",\"controller\":\"" + hex_address(ctx.controller) + "\"" +
+                           ",\"player_state\":\"" + hex_address(player_state) + "\"" +
+                           ",\"net_connection\":\"" + hex_address(net_connection) + "\"" +
+                           ",\"blocks_so_far\":" + std::to_string(g_anti_kick_block_count.load()) + "," + monitored;
+        return response_json(true, "set_anti_kick", 0, 0, "anti-kick enabled", meta);
+    }
+
+    auto handle_game_set_god_mode(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        const bool enabled = json_extract_bool(payload, "enabled");
+        if (!enabled)
+        {
+            g_god_mode_enabled.store(false);
+            g_god_mode_local_pawn.store(0);
+            g_god_mode_blocked_function_count.store(0);
+            for (std::size_t i = 0; i < GodModeMaxBlockedFunctions; ++i)
+            {
+                g_god_mode_blocked_functions[i].store(0);
+            }
+            append_anti_kick_log_file("[god-mode] disabled\n");
+            return response_json(true, "set_god_mode", 0, 0, "god mode disabled",
+                                "\"enabled\":false,\"blocked_functions\":0");
+        }
+
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1,
+                                "wait until spawned in as survivor before enabling god mode");
+        }
+
+        std::uintptr_t blocked[GodModeMaxBlockedFunctions]{};
+        std::size_t blocked_count = 0;
+        auto remember_blocked = [&](std::uintptr_t function) {
+            if (!function || blocked_count >= GodModeMaxBlockedFunctions)
+            {
+                return;
+            }
+            for (std::size_t i = 0; i < blocked_count; ++i)
+            {
+                if (blocked[i] == function)
+                {
+                    return;
+                }
+            }
+            blocked[blocked_count++] = function;
+        };
+        auto add_class_named = [&](const char* class_name_text, const char* function_name) {
+            const auto cls = ref.find_class_any(class_name_text);
+            if (!cls)
+            {
+                append_anti_kick_log_file(std::string("[god-mode] class not found: ") + class_name_text + "\n");
+                return;
+            }
+            const auto function = ref.find_function_in_class(cls, function_name);
+            if (function)
+            {
+                remember_blocked(function);
+            }
+            else
+            {
+                append_anti_kick_log_file(
+                    std::string("[god-mode] function not found: ") + class_name_text + "." + function_name + "\n");
+            }
+        };
+
+        add_class_named("BP_FirstPersonCharacter_Main_C", "Damage");
+        add_class_named("BP_FirstPersonCharacter_LINK_C", "Damage");
+        add_class_named("BP_FirstPersonCharacter_cLeon_Character_C", "DeathPlayer");
+        add_class_named("BP_FirstPersonCharacter_cLeon_Character_Hunter_C", "KillPlayer");
+
+        if (blocked_count == 0)
+        {
+            return response_json(false, "god_mode_functions_unavailable", 0, 1,
+                                "could not resolve Damage/DeathPlayer/KillPlayer UFunctions");
+        }
+
+        std::string pe_hook_failure{};
+        if (!install_process_event_hook(pe_hook_failure))
+        {
+            return response_json(false, "god_mode_hook_failed", 0, 1, pe_hook_failure);
+        }
+        if (!g_original_process_event.load() || !is_executable_code(g_original_process_event.load()))
+        {
+            return response_json(false, "god_mode_hook_failed", 0, 1, "process_event_original_unavailable");
+        }
+
+        g_god_mode_local_pawn.store(ctx.pawn);
+        g_god_mode_blocked_function_count.store(blocked_count);
+        for (std::size_t i = 0; i < GodModeMaxBlockedFunctions; ++i)
+        {
+            g_god_mode_blocked_functions[i].store(i < blocked_count ? blocked[i] : 0);
+        }
+        god_mode_scrub_pawn(ctx.pawn);
+        g_god_mode_enabled.store(true);
+
+        append_anti_kick_log_file(
+            "[god-mode] enabled — blocking " + std::to_string(blocked_count) +
+            " UFunction(s) on pawn " + hex_address(ctx.pawn) + "\n");
+
+        std::string meta = "\"enabled\":true,\"blocked_functions\":" + std::to_string(blocked_count) +
+                           ",\"pawn\":\"" + hex_address(ctx.pawn) + "\"" +
+                           ",\"blocks_so_far\":" + std::to_string(g_god_mode_block_count.load());
+        return response_json(true, "set_god_mode", 0, 0, "god mode enabled", meta);
+    }
+
+    auto handle_get_anti_kick_log(const std::string& payload) -> std::string
+    {
+        const std::uint64_t since_seq = static_cast<std::uint64_t>(json_extract_double(payload, "since_seq"));
+        std::string entries = "\"entries\":[";
+        bool first = true;
+        std::size_t returned = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_log_mutex);
+            const std::size_t total = std::min(g_anti_kick_log_head, AntiKickLogCapacity);
+            for (std::size_t i = 0; i < total; ++i)
+            {
+                const auto& entry = g_anti_kick_log[(g_anti_kick_log_head + AntiKickLogCapacity - total + i) % AntiKickLogCapacity];
+                if (entry.seq <= since_seq)
+                {
+                    continue;
+                }
+                if (!first)
+                {
+                    entries += ",";
+                }
+                first = false;
+                ++returned;
+                entries += "{\"seq\":" + std::to_string(entry.seq) +
+                           ",\"timestamp_ms\":" + std::to_string(entry.timestamp_ms) +
+                           ",\"function\":\"" + json_escape(entry.function_name) + "\"" +
+                           ",\"owner\":\"" + json_escape(entry.object_owner) + "\"" +
+                           ",\"kicker\":\"" + json_escape(entry.kicker) + "\"" +
+                           ",\"detail\":\"" + json_escape(entry.detail) + "\"}";
+            }
+        }
+        entries += "]";
+        std::string monitored = "\"monitored_functions\":[";
+        {
+            std::lock_guard<std::mutex> lock(g_anti_kick_meta_mutex);
+            for (std::size_t i = 0; i < g_anti_kick_func_meta_count; ++i)
+            {
+                if (i > 0)
+                {
+                    monitored += ",";
+                }
+                monitored += "\"" + json_escape(g_anti_kick_func_meta[i].name) + "\"";
+            }
+        }
+        monitored += "]";
+        const std::string meta = entries + "," + monitored +
+                                 ",\"latest_seq\":" + std::to_string(g_anti_kick_log_seq.load()) +
+                                 ",\"blocks_so_far\":" + std::to_string(g_anti_kick_block_count.load()) +
+                                 ",\"enabled\":" + json_bool(g_anti_kick_enabled.load()) +
+                                 ",\"returned\":" + std::to_string(returned);
+        return response_json(true, "get_anti_kick_log", 0, 0, "ok", meta);
+    }
+
+    auto trim_player_name(std::string name) -> std::string
+    {
+        while (!name.empty() && (name.front() == ' ' || name.front() == '\t'))
+        {
+            name.erase(name.begin());
+        }
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
+        {
+            name.pop_back();
+        }
+        if (name.size() > 32)
+        {
+            name.resize(32);
+        }
+        return name;
+    }
+
+    auto parse_hex_u64(const std::string& text) -> std::uintptr_t
+    {
+        if (text.empty())
+        {
+            return 0;
+        }
+        const char* start = text.c_str();
+        if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0)
+        {
+            start += 2;
+        }
+        char* end = nullptr;
+        const auto value = std::strtoull(start, &end, 16);
+        return end && end > start ? static_cast<std::uintptr_t>(value) : 0;
+    }
+
+    auto extract_steam64_text(const std::string& text) -> std::string
+    {
+        for (std::size_t i = 0; i + 17 <= text.size(); ++i)
+        {
+            if (text.compare(i, 7, "7656119") != 0)
+            {
+                continue;
+            }
+            bool ok = true;
+            for (int j = 7; j < 17; ++j)
+            {
+                const char ch = text[i + static_cast<std::size_t>(j)];
+                if (ch < '0' || ch > '9')
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok)
+            {
+                return text.substr(i, 17);
+            }
+        }
+        return {};
+    }
+
+    auto read_fstring_param(const std::uint8_t* base) -> std::string
+    {
+        if (!base)
+        {
+            return {};
+        }
+        const auto data = safe_read<const wchar_t*>(reinterpret_cast<std::uintptr_t>(base));
+        const auto num = safe_read<int>(reinterpret_cast<std::uintptr_t>(base + 8));
+        if (!data || num <= 1 || num > 256)
+        {
+            return {};
+        }
+        std::string out{};
+        out.reserve(static_cast<std::size_t>(num));
+        for (int i = 0; i < num - 1; ++i)
+        {
+            const wchar_t ch = safe_read<wchar_t>(
+                reinterpret_cast<std::uintptr_t>(data + static_cast<std::size_t>(i) * sizeof(wchar_t)));
+            if (!ch)
+            {
+                break;
+            }
+            out.push_back(ch >= 0 && ch < 128 ? static_cast<char>(ch) : '?');
+        }
+        return out;
+    }
+
+    auto read_player_state_display_name(std::uintptr_t player_state) -> std::string
+    {
+        if (!live_uobject(player_state))
+        {
+            return {};
+        }
+        static const int name_offsets[] = {0x388, 0x3F0, 0x340};
+        for (const int off : name_offsets)
+        {
+            const auto name = read_fstring_param(reinterpret_cast<const std::uint8_t*>(player_state + off));
+            if (!name.empty())
+            {
+                return trim_player_name(name);
+            }
+        }
+        return {};
+    }
+
+    auto resolve_session_host_player_state(Reflection& ref) -> std::uintptr_t
+    {
+        (void)ref;
+        const auto& sess = g_anti_kick_session;
+        if (!sess.world || sess.gamestate_off <= 0)
+        {
+            return 0;
+        }
+        const auto gamestate = safe_read<std::uintptr_t>(sess.world + static_cast<std::uintptr_t>(sess.gamestate_off));
+        if (!live_uobject(gamestate))
+        {
+            return 0;
+        }
+        if (sess.host_ps_direct_off > 0)
+        {
+            const auto host_ps = safe_read<std::uintptr_t>(
+                gamestate + static_cast<std::uintptr_t>(sess.host_ps_direct_off));
+            if (live_uobject(host_ps))
+            {
+                return host_ps;
+            }
+        }
+        if (sess.playerarray_off <= 0 || sess.host_flag_off <= 0)
+        {
+            return 0;
+        }
+        const auto player_array = safe_read<sdk::TArray<std::uintptr_t>>(
+            gamestate + static_cast<std::uintptr_t>(sess.playerarray_off));
+        if (!player_array.Data || player_array.Num <= 0)
+        {
+            return 0;
+        }
+        const int limit = std::min(player_array.Num, 32);
+        for (int i = 0; i < limit; ++i)
+        {
+            const auto ps = safe_read<std::uintptr_t>(
+                reinterpret_cast<std::uintptr_t>(player_array.Data) + static_cast<std::uintptr_t>(i) * 8);
+            if (!live_uobject(ps))
+            {
+                continue;
+            }
+            if (safe_read<std::uint8_t>(ps + static_cast<std::uintptr_t>(sess.host_flag_off)) != 0)
+            {
+                return ps;
+            }
+        }
+        return 0;
+    }
+
+    auto cached_session_host_name(Reflection& ref) -> const char*
+    {
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        if (g_anti_kick_host_name[0] != '\0' && (now_ms - g_anti_kick_host_name_ms) < 2000)
+        {
+            return g_anti_kick_host_name;
+        }
+
+        std::lock_guard<std::mutex> lock(g_anti_kick_host_name_mutex);
+        if (g_anti_kick_host_name[0] != '\0' && (now_ms - g_anti_kick_host_name_ms) < 2000)
+        {
+            return g_anti_kick_host_name;
+        }
+
+        std::string host_name{};
+        const auto host_ps = resolve_session_host_player_state(ref);
+        if (host_ps)
+        {
+            host_name = read_player_state_display_name(host_ps);
+        }
+        if (host_name.empty())
+        {
+            host_name = "unknown host";
+        }
+        std::snprintf(g_anti_kick_host_name, sizeof(g_anti_kick_host_name), "%s", host_name.c_str());
+        g_anti_kick_host_name_ms = now_ms;
+        return g_anti_kick_host_name;
+    }
+
+    auto conv_net_id_repl_to_steam64(Reflection& ref, const std::uint8_t* net_id, std::string& failure) -> std::string
+    {
+        if (!net_id)
+        {
+            return {};
+        }
+        bool any = false;
+        for (int i = 0; i < 0x30; ++i)
+        {
+            if (net_id[i] != 0)
+            {
+                any = true;
+                break;
+            }
+        }
+        if (!any)
+        {
+            return {};
+        }
+
+        const auto helpers = sdk_find_object_named(ref, "Default__OnlineHelpers");
+        const auto fn_conv = helpers ? ref.find_function(helpers, "Conv_FUniqueNetIdReplToString") : 0;
+        if (!helpers || !fn_conv)
+        {
+            failure = "conv_function_unavailable";
+            return extract_steam64_text(std::string(reinterpret_cast<const char*>(net_id), 0x30));
+        }
+
+        alignas(16) std::uint8_t conv_params[0x40]{};
+        std::memcpy(conv_params, net_id, 0x30);
+        if (!process_event(helpers, fn_conv, conv_params, failure))
+        {
+            return {};
+        }
+        return extract_steam64_text(read_fstring_param(conv_params + 0x30));
+    }
+
+    auto handle_game_get_player_steam_id(const std::string& payload, Reflection& ref) -> std::string
+    {
+        const auto ps_text = json_extract_string(payload, "player_state");
+        const auto player_state = parse_hex_u64(ps_text);
+        if (!live_uobject(player_state))
+        {
+            return response_json(false, "player_state_unavailable", 0, 1, "invalid PlayerState pointer");
+        }
+
+        std::string failure{};
+        std::string steam_id{};
+
+        const auto helpers = sdk_find_object_named(ref, "Default__OnlineHelpers");
+        const auto fn_get_ps = helpers ? ref.find_function(helpers, "GetPlayerStateUniqueNetId") : 0;
+        if (helpers && fn_get_ps)
+        {
+            alignas(16) std::uint8_t get_params[0x38]{};
+            *reinterpret_cast<std::uintptr_t*>(get_params) = player_state;
+            if (process_event(helpers, fn_get_ps, get_params, failure))
+            {
+                steam_id = conv_net_id_repl_to_steam64(ref, get_params + 8, failure);
+            }
+        }
+
+        if (steam_id.empty())
+        {
+            const auto fn_bp = ref.find_function(player_state, "BP_GetUniqueId");
+            if (fn_bp)
+            {
+                alignas(16) std::uint8_t bp_params[0x30]{};
+                if (process_event(player_state, fn_bp, bp_params, failure))
+                {
+                    steam_id = conv_net_id_repl_to_steam64(ref, bp_params, failure);
+                }
+            }
+        }
+
+        if (steam_id.empty())
+        {
+            const auto unique_off = ref.resolve_property_offset("PlayerState", "UniqueID");
+            if (unique_off >= 0)
+            {
+                steam_id = conv_net_id_repl_to_steam64(
+                    ref,
+                    reinterpret_cast<const std::uint8_t*>(player_state + static_cast<std::uintptr_t>(unique_off)),
+                    failure);
+            }
+        }
+
+        if (steam_id.empty())
+        {
+            const auto msg = failure.empty() ? "Steam ID not replicated yet" : failure;
+            return response_json(false, "steam_id_unavailable", 0, 1, msg);
+        }
+
+        const std::string meta = "\"steam_id\":\"" + json_escape(steam_id) + "\"";
+        return response_json(true, "get_player_steam_id", 0, 0, steam_id, meta);
+    }
+
+    auto handle_game_set_player_name(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        std::string name = trim_player_name(json_extract_string(payload, "name"));
+        if (name.empty())
+        {
+            return response_json(false, "invalid_name", 0, 1, "name must not be empty");
+        }
+
+        if (!live_uobject(ctx.controller))
+        {
+            return response_json(false, "controller_unavailable", 0, 1, "local PlayerController not available");
+        }
+
+        std::uintptr_t player_state = safe_read<std::uintptr_t>(ctx.controller + OffPlayerControllerPlayerState);
+        if (!live_uobject(player_state) && live_uobject(ctx.pawn))
+        {
+            player_state = safe_read<std::uintptr_t>(ctx.pawn + OffPawnPlayerState);
+        }
+        if (!live_uobject(player_state))
+        {
+            return response_json(false, "player_state_unavailable", 0, 1, "local PlayerState not available");
+        }
+
+        std::uintptr_t set_name_fn = 0;
+        std::string func_used{};
+        for (const char* candidate : {"SetName(Server)", "SetName"})
+        {
+            set_name_fn = ref.find_function(player_state, candidate);
+            if (set_name_fn)
+            {
+                func_used = candidate;
+                break;
+            }
+        }
+        if (!set_name_fn)
+        {
+            return response_json(false, "function_unavailable", 0, 1, "SetName UFunction not found on PlayerState");
+        }
+
+        const auto params_size = safe_read<int>(set_name_fn + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 4096)
+        {
+            return response_json(false, "params_unavailable", 0, 1, "SetName parameter block unavailable");
+        }
+
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        std::vector<std::wstring> backing{};
+        bool wrote_string = false;
+        for (auto prop = safe_read<std::uintptr_t>(set_name_fn + OffChildProperties); prop;
+             prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto prop_name = lower_copy(ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName)));
+            if (contains_text(prop_name, "customplayername") || prop_name == "name")
+            {
+                wrote_string = sdk_write_fstring_param(prop, params.data(), name, backing) || wrote_string;
+            }
+        }
+        if (!wrote_string && params_size >= static_cast<int>(sizeof(ScriptStringParam)))
+        {
+            backing.push_back(widen_ascii(name));
+            auto& wide = backing.back();
+            auto* dest = reinterpret_cast<ScriptStringParam*>(params.data());
+            dest->data = wide.empty() ? nullptr : wide.data();
+            dest->num = static_cast<int>(wide.size()) + 1;
+            dest->max = dest->num;
+            wrote_string = true;
+        }
+        if (!wrote_string)
+        {
+            return response_json(false, "params_unavailable", 0, 1, "could not populate SetName FString parameter");
+        }
+
+        std::string pe_failure{};
+        if (!process_event(player_state, set_name_fn, params.data(), pe_failure))
+        {
+            return response_json(false, "process_event_failed", 0, 1, pe_failure);
+        }
+
+        std::string meta = "\"name\":\"" + json_escape(name) + "\",\"function\":\"" + json_escape(func_used) + "\"";
+        return response_json(true, "set_player_name", 0, 0, "SetName RPC sent", meta);
+    }
+
+    auto handle_game_command_direct(const std::string& request) -> std::string
+    {
+        std::string failure{};
+        Reflection ref{};
+        if (!ref.init(failure))
+        {
+            return response_json(false, failure.c_str(), 0, 1, failure.empty() ? "SDK reflection init failed" : failure);
+        }
+        SdkContext ctx{};
+        try
+        {
+            ctx = sdk_resolve_context(ref);
+        }
+        catch (const SdkResolutionException& ex)
+        {
+            return response_json(false, ex.stage.c_str(), 0, 1, ex.what());
+        }
+
+        const std::string payload = json_extract_payload(request);
+
+        if (request.find("\"type\":\"teleport\"") != std::string::npos)
+        {
+            return handle_game_teleport(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"set_fov\"") != std::string::npos)
+        {
+            return handle_game_set_fov(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"kill\"") != std::string::npos)
+        {
+            return handle_game_kill(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"set_anti_kick\"") != std::string::npos)
+        {
+            return handle_game_set_anti_kick(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"set_god_mode\"") != std::string::npos)
+        {
+            return handle_game_set_god_mode(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"get_skeleton\"") != std::string::npos)
+        {
+            return handle_game_get_skeleton(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"set_netconn_watch\"") != std::string::npos)
+        {
+            return handle_game_set_netconn_watch(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"dump_netconn_vtable\"") != std::string::npos)
+        {
+            return handle_game_dump_netconn_vtable(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"set_player_name\"") != std::string::npos)
+        {
+            return handle_game_set_player_name(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"get_player_steam_id\"") != std::string::npos)
+        {
+            return handle_game_get_player_steam_id(payload, ref);
+        }
+        if (request.find("\"type\":\"rotate\"") != std::string::npos)
+        {
+            const std::string payload = json_extract_payload(request);
+            const double yaw_delta = json_extract_double(payload, "yaw");
+            const std::string rotate_target = json_extract_string(payload, "target");
+            const bool rotate_camera = rotate_target == "camera" || rotate_target == "control";
+            bool rotated = false;
+            if (!rotate_camera && live_uobject(ctx.pawn))
+            {
+                const auto get_rot_fn = ref.find_function(ctx.pawn, "K2_GetActorRotation");
+                sdk::Actor_K2_GetActorRotation get_params{};
+                if (get_rot_fn &&
+                    process_event(ctx.pawn, get_rot_fn, reinterpret_cast<std::uint8_t*>(&get_params), failure))
+                {
+                    const auto set_rot_fn = ref.find_function(ctx.pawn, "K2_SetActorRotation");
+                    if (set_rot_fn)
+                    {
+                        sdk::Actor_K2_SetActorRotation set_params{};
+                        set_params.NewRotation = get_params.ReturnValue;
+                        set_params.NewRotation.Yaw += yaw_delta;
+                        set_params.bTeleportPhysics = true;
+                        rotated = process_event(ctx.pawn, set_rot_fn, reinterpret_cast<std::uint8_t*>(&set_params), failure);
+                    }
+                }
+            }
+            if (!rotated && live_uobject(ctx.controller))
+            {
+                const auto set_cr_fn = ref.find_function(ctx.controller, "SetControlRotation");
+                if (set_cr_fn)
+                {
+                    sdk::Controller_SetControlRotation cr_params{};
+                    cr_params.NewRotation = safe_read<sdk::FRotator>(
+                        ctx.controller + sdk::FieldOffsets::Controller_ControlRotation);
+                    cr_params.NewRotation.Yaw += yaw_delta;
+                    rotated = process_event(ctx.controller, set_cr_fn, reinterpret_cast<std::uint8_t*>(&cr_params), failure);
+                }
+            }
+            return response_json(rotated, "rotate", 0, rotated ? 0 : 1, rotated ? "rotated" : "rotate failed",
+                                std::string("\"yaw_delta\":") + std::to_string(yaw_delta) +
+                                    ",\"rotate_target\":\"" + json_escape(rotate_camera ? "camera" : "pawn") + "\"");
+        }
+        return response_json(false, "unknown_game_command", 0, 1, "unknown game command type");
+    }
+
+    auto handle_cancel_paint() -> std::string
+    {
+        g_paint_cancelled.store(true);
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            for (auto& job : g_paint_jobs)
+            {
+                if (job && !job->done)
+                {
+                    job->response = response_json(false, "cancelled", 0, 0, "paint cancelled", "");
+                    job->done = true;
+                }
+            }
+            g_paint_jobs.clear();
+        }
+        g_paint_jobs_cv.notify_all();
+        return response_json(true, "cancelled", 0, 0, "paint cancelled");
+    }
+
+    auto handle_request(const std::string& line) -> std::string
+    {
+        if (line.find("\"type\":\"ping\"") != std::string::npos)
+        {
+            return response_json(true, "ping", 0, 0, "pong");
+        }
+        if (line.find("\"type\":\"cancel_paint\"") != std::string::npos)
+        {
+            return handle_cancel_paint();
+        }
+        if (line.find("\"type\":\"get_anti_kick_log\"") != std::string::npos)
+        {
+            return handle_get_anti_kick_log(json_extract_payload(line));
+        }
+        if (line.find("\"type\":\"capabilities\"") != std::string::npos)
+        {
+            return "{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,"
+                   "\"message\":\"ok\",\"timing_ms\":{},"
+                   "\"metadata\":{\"commands\":[\"ping\",\"capabilities\",\"sdk_probe\",\"sdk_deep_probe\",\"paint_full_route\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"rotate\",\"set_anti_kick\",\"set_god_mode\",\"get_skeleton\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\",\"set_netconn_watch\",\"dump_netconn_vtable\"],"
+                   "\"sdk\":\"runtime_dynamic_reflection_min\","
+                   "\"paint_full_route\":\"template_brush_paint\","
+                   "\"paint_full_route_fields\":[\"camera_yaw_offset\",\"camera_rotation_absolute\",\"camera_settle_ms\"],"
+                   "\"texture_import_used\":false,"
+                   "\"local_paint_used\":false,"
+                   "\"paint_at_uv_with_brush_used\":false,"
+                   "\"replication\":\"server_paint_batch\","
+                   "\"multiplayer_replicated\":true}}\n";
+        }
+        if (line.find("\"type\":\"shutdown\"") != std::string::npos)
+        {
+            g_anti_kick_enabled.store(false);
+            g_god_mode_enabled.store(false);
+            g_god_mode_local_pawn.store(0);
+            g_god_mode_blocked_function_count.store(0);
+            g_netconn_watch_enabled.store(false);
+            uninstall_anti_kick_vtable_hooks();
+            uninstall_process_event_inline_hook();
+            uninstall_process_event_hook();
+            g_running.store(false);
+            return response_json(true, "shutdown", 0, 0, "bridge shutdown requested");
+        }
+        if (line.find("\"type\":\"sdk_probe\"") != std::string::npos)
+        {
+            return paint_full_route_native(line);
+        }
+        if (line.find("\"type\":\"sdk_deep_probe\"") != std::string::npos)
+        {
+            return paint_full_route_native(line);
+        }
+        if (line.find("\"type\":\"paint_full_route\"") != std::string::npos)
+        {
+            return paint_full_route_native(line);
+        }
+        if (line.find("\"type\":\"teleport\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_fov\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"kill\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_anti_kick\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_god_mode\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"get_skeleton\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_netconn_watch\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"dump_netconn_vtable\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_player_name\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"get_player_steam_id\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"rotate\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+
+
+        return response_json(false, "unknown_command", 0, 1, "unknown bridge command");
+    }
+
+    auto bridge_thread() -> void
+    {
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+        {
+            return;
+        }
+        SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listener == INVALID_SOCKET)
+        {
+            WSACleanup();
+            return;
+        }
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(static_cast<u_short>(resolve_bridge_port()));
+        const int yes = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+        if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR || listen(listener, 4) == SOCKET_ERROR)
+        {
+            closesocket(listener);
+            WSACleanup();
+            return;
+        }
+        auto last_activity = std::chrono::steady_clock::now();
+        while (g_running.load())
+        {
+            fd_set read_set{};
+            FD_ZERO(&read_set);
+            FD_SET(listener, &read_set);
+            timeval timeout{};
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+            const int selected = select(0, &read_set, nullptr, nullptr, &timeout);
+            if (selected == SOCKET_ERROR)
+            {
+                break;
+            }
+            if (selected == 0)
+            {
+                continue;
+            }
+            SOCKET client = accept(listener, nullptr, nullptr);
+            if (client == INVALID_SOCKET)
+            {
+                continue;
+            }
+            last_activity = std::chrono::steady_clock::now();
+            const int timeout_ms = 5000;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            std::string request{};
+            request.reserve(65536);
+            char buffer[16384]{};
+            while (request.size() < MaxRequestBytes)
+            {
+                const int received = recv(client, buffer, static_cast<int>(sizeof(buffer)), 0);
+                if (received <= 0)
+                {
+                    break;
+                }
+                request.append(buffer, static_cast<std::size_t>(received));
+                if (request.find('\n') != std::string::npos)
+                {
+                    break;
+                }
+            }
+            if (!request.empty())
+            {
+                const std::string response = request.size() >= MaxRequestBytes
+                                                 ? response_json(false, "request_too_large", 0, 1, "bridge request exceeded max size")
+                                                 : handle_request(request);
+                send(client, response.c_str(), static_cast<int>(response.size()), 0);
+            }
+            closesocket(client);
+        }
+        closesocket(listener);
+        WSACleanup();
+        g_anti_kick_enabled.store(false);
+        uninstall_anti_kick_vtable_hooks();
+        uninstall_process_event_inline_hook();
+        uninstall_process_event_hook();
+        HMODULE module = g_module;
+        g_module = nullptr;
+        if (module != nullptr)
+        {
+            FreeLibraryAndExitThread(module, 0);
+        }
+    }
+}
+
+// GAME_COMMAND_PATCH_APPLIED 2026-06-28 10:08:37 UTC
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls(module);
+        g_module = module;
+        std::thread(bridge_thread).detach();
+    }
+    if (reason == DLL_PROCESS_DETACH)
+    {
+        g_running.store(false);
+    }
+    return TRUE;
+}

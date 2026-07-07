@@ -19,6 +19,12 @@ meccha_chameleon_tools/paint_presets/
 logs/
 *.log
 
+# Bridge runtime sidecars (binaries in bridge/ are committed)
+bridge/*.port
+bridge/*.progress.json
+bridge/*.listen.json
+bridge/*.eventwatch*
+
 # IDE
 .vscode/
 .idea/

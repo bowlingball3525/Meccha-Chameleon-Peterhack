@@ -89,6 +89,16 @@ try {
 
     if (-not (Test-Path $BridgeOutput)) { throw "Bridge DLL was not produced: $BridgeOutput" }
 
+    $MeshProfilesSrc = Join-Path $RuntimeRoot "resources\mesh-profiles"
+    if (Test-Path $MeshProfilesSrc) {
+        $MeshProfilesOut = Join-Path $OutDir "mesh-profiles"
+        New-Item -ItemType Directory -Force -Path $MeshProfilesOut | Out-Null
+        Copy-Item -Force (Join-Path $MeshProfilesSrc "*.json") $MeshProfilesOut
+        Write-Host ("  " + (Join-Path $OutDir "mesh-profiles"))
+    } else {
+        Write-Warning "Mesh profiles not found at $MeshProfilesSrc - mesh_first_paint will fail at runtime"
+    }
+
     $ResourceRc = Join-Path $ObjDir "controller.rc"
     $ResourceRes = Join-Path $ObjDir "controller.res"
     $BridgeResourcePath = ((Resolve-Path $BridgeOutput).Path -replace '\\', '\\')
@@ -114,3 +124,22 @@ Write-Host "Built runtime artifacts:"
 Write-Host "  $(Join-Path $OutDir "$ExeName.exe")"
 Write-Host "  $(Join-Path $OutDir 'runtime-bridge.dll')"
 Write-Host "  $(Join-Path $OutDir 'runtime-injector.exe')"
+
+$RepoRoot = (Resolve-Path (Join-Path $RuntimeRoot "..")).Path
+$BridgeDir = Join-Path $RepoRoot "bridge"
+
+function Deploy-BridgeArtifacts([string]$TargetDir) {
+    if (-not (Test-Path $TargetDir)) { return }
+    New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+    Copy-Item -Force (Join-Path $OutDir "runtime-bridge.dll") (Join-Path $TargetDir "meccha-xenos-bridge.dll")
+    Copy-Item -Force (Join-Path $OutDir "runtime-injector.exe") (Join-Path $TargetDir "meccha-xenos-injector.exe")
+    $ProfilesSrc = Join-Path $OutDir "mesh-profiles"
+    if (Test-Path $ProfilesSrc) {
+        $ProfilesDst = Join-Path $TargetDir "mesh-profiles"
+        New-Item -ItemType Directory -Force -Path $ProfilesDst | Out-Null
+        Copy-Item -Force (Join-Path $ProfilesSrc "*.json") $ProfilesDst
+    }
+    Write-Host "Deployed Peterhack bridge to $TargetDir"
+}
+
+Deploy-BridgeArtifacts $BridgeDir

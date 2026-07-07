@@ -169,7 +169,7 @@ Works in lobby as non-host (nameplate above character). Spamming rename no longe
 | `set_player_name` | Replicated rename via `SetName(Server)` |
 | `shutdown` | Stop bridge TCP server |
 
-Bridge auto-injects on game connect. Binaries copied to `C:\peterhack\camo\` on first use.
+Bridge auto-injects on game connect from **`bridge/`** in the Peterhack repo folder (same directory as `Peterhack.bat`).
 
 ### Environment Camouflage (Bridge)
 
@@ -272,7 +272,8 @@ Requires **Visual Studio** with C++ tools.
 ```powershell
 runtime/scripts/build.ps1
 # Output: runtime/.build/bin/runtime-bridge.dll
-# Copy to meccha_chameleon_tools/meccha-xenos-bridge.dll and C:\peterhack\camo\
+# Output: bridge/meccha-xenos-bridge.dll (+ injector, mesh-profiles)
+# Commit bridge/ when updating the in-game DLL so GitHub users get the latest build.
 ```
 
 **Bridge source (in repo):**
@@ -283,6 +284,7 @@ runtime/scripts/build.ps1
 | `runtime/src/injector.cpp` | DLL injector |
 | `runtime/include/sdk.hpp` | UE5 struct layouts and offsets |
 | `runtime/scripts/build.ps1` | MSVC build script |
+| `bridge/` | Shipped **`meccha-xenos-bridge.dll`**, injector, and mesh profiles (committed to Git) |
 
 Peterhack extends [SilentJMA/Meccha-Chameleon-Tools](https://github.com/SilentJMA/Meccha-Chameleon-Tools) with 6-pass dynamic camo, body-anchored scene capture, world-position UV color projection, vtable anti-kick, and game-thread rename.
 
@@ -311,7 +313,7 @@ On launch, Peterhack can check [GitHub main](https://github.com/bowlingball3525/
 | Magnet does nothing | You must be **Hunter**; press **G** (or your bound key) to toggle ON. Key works while tabbed into the game — run Peterhack as Admin if hotkey fails. |
 | Kill Selected / Kill All fails | Hunter only; host/session rules apply — check `[EXPLOITS:KILL]` in log. |
 | `could not unload` / DLL stuck | **Quit the game completely** and relaunch. Run Peterhack as Administrator. |
-| `missing bridge binaries` | Ensure `meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` are in `meccha_chameleon_tools/` |
+| `missing bridge binaries` | Run `runtime/scripts/build.ps1` or ensure `bridge/meccha-xenos-bridge.dll` + `meccha-xenos-injector.exe` exist |
 | Bridge inject OK but paint fails on retry | Restart game — do not spam F10 after a failed reinject |
 | Front pass blocked by floor/geometry | Latest build uses front noclip + body anchor; on flat maps try **Disable front pass** |
 | Back pass paints wrong side | Update — front/back yaw swap fixed in latest build |

@@ -20,6 +20,22 @@ EXPLOITS_PATCHES = {
     "RVA_PROCESS_EVENT": "OFFSET_PROCESSEVENT",
 }
 
+# .get("Class::Field", 0xFALLBACK) literals in core.py when resolver cache misses.
+FALLBACK_OFFSETS = {
+    "AActor::RootComponent": ("AActor", "RootComponent"),
+    "APawn::PlayerState": ("APawn", "PlayerState"),
+    "APawn::Controller": ("APawn", "Controller"),
+    "AController::PlayerState": ("AController", "PlayerState"),
+    "AController::ControlRotation": ("AController", "ControlRotation"),
+    "APlayerState::PawnPrivate": ("APlayerState", "PawnPrivate"),
+    "APlayerController::PlayerCameraManager": ("APlayerController", "PlayerCameraManager"),
+    "APlayerController::Player": ("APlayerController", "Player"),
+    "APlayerController::AcknowledgedPawn": ("APlayerController", "AcknowledgedPawn"),
+    "UWorld::OwningGameInstance": ("UWorld", "OwningGameInstance"),
+    "UWorld::GameState": ("UWorld", "GameState"),
+    "UGameInstance::LocalPlayers": ("UGameInstance", "LocalPlayers"),
+}
+
 # Prefer C:\dumper-7 (user may typo as duper-7)
 DUMP_ROOTS = [Path(r"C:\dumper-7"), Path(r"C:\duper-7")]
 
@@ -162,6 +178,43 @@ def patch_const(text: str, name: str, value: int) -> tuple[str, bool]:
     return new_text, n == 1
 
 
+def patch_fallback(text: str, key: str, value: int) -> tuple[str, bool]:
+    pat = re.compile(rf'(\.get\("{re.escape(key)}",\s*)0x[0-9A-Fa-f]+(\))')
+    new = rf"\g<1>0x{value:X}\2"
+    new_text, n = pat.subn(new, text)
+    return new_text, n > 0
+
+
+def collect_fallback_updates(dump: Path) -> dict[str, int]:
+    classes = load_class_offsets(dump)
+    updates: dict[str, int] = {}
+    for key, (cls, field) in FALLBACK_OFFSETS.items():
+        full = f"{cls}::{field}"
+        if full in classes:
+            updates[key] = classes[full]
+    return updates
+
+
+def apply_fallback_updates(updates: dict[str, int]) -> None:
+    if not CORE.is_file() or not updates:
+        return
+    text = CORE.read_text(encoding="utf-8")
+    changed = []
+    missing = []
+    for key, value in sorted(updates.items()):
+        text, ok = patch_fallback(text, key, value)
+        if ok:
+            changed.append(f"  {key} fallback -> 0x{value:X}")
+        else:
+            missing.append(key)
+    if changed:
+        CORE.write_text(text, encoding="utf-8")
+        print("Patched core.py fallbacks:")
+        print("\n".join(changed))
+    if missing:
+        print(f"Fallback not found in core.py: {', '.join(missing)}")
+
+
 def collect_updates(dump: Path) -> dict[str, int]:
     oi = json.loads((dump / "Dumpspace" / "OffsetsInfo.json").read_text(encoding="utf-8"))
     globals_map = {k: v for k, v in oi["data"] if k.startswith("OFFSET")}
@@ -284,6 +337,7 @@ def main():
     report(dump, updates)
     if args.apply:
         apply_updates(updates)
+        apply_fallback_updates(collect_fallback_updates(dump))
         print("\nDone — restart Peterhack to pick up new offsets.")
     return 0
 

@@ -31,40 +31,48 @@ class CamoBridgeMixin:
     DLL_NAME = "meccha-xenos-bridge.dll"
     EXE_NAME = "meccha-camouflage.exe"  # legacy bundle artifact — not launched by Peterhack
     INJECTOR_NAME = "meccha-xenos-injector.exe"
+    BRIDGE_FOLDER = "bridge"
     BRIDGE_HOST = "127.0.0.1"
     BRIDGE_PORT = BRIDGE_FIXED_PORT
-    CAMO_DIR = os.path.join(PETERHACK_ROOT, "camo")
-    RUNTIME_DIR = os.path.join(CAMO_DIR, "runtime")
+    # Legacy controller sidecars only — not used for inject.
+    RUNTIME_DIR = os.path.join(PETERHACK_ROOT, "logs", "bridge")
 
-    @staticmethod
-    def _camo_bundle_dir():
+    @classmethod
+    def _repo_root(cls):
         if getattr(sys, "frozen", False):
+            return os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    @classmethod
+    def _bridge_dir(cls):
+        """Shipped bridge binaries live in <repo>/bridge/ (committed to GitHub)."""
+        return os.path.join(cls._repo_root(), cls.BRIDGE_FOLDER)
+
+    @classmethod
+    def _embedded_bridge_dir(cls):
+        """PyInstaller bundle or legacy meccha_chameleon_tools fallback."""
+        if getattr(sys, "frozen", False):
+            bundled = os.path.join(sys._MEIPASS, cls.BRIDGE_FOLDER)
+            if os.path.isdir(bundled):
+                return bundled
             return sys._MEIPASS
-        return os.path.dirname(os.path.abspath(__file__))
+        legacy = os.path.dirname(os.path.abspath(__file__))
+        bridge = cls._bridge_dir()
+        if os.path.isfile(os.path.join(bridge, cls.DLL_NAME)):
+            return bridge
+        return legacy
 
     @classmethod
-    def _get_dll_path(cls):
-        return os.path.join(cls._camo_bundle_dir(), cls.DLL_NAME)
+    def _get_bridge_dll_path(cls):
+        return os.path.join(cls._bridge_dir(), cls.DLL_NAME)
 
     @classmethod
-    def _get_exe_path(cls):
-        return os.path.join(cls._camo_bundle_dir(), cls.EXE_NAME)
+    def _get_bridge_injector_path(cls):
+        return os.path.join(cls._bridge_dir(), cls.INJECTOR_NAME)
 
     @classmethod
-    def _get_injector_path(cls):
-        return os.path.join(cls._camo_bundle_dir(), cls.INJECTOR_NAME)
-
-    @staticmethod
-    def _get_stable_exe_path():
-        return os.path.join(CamoBridgeMixin.CAMO_DIR, CamoBridgeMixin.EXE_NAME)
-
-    @staticmethod
-    def _get_stable_dll_path():
-        return os.path.join(CamoBridgeMixin.CAMO_DIR, CamoBridgeMixin.DLL_NAME)
-
-    @staticmethod
-    def _get_stable_injector_path():
-        return os.path.join(CamoBridgeMixin.CAMO_DIR, CamoBridgeMixin.INJECTOR_NAME)
+    def _get_bridge_exe_path(cls):
+        return os.path.join(cls._bridge_dir(), cls.EXE_NAME)
 
     BRIDGE_DLL_MARKERS = (
         "meccha-xenos-bridge",
@@ -73,6 +81,73 @@ class CamoBridgeMixin:
     )
     RUNTIME_BRIDGE_MARKERS = ("runtime-bridge",)
     XENOS_BRIDGE_MARKERS = ("meccha-xenos-bridge", "xenos-bridge")
+    REQUIRED_BRIDGE_COMMANDS = frozenset({
+        "get_skeleton",
+        "set_anti_kick",
+        "paint_full_route",
+        "teleport",
+    })
+
+    @classmethod
+    def _bridge_file_fingerprint(cls, path):
+        try:
+            stat = os.stat(path)
+            return int(stat.st_size), int(stat.st_mtime)
+        except OSError:
+            return None, None
+
+    @classmethod
+    def _format_bridge_fingerprint(cls, path):
+        size, mtime = cls._bridge_file_fingerprint(path)
+        if size is None:
+            return "missing"
+        import datetime as _dt
+        stamp = _dt.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        return f"{size} bytes, {stamp}"
+
+    @classmethod
+    def _validate_inject_dll_path(cls, dll_path):
+        """Peterhack must inject only the stable xenos bridge — never runtime-bridge."""
+        if not dll_path:
+            return False, "bridge DLL path is empty"
+        base = os.path.basename(dll_path)
+        if base.lower() != cls.DLL_NAME.lower():
+            return False, f"refusing wrong DLL name: {base!r} (expected {cls.DLL_NAME})"
+        norm = os.path.normcase(os.path.abspath(dll_path))
+        if "runtime-bridge" in norm:
+            return False, "refusing runtime-bridge DLL — use meccha-xenos-bridge.dll"
+        expected = os.path.normcase(os.path.abspath(cls._get_bridge_dll_path()))
+        if norm != expected:
+            return False, f"refusing unexpected inject path: {dll_path} (expected {expected})"
+        if not os.path.isfile(dll_path):
+            return False, f"bridge DLL not found: {dll_path}"
+        if os.path.getsize(dll_path) <= 0:
+            return False, f"bridge DLL is empty: {dll_path}"
+        return True, ""
+
+    def _verify_bridge_identity(self):
+        """Confirm TCP bridge is the merged Peterhack xenos DLL, not legacy runtime-bridge."""
+        loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
+        if has_runtime and not has_xenos:
+            return False, "runtime-bridge loaded — quit game and reconnect so Peterhack can inject meccha-xenos-bridge.dll"
+        if loaded and not has_xenos:
+            return False, f"unknown bridge module(s): {', '.join(mod_names)}"
+
+        resp = self._bridge_request("capabilities", {}, timeout=5)
+        if not resp or not resp.get("success"):
+            return False, "bridge capabilities probe failed"
+        meta = resp.get("metadata") or {}
+        route = meta.get("paint_full_route")
+        if route != "mesh_first_paint":
+            return False, (
+                f"wrong bridge build (paint_full_route={route!r}) — "
+                "fully quit the game, then restart Peterhack to inject the updated meccha-xenos-bridge.dll"
+            )
+        cmds = set((meta.get("commands") or []))
+        missing = sorted(self.REQUIRED_BRIDGE_COMMANDS - cmds)
+        if missing:
+            return False, f"bridge missing Peterhack commands: {', '.join(missing)}"
+        return True, ""
 
     def _bridge_dll_loaded(self):
         """Return (loaded, module_names) for camouflage bridge DLLs in the game process."""
@@ -176,12 +251,12 @@ class CamoBridgeMixin:
         add(bridge.get("port"))
         add(getattr(self, "_bridge_port", None))
         add(BRIDGE_FIXED_PORT)
-        add(self._read_port_file(self._get_stable_dll_path() + ".port"))
+        add(self._read_port_file(self._get_bridge_dll_path() + ".port"))
 
         sidecars = []
         for pattern in (
             os.path.join(self.RUNTIME_DIR, "native", "*.dll.port"),
-            os.path.join(self.CAMO_DIR, "*.dll.port"),
+            os.path.join(self._bridge_dir(), "*.dll.port"),
         ):
             sidecars.extend(glob.glob(pattern))
         sidecars.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -391,37 +466,85 @@ class CamoBridgeMixin:
         if removed:
             print(f"[CAMO] purged {removed} stale runtime-bridge file(s)", flush=True)
 
-    def _extract_stable_camo_files(self):
+    def _ensure_bridge_files(self):
+        """Ensure repo bridge/ has DLL, injector, and mesh-profiles (sync from EXE bundle when frozen)."""
         import shutil
 
-        os.makedirs(self.CAMO_DIR, exist_ok=True)
+        bridge_dir = self._bridge_dir()
+        os.makedirs(bridge_dir, exist_ok=True)
         os.makedirs(self.RUNTIME_DIR, exist_ok=True)
         missing = []
+        embedded = self._embedded_bridge_dir()
 
-        def _safe_copy(src_fn, dst_fn):
+        def _files_match(src_fn, dst_fn):
+            if not os.path.isfile(src_fn) or not os.path.isfile(dst_fn):
+                return False
+            src_size, src_mtime = self._bridge_file_fingerprint(src_fn)
+            dst_size, dst_mtime = self._bridge_file_fingerprint(dst_fn)
+            return src_size == dst_size and src_mtime == dst_mtime
+
+        def _safe_copy(src_fn, dst_fn, label):
             if not os.path.isfile(src_fn):
                 return os.path.isfile(dst_fn)
+            if os.path.isfile(dst_fn) and _files_match(src_fn, dst_fn):
+                return True
             try:
+                os.makedirs(os.path.dirname(dst_fn), exist_ok=True)
                 shutil.copy2(src_fn, dst_fn)
+                print(
+                    f"[CAMO] refreshed {label} → {dst_fn} "
+                    f"({self._format_bridge_fingerprint(dst_fn)})",
+                    flush=True,
+                )
                 return True
             except (PermissionError, OSError) as exc:
                 winerr = getattr(exc, "winerror", None)
                 if os.path.isfile(dst_fn) and os.path.getsize(dst_fn) > 0:
                     if winerr == 32 or isinstance(exc, PermissionError):
-                        print(
-                            f"[CAMO] {os.path.basename(dst_fn)} in use — "
-                            "using existing copy",
-                            flush=True,
-                        )
+                        src_fp = self._format_bridge_fingerprint(src_fn)
+                        dst_fp = self._format_bridge_fingerprint(dst_fn)
+                        if not _files_match(src_fn, dst_fn):
+                            print(
+                                f"[CAMO] {label} locked in game — using {dst_fn} ({dst_fp}); "
+                                f"bundle has newer {src_fp}. Fully quit the game to pick up updates.",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[CAMO] {label} in use — using existing copy ({dst_fp})",
+                                flush=True,
+                            )
                         return True
                 raise
 
+        print(
+            f"[CAMO] bridge dir={bridge_dir} "
+            f"dll={self._format_bridge_fingerprint(self._get_bridge_dll_path())}",
+            flush=True,
+        )
+
+        embedded_dll = os.path.join(embedded, self.DLL_NAME)
+        embedded_inj = os.path.join(embedded, self.INJECTOR_NAME)
+        if not os.path.isfile(embedded_dll):
+            embedded_dll = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), self.DLL_NAME,
+            )
+            embedded_inj = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), self.INJECTOR_NAME,
+            )
+
         for src_fn, dst_fn, label in (
-            (self._get_dll_path(), self._get_stable_dll_path(), self.DLL_NAME),
-            (self._get_injector_path(), self._get_stable_injector_path(), self.INJECTOR_NAME),
+            (embedded_dll, self._get_bridge_dll_path(), self.DLL_NAME),
+            (embedded_inj, self._get_bridge_injector_path(), self.INJECTOR_NAME),
         ):
+            src_norm = os.path.normcase(os.path.abspath(src_fn))
+            dst_norm = os.path.normcase(os.path.abspath(dst_fn))
+            if src_norm == dst_norm:
+                if not os.path.isfile(dst_fn):
+                    missing.append(label)
+                continue
             try:
-                if not _safe_copy(src_fn, dst_fn):
+                if not _safe_copy(src_fn, dst_fn, label):
                     missing.append(label)
             except Exception as exc:
                 if os.path.isfile(dst_fn) and os.path.getsize(dst_fn) > 0:
@@ -432,8 +555,44 @@ class CamoBridgeMixin:
                 else:
                     missing.append(label)
 
+        profiles_dst = os.path.join(bridge_dir, "mesh-profiles")
+        profiles_src_candidates = [
+            os.path.join(embedded, "mesh-profiles"),
+            os.path.join(self._repo_root(), "runtime", "resources", "mesh-profiles"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "mesh-profiles"),
+        ]
+        profiles_src = ""
+        for candidate in profiles_src_candidates:
+            if os.path.isdir(candidate):
+                profiles_src = candidate
+                break
+
+        src_norm = os.path.normcase(os.path.abspath(profiles_src)) if profiles_src else ""
+        dst_norm = os.path.normcase(os.path.abspath(profiles_dst))
+        has_profiles = os.path.isdir(profiles_dst) and any(
+            name.endswith(".json") for name in os.listdir(profiles_dst)
+        )
+
+        if profiles_src and src_norm != dst_norm:
+            try:
+                if os.path.isdir(profiles_dst):
+                    shutil.rmtree(profiles_dst, ignore_errors=True)
+                shutil.copytree(profiles_src, profiles_dst)
+                print(f"[CAMO] refreshed mesh-profiles → {profiles_dst}", flush=True)
+            except Exception as exc:
+                print(f"[CAMO] could not copy mesh-profiles: {exc}", flush=True)
+        elif profiles_src and src_norm == dst_norm and has_profiles:
+            pass  # already in bridge/
+        elif not has_profiles:
+            missing.append("mesh-profiles")
+            print(
+                "[CAMO] error: mesh-profiles missing in bridge/ — "
+                "run runtime/scripts/build.ps1 or copy runtime/resources/mesh-profiles",
+                flush=True,
+            )
+
         if not missing:
-            print(f"[CAMO] bridge files ready in {self.CAMO_DIR}", flush=True)
+            print(f"[CAMO] bridge files ready in {bridge_dir}", flush=True)
         return missing
 
     @staticmethod
@@ -566,10 +725,15 @@ class CamoBridgeMixin:
         self._bridge_commands = set(cmds)
         meta = resp.get("metadata") or {}
         fields = meta.get("paint_full_route_fields") or []
-        self._bridge_paint_yaw = "camera_yaw_offset" in fields
+        self._bridge_paint_yaw = (
+            meta.get("paint_full_route") != "mesh_first_paint"
+            and "camera_yaw_offset" in fields
+        )
         if cmds:
             print(f"[CAMO] bridge commands: {', '.join(cmds)}", flush=True)
-        if self._bridge_paint_yaw:
+        if meta.get("paint_full_route") == "mesh_first_paint":
+            print("[CAMO] bridge uses official mesh_first_paint pipeline", flush=True)
+        elif self._bridge_paint_yaw:
             print("[CAMO] wrap yaw via paint_full_route camera_yaw_offset", flush=True)
         elif cmds and "rotate" not in cmds:
             print(
@@ -626,8 +790,13 @@ class CamoBridgeMixin:
                     flush=True,
                 )
                 return False
-        inj = self._get_stable_injector_path()
-        dll = self._get_stable_dll_path()
+        inj = self._get_bridge_injector_path()
+        dll = self._get_bridge_dll_path()
+        ok_path, path_err = self._validate_inject_dll_path(dll)
+        if not ok_path:
+            print(f"[CAMO] {path_err}", flush=True)
+            self._camo_last_error = path_err
+            return False
         proc_name = getattr(self, "PROCESS_NAME", "PenguinHotel-Win64-Shipping.exe")
         if not os.path.isfile(inj) or not os.path.isfile(dll):
             print("[CAMO] direct inject skipped — injector or DLL missing", flush=True)
@@ -635,7 +804,7 @@ class CamoBridgeMixin:
         self._write_port_sidecar(dll, port)
         print(
             f"[CAMO] injecting {self.DLL_NAME} pid={getattr(self.pm, 'process_id', 0)} "
-            f"port={port}...",
+            f"port={port} path={dll} ({self._format_bridge_fingerprint(dll)})...",
             flush=True,
         )
         try:
@@ -721,28 +890,30 @@ class CamoBridgeMixin:
 
         loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
         tcp_ok = bool(self._resolve_bridge_port())
+        reasons = []
 
         ready = tcp_ok and has_xenos and not has_runtime
         if ready:
-            self._bridge_last_ok_ts = _t.time()
-            print("[CAMO] meccha-xenos-bridge ready (TCP)", flush=True)
-            self._log_bridge_capabilities()
-            return True
+            ok_id, id_err = self._verify_bridge_identity()
+            if not ok_id:
+                print(f"[CAMO] {id_err}", flush=True)
+                self._camo_last_error = id_err
+                if not force:
+                    return False
+                reasons.append("wrong bridge identity")
+                ready = False
+            else:
+                self._bridge_last_ok_ts = _t.time()
+                print("[CAMO] meccha-xenos-bridge ready (TCP)", flush=True)
+                self._log_bridge_capabilities()
+                return True
 
-        # Sidecar runtime-bridge (e.g. from old meccha-camouflage.exe) — reuse if TCP works.
-        if tcp_ok and loaded and not has_xenos:
-            resp = self._bridge_request("capabilities", {}, timeout=5)
-            if resp and resp.get("success"):
-                cmds = (resp.get("metadata") or {}).get("commands") or []
-                if "paint_full_route" in cmds:
-                    print(
-                        f"[CAMO] reusing in-game bridge TCP ({', '.join(mod_names)})",
-                        flush=True,
-                    )
-                    self._log_bridge_capabilities()
-                    return True
+        if has_runtime:
+            print("[CAMO] runtime-bridge detected — unloading before xenos inject", flush=True)
+            self._replace_runtime_bridge_with_xenos()
+            loaded, mod_names, has_xenos, has_runtime = self._bridge_dll_state()
+            tcp_ok = bool(self._resolve_bridge_port())
 
-        reasons = []
         if has_runtime:
             reasons.append("runtime-bridge loaded")
         if has_xenos and not tcp_ok:
@@ -793,12 +964,12 @@ class CamoBridgeMixin:
                 return False
 
         try:
-            missing = self._extract_stable_camo_files()
+            missing = self._ensure_bridge_files()
             if missing:
                 msg = (
                     f"Missing bridge files: {', '.join(missing)}. "
-                    f"Copy meccha-xenos-bridge.dll and meccha-xenos-injector.exe into "
-                    f"{self._camo_bundle_dir()} or download the latest Peterhack release."
+                    f"Run runtime/scripts/build.ps1 or place {self.DLL_NAME} and "
+                    f"{self.INJECTOR_NAME} in {self._bridge_dir()}."
                 )
                 self._camo_last_error = msg
                 print(f"[CAMO] {msg}", flush=True)
@@ -808,7 +979,7 @@ class CamoBridgeMixin:
             print(f"[CAMO] extract failed: {exc}", flush=True)
             return False
 
-        self._write_port_sidecar(self._get_stable_dll_path(), BRIDGE_FIXED_PORT)
+        self._write_port_sidecar(self._get_bridge_dll_path(), BRIDGE_FIXED_PORT)
 
         if not self._try_direct_inject(BRIDGE_FIXED_PORT, force=True):
             msg = "Bridge inject failed — run Peterhack as Administrator."
@@ -818,6 +989,11 @@ class CamoBridgeMixin:
 
         print("[CAMO] waiting for meccha-xenos-bridge TCP...", flush=True)
         if self._wait_for_bridge_tcp("xenos bridge", attempts=40, sleep_s=0.25):
+            ok_id, id_err = self._verify_bridge_identity()
+            if not ok_id:
+                self._camo_last_error = id_err
+                print(f"[CAMO] {id_err}", flush=True)
+                return False
             self._bridge_last_ok_ts = _t.time()
             self._log_bridge_capabilities()
             return True
@@ -1277,53 +1453,90 @@ class CamoBridgeMixin:
                 self._camo_noclip_owned = False
             print(f"[CAMO] noclip restored after front pass{note}", flush=True)
 
-    def _paint_payload(
-        self,
-        pid,
-        camera_yaw_offset=0,
-        camera_rotation=None,
-        camera_body_anchor=False,
-        camera_body_pullback=150.0,
-    ):
+    @staticmethod
+    def _quality_to_mesh_first_tuning(quality):
+        """Map Peterhack camo slider 1–20 → official mesh_first_paint tuning.
+
+        Higher quality = smaller brush + tighter coverage (more strokes, sharper camo).
+        """
+        q = max(1, min(20, int(quality)))
+        t = (q - 1) / 19.0  # 0.0 at draft, 1.0 at god mode
+        # stroke/coverage: 12 texels (fast/blocky) → 1 texel (extreme detail).
+        stroke = round(12.0 - t * 11.0, 2)
+        stroke = max(1.0, min(12.0, stroke))
+        # Side/front-back source distance in UV — tighter at high quality.
+        side_uv = round(0.48 - t * 0.44, 4)  # 0.48 → 0.04
+        side_uv = max(0.04, min(0.50, side_uv))
+        front_back_uv = round(1.15 - t * 1.0, 4)  # 1.15 → 0.15
+        front_back_uv = max(0.08, min(1.20, front_back_uv))
+        # Slightly faster batch pacing at low quality; patient at extreme.
+        batch_delay_ms = int(round(95 - t * 45))  # 95 ms → 50 ms
+        batch_delay_ms = max(50, min(100, batch_delay_ms))
+        return {
+            "stroke_size_texels": stroke,
+            "coverage_step_texels": stroke,
+            "side_source_max_uv": side_uv,
+            "front_back_source_max_uv": front_back_uv,
+            "server_batch_delay_ms": batch_delay_ms,
+        }
+
+    def _paint_payload(self, pid):
+        """Official MecchaCamouflage mesh_first_paint payload (v1.6.0-beta.4)."""
         cfg = getattr(self, "config", None)
         quality = max(1, min(20, int(getattr(cfg, "paint_quality", 12) if cfg else 12)))
-        min_points = {
-            1: 2500, 5: 6000, 8: 9000, 10: 12000, 12: 15000,
-            14: 18000, 16: 22000, 18: 26000, 20: 30000,
-        }
-        keys = sorted(min_points)
-        floor = min_points[keys[0]]
-        for k in keys:
-            if quality >= k:
-                floor = min_points[k]
-        payload = {
-            "native_apply_mode": "template_brush_paint",
-            "route": "f10_template_brush_paint",
+        tuning = self._quality_to_mesh_first_tuning(quality)
+        skip_front = bool(getattr(cfg, "camo_skip_front_pass", False)) if cfg else False
+        back_only = bool(getattr(cfg, "camo_back_pass_only", False)) if cfg else False
+        if back_only:
+            front_mode = side_mode = "skip"
+            back_mode = "paint"
+        elif skip_front:
+            front_mode = "skip"
+            side_mode = back_mode = "paint"
+        else:
+            front_mode = side_mode = back_mode = "paint"
+        return {
+            "native_apply_mode": "mesh_first_paint",
+            "route": "f10_mesh_first_paint",
+            "server_batch_rpc": "packed",
+            "packed_route": "component",
+            "preview_only": False,
+            "unpreview_only": False,
+            "research_artifacts": False,
             "process": {
                 "pid": pid,
                 "name": getattr(self, "PROCESS_NAME", "PenguinHotel-Win64-Shipping.exe"),
             },
-            "max_paints_per_tick": 256,
-            "paint_tick_budget_ms": 16,
-            "paint_quality": quality,
-            "template_min_direct_points": floor,
-            "auto_flush_during_paint": True,
+            # Top-level + tuning — bridge parses keys anywhere in the JSON blob.
+            "stroke_size_texels": tuning["stroke_size_texels"],
+            "coverage_step_texels": tuning["coverage_step_texels"],
+            "side_source_max_uv": tuning["side_source_max_uv"],
+            "front_back_source_max_uv": tuning["front_back_source_max_uv"],
+            "server_batch_delay_ms": tuning["server_batch_delay_ms"],
+            "tuning": {
+                "stroke_size_texels": tuning["stroke_size_texels"],
+                "server_batch_delay_ms": tuning["server_batch_delay_ms"],
+                "coverage_step_texels": tuning["coverage_step_texels"],
+                "side_source_max_uv": tuning["side_source_max_uv"],
+                "front_back_source_max_uv": tuning["front_back_source_max_uv"],
+                "auto_material": True,
+                "auto_material_properties": True,
+                "metallic": 0.0,
+                "roughness": 0.65,
+                "front_region_mode": front_mode,
+                "side_region_mode": side_mode,
+                "back_region_mode": back_mode,
+                "enable_front_paint": front_mode == "paint",
+                "enable_side_paint": side_mode == "paint",
+                "enable_back_paint": back_mode == "paint",
+                "fill_color": "#FFFFFF",
+                "fill_color_r": 1.0,
+                "fill_color_g": 1.0,
+                "fill_color_b": 1.0,
+                "fill_metallic": 0.0,
+                "fill_roughness": 0.65,
+            },
         }
-        if camera_rotation:
-            pitch, yaw, roll = camera_rotation
-            payload["camera_rotation_absolute"] = True
-            payload["camera_pitch"] = float(pitch)
-            payload["camera_yaw"] = float(yaw)
-            payload["camera_roll"] = float(roll)
-            if camera_body_anchor:
-                payload["camera_use_body_anchor"] = True
-                payload["camera_body_pullback"] = float(camera_body_pullback)
-        elif camera_yaw_offset:
-            payload["camera_yaw_offset"] = int(camera_yaw_offset)
-        payload["camera_settle_ms"] = int(
-            getattr(self, "CAMO_CAMERA_SETTLE_MS", 1500)
-        )
-        return payload
 
     def _finalize_camo_paint(self):
         """Stop template_brush_paint tick loops after apply."""
@@ -1339,9 +1552,8 @@ class CamoBridgeMixin:
                 pass
 
     def camo_apply(self, r=None, g=None, b=None, a=None, full_wrap=True):
-        """Environment camo — 6-pass wrap (4 orbit + 2 detail) via paint_full_route."""
-        del r, g, b, a
-        full_wrap = True
+        """Environment camo via official mesh_first_paint (single bridge call)."""
+        del r, g, b, a, full_wrap
         if not getattr(self, "pm", None) or not self.pm:
             print("[CAMO] no pymem handle", flush=True)
             return False
@@ -1352,128 +1564,35 @@ class CamoBridgeMixin:
         self._camo_noclip_hold = False
         try:
             pid = self.pm.process_id
-            print(f"[CAMO] pid={pid} wrap={full_wrap}", flush=True)
             cfg = getattr(self, "config", None)
             q = getattr(cfg, "paint_quality", 12) if cfg else 12
-            print(f"[CAMO] paint quality={q}/20", flush=True)
+            tuning = self._quality_to_mesh_first_tuning(q)
+            print(
+                f"[CAMO] pid={pid} route=mesh_first_paint quality={q}/20 "
+                f"stroke={tuning['stroke_size_texels']}tex side_uv={tuning['side_source_max_uv']} "
+                f"front_back_uv={tuning['front_back_source_max_uv']}",
+                flush=True,
+            )
             if not pid:
                 return False
 
             if not self._ensure_bridge(force=True):
                 return False
 
-            import time as _t
-
-            self._camo_view_state = self._camo_save_view_rotation() if full_wrap else None
-            saved_control = (
-                self._camo_view_state.get("control") if self._camo_view_state else None
+            payload = self._paint_payload(pid)
+            print("[CAMO] sending mesh_first_paint (official camo pipeline)...", flush=True)
+            resp = self._bridge_request(
+                "paint_full_route",
+                payload,
+                timeout=self.CAMO_PAINT_ROUTE_TIMEOUT,
             )
-
-            wrap_passes, emote_pose, body_rot = self._camo_plan_wrap_orbit(saved_control)
-            if not full_wrap:
-                wrap_passes = wrap_passes[:1]
-            skip_front = bool(getattr(cfg, "camo_skip_front_pass", False)) if cfg else False
-            back_only = bool(getattr(cfg, "camo_back_pass_only", False)) if cfg else False
-            if back_only and full_wrap:
-                before = len(wrap_passes)
-                wrap_passes = [p for p in wrap_passes if p[1] == "back"]
-                if len(wrap_passes) < before:
-                    print("[CAMO] back pass only mode", flush=True)
-            elif skip_front and full_wrap:
-                before = len(wrap_passes)
-                wrap_passes = [p for p in wrap_passes if p[1] != "front"]
-                if len(wrap_passes) < before:
-                    print("[CAMO] front pass disabled (flat map option)", flush=True)
-            if not wrap_passes:
-                print("[CAMO] orbit plan empty — cannot paint", flush=True)
-                self._camo_last_error = "Could not compute camo camera orbit"
+            print(f"[CAMO] paint response={resp}", flush=True)
+            if not resp or not resp.get("success", False):
+                err = resp.get("message") or resp.get("stage") if resp else "no response"
+                self._camo_last_error = f"Paint failed: {err}"
+                print(f"[CAMO] {self._camo_last_error}", flush=True)
+                self._finalize_camo_paint()
                 return False
-
-            body_pitch = self._camo_normalize_pitch_deg(body_rot[0])
-            body_roll = float(body_rot[2])
-            orbit_mode = getattr(self, "_camo_orbit_mode", "dynamic")
-            print(
-                f"[CAMO] single camo_apply: {len(wrap_passes)}-pass wrap "
-                f"(4 orbit + 2 detail, {orbit_mode}, "
-                f"body pitch={body_pitch:.0f}° roll={body_roll:.0f}°)",
-                flush=True,
-            )
-            self._camo_last_error = None
-
-            upright_orbit = orbit_mode == "dynamic-upright"
-            if full_wrap and upright_orbit:
-                body_yaw = self._camo_get_body_forward_yaw()
-                print(
-                    f"[CAMO] aligning camera to pawn forward "
-                    f"(body yaw={body_yaw if body_yaw is not None else '?'}°)...",
-                    flush=True,
-                )
-                if not self._camo_reset_to_default_view():
-                    print("[CAMO] camera align failed — continuing", flush=True)
-                else:
-                    print(
-                        f"[CAMO] camera aligned (body yaw={getattr(self, '_camo_body_yaw', 0):.0f}°)",
-                        flush=True,
-                    )
-                _t.sleep(self.CAMO_DEFAULT_SETTLE_SEC)
-
-            for idx, (cam, label, yaw_offset) in enumerate(wrap_passes):
-                pitch, yaw, roll = cam
-                print(
-                    f"[CAMO] orbit plan {idx + 1}/{len(wrap_passes)} "
-                    f"({label}, offset={yaw_offset}°, "
-                    f"cam pitch={pitch:.0f}° yaw={yaw:.0f}° roll={roll:.0f}°)",
-                    flush=True,
-                )
-
-            try:
-                for pass_idx, (cam, label, yaw_offset) in enumerate(wrap_passes):
-                    if self._camo_aborted():
-                        print("[CAMO] apply aborted", flush=True)
-                        return False
-                    pitch, yaw, roll = cam
-                    front_pass = label == "front"
-                    steep_up = label == "inner_legs" and pitch > 40.0
-                    use_body_anchor = front_pass or steep_up
-                    print(
-                        f"[CAMO] paint pass {pass_idx + 1}/{len(wrap_passes)} "
-                        f"({label}, offset={yaw_offset}°, "
-                        f"cam pitch={pitch:.0f}° yaw={yaw:.0f}° roll={roll:.0f}°, "
-                        f"settle={self.CAMO_CAMERA_SETTLE_MS}ms)"
-                        f"{' [noclip]' if front_pass else ''}...",
-                        flush=True,
-                    )
-                    if front_pass:
-                        self._camo_set_collision_free(True, label="front")
-                    try:
-                        payload = self._paint_payload(
-                            pid,
-                            camera_rotation=cam,
-                            camera_body_anchor=use_body_anchor,
-                            camera_body_pullback=280.0
-                            if (use_body_anchor and not upright_orbit)
-                            else 150.0,
-                        )
-                        resp = self._bridge_request(
-                            "paint_full_route",
-                            payload,
-                            timeout=self.CAMO_PAINT_ROUTE_TIMEOUT,
-                        )
-                        print(f"[CAMO] paint response={resp}", flush=True)
-                        if not resp or not resp.get("success", False):
-                            err = resp.get("message") or resp.get("stage") if resp else "no response"
-                            self._camo_last_error = f"Paint pass {label} failed: {err}"
-                            print(f"[CAMO] {self._camo_last_error}", flush=True)
-                            self._finalize_camo_paint()
-                            return False
-                    finally:
-                        if front_pass:
-                            self._camo_set_collision_free(False, label="front")
-            finally:
-                if self._camo_view_state:
-                    self._camo_restore_view_rotation(self._camo_view_state)
-                    self._camo_view_state = None
-                    _t.sleep(0.3)
 
             self._finalize_camo_paint()
             print("[CAMO] apply complete", flush=True)
