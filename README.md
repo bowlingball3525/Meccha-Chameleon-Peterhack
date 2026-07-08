@@ -16,12 +16,12 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 
 | | |
 |---|---|
-| **Version (Git)** | `614380c` |
-| **Full SHA** | `614380c8d1a610b4246e29785e98c4c246d7c9e8` |
+| **Version (Git)** | `fa520bd` |
+| **Full SHA** | `fa520bd16869386a87584f44709144a08fff5187` |
 | **Branch** | `main` |
 | **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,540,608 bytes |
 | **Paint pipeline** | Official `mesh_first_paint` (SilentJMA v1.6+ route) |
-| **Code base** | ESP/dead-filter/bridge fixes from `fff8094` + this README |
+| **Feature commit** | ESP/dead-filter/bridge fixes in `fff8094` |
 
 The in-app **CHANGELOG** tab shows the same short SHA from the `VERSION` file. Auto-update pulls from [GitHub main](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack).
 
@@ -278,7 +278,7 @@ pip install -r requirements.txt
 4. **CAMOUFLAGE** — set quality, **Paint Now** or **F10**.
 5. **EXPLOITS** — enable anti-kick after spawn; check `anti_kick.log` if disconnected.
 
-**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `614380c` or newer).
+**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `fa520bd` or newer).
 
 ---
 
@@ -317,10 +317,10 @@ On launch, Peterhack can check GitHub `main` and apply updates, then restart.
 |---|---|
 | `failed to communicate with bridge DLL` | Run as Admin; be in a match; check `latest.log` |
 | `mesh_profile_missing` | Ensure `bridge/mesh-profiles/` exists next to the DLL |
-| ESP shows only clones | Update to `614380c`+ — fixes false dead elimination / recursion bugs |
+| ESP shows only clones | Update to `fa520bd`+ (features from `fff8094`) |
 | ESP missing players | Turn off team filter to test; check `[ESP] discovery` in log with debug ESP logging |
 | ESP shows dead bodies | Ragdoll latch should hide corpses; report if they linger after elimination |
-| `RecursionError` in log | Fixed in `fff8094` / `614380c` — restart Peterhack after update |
+| `RecursionError` in log | Fixed in `fff8094` — pull `fa520bd`+ and restart |
 | Anti-kick log is huge | `[capture-session]` lines are diagnostics, not errors; bridge filters noise in latest build |
 | Anti-kick enabled but kicked | Check `anti_kick.log` for `[capture-kick]`; EOS may bypass UE RPCs |
 | Magnet does nothing | Must be hunter; press **G** to toggle ON |
