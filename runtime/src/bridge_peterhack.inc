@@ -978,6 +978,12 @@
             return;
         }
 
+        const std::string lower = lower_copy(fname);
+        if (!is_kick_like_function_name(lower) && !is_session_join_like_name(lower))
+        {
+            return;
+        }
+
         std::string key = std::string(owner) + "::" + fname;
         {
             std::lock_guard<std::mutex> lock(g_anti_kick_capture_mutex);
@@ -2056,6 +2062,442 @@
         return response_json(false, "kill_failed", 0, 1, "all kill strategies failed");
     }
 
+    constexpr std::uintptr_t CheatOffIsHunter = 0x0C3A;
+    constexpr std::uintptr_t CheatOffDead = 0x05AA;
+    constexpr std::uintptr_t CheatOffMyPlayerState = 0x808;
+
+    auto cheat_is_leon_character(Reflection& ref, std::uintptr_t object) -> bool
+    {
+        if (!live_uobject(object))
+        {
+            return false;
+        }
+        const auto name = ref.class_name(object);
+        return name.find("BP_FirstPersonCharacter_cLeon_Character") != std::string::npos
+            && name.rfind("Default__", 0) != 0;
+    }
+
+    auto cheat_is_hunter_pawn(Reflection& ref, std::uintptr_t object) -> bool
+    {
+        if (!cheat_is_leon_character(ref, object))
+        {
+            return false;
+        }
+        const auto name = ref.class_name(object);
+        if (name.find("Hunter") != std::string::npos)
+        {
+            return true;
+        }
+        return safe_read<std::uint8_t>(object + CheatOffIsHunter, 0) != 0;
+    }
+
+    auto cheat_is_survivor_pawn(Reflection& ref, std::uintptr_t object) -> bool
+    {
+        if (!cheat_is_leon_character(ref, object))
+        {
+            return false;
+        }
+        if (cheat_is_hunter_pawn(ref, object))
+        {
+            return false;
+        }
+        const auto name = ref.class_name(object);
+        if (name.find("Survivor") != std::string::npos)
+        {
+            return true;
+        }
+        return safe_read<std::uint8_t>(object + CheatOffIsHunter, 1) == 0;
+    }
+
+    auto cheat_is_pawn_dead(std::uintptr_t object) -> bool
+    {
+        return live_uobject(object) && safe_read<std::uint8_t>(object + CheatOffDead, 0) != 0;
+    }
+
+    auto cheat_read_actor_location(Reflection& ref, std::uintptr_t actor, sdk::FVector& out, std::string& failure) -> bool
+    {
+        const auto get_loc_fn = ref.find_function(actor, "K2_GetActorLocation");
+        if (!get_loc_fn)
+        {
+            return false;
+        }
+        const auto params_size = std::max(0x18, safe_read<int>(get_loc_fn + OffPropertiesSize, 0x18));
+        std::vector<std::uint8_t> loc_params(static_cast<std::size_t>(params_size), 0);
+        if (!process_event(actor, get_loc_fn, loc_params.data(), failure)
+            || params_size < static_cast<int>(sizeof(sdk::FVector)))
+        {
+            return false;
+        }
+        out = *reinterpret_cast<const sdk::FVector*>(loc_params.data());
+        return true;
+    }
+
+    auto cheat_read_actor_forward(Reflection& ref, std::uintptr_t actor, sdk::FVector& out, std::string& failure) -> bool
+    {
+        const auto forward_fn = ref.find_function(actor, "GetActorForwardVector");
+        if (forward_fn)
+        {
+            struct ForwardParams
+            {
+                sdk::FVector ReturnValue{};
+            } params{};
+            if (process_event(actor, forward_fn, reinterpret_cast<std::uint8_t*>(&params), failure))
+            {
+                out = params.ReturnValue;
+                const double len = std::sqrt(out.X * out.X + out.Y * out.Y + out.Z * out.Z);
+                if (len > 1e-6)
+                {
+                    out.X /= len;
+                    out.Y /= len;
+                    out.Z /= len;
+                    return true;
+                }
+            }
+        }
+
+        const auto get_rot_fn = ref.find_function(actor, "K2_GetActorRotation");
+        if (!get_rot_fn)
+        {
+            return false;
+        }
+        sdk::Actor_K2_GetActorRotation rot_params{};
+        if (!process_event(actor, get_rot_fn, reinterpret_cast<std::uint8_t*>(&rot_params), failure))
+        {
+            return false;
+        }
+        constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+        const double pitch = rot_params.ReturnValue.Pitch * kDegToRad;
+        const double yaw = rot_params.ReturnValue.Yaw * kDegToRad;
+        const double cp = std::cos(pitch);
+        out.X = std::cos(yaw) * cp;
+        out.Y = std::sin(yaw) * cp;
+        out.Z = std::sin(pitch);
+        return true;
+    }
+
+    auto cheat_resolve_hunter_player_state(Reflection& ref, const SdkContext& ctx, std::uintptr_t hunter) -> std::uintptr_t
+    {
+        std::uintptr_t source_ps = safe_read<std::uintptr_t>(hunter + CheatOffMyPlayerState);
+        if (live_uobject(source_ps))
+        {
+            return source_ps;
+        }
+        if (live_uobject(ctx.controller))
+        {
+            source_ps = safe_read<std::uintptr_t>(ctx.controller + OffPlayerControllerPlayerState);
+            if (live_uobject(source_ps))
+            {
+                return source_ps;
+            }
+        }
+        return 0;
+    }
+
+    auto cheat_kill_survivor_internal(Reflection& ref,
+                                      const SdkContext& ctx,
+                                      std::uintptr_t target_pawn,
+                                      const sdk::FVector* endpoint,
+                                      std::string& method_out,
+                                      std::string& failure_out) -> bool
+    {
+        method_out.clear();
+        failure_out.clear();
+        if (!live_uobject(ctx.pawn) || !live_uobject(target_pawn))
+        {
+            failure_out = "hunter or target pawn unavailable";
+            return false;
+        }
+        if (!cheat_is_hunter_pawn(ref, ctx.pawn))
+        {
+            failure_out = "local pawn is not hunter";
+            return false;
+        }
+        if (!cheat_is_survivor_pawn(ref, target_pawn))
+        {
+            failure_out = "target is not a survivor";
+            return false;
+        }
+        if (cheat_is_pawn_dead(target_pawn))
+        {
+            failure_out = "target already dead";
+            return false;
+        }
+
+        const auto source_ps = cheat_resolve_hunter_player_state(ref, ctx, ctx.pawn);
+        sdk::FVector endpoint_local{};
+        const sdk::FVector* endpoint_ptr = endpoint;
+        if (!endpoint_ptr)
+        {
+            if (!cheat_read_actor_location(ref, target_pawn, endpoint_local, failure_out))
+            {
+                failure_out = failure_out.empty() ? "could not read target location" : failure_out;
+            }
+            else
+            {
+                endpoint_ptr = &endpoint_local;
+            }
+        }
+
+        const auto hunter_cls = ref.find_class_any("BP_FirstPersonCharacter_cLeon_Character_Hunter_C");
+        std::uintptr_t kill_fn = hunter_cls ? ref.find_function_in_class(hunter_cls, "KillPlayer") : 0;
+        if (!kill_fn)
+        {
+            kill_fn = ref.find_function(ctx.pawn, "KillPlayer");
+        }
+        if (kill_fn)
+        {
+            const auto params_size = std::max(0x10, safe_read<int>(kill_fn + OffPropertiesSize, 0x10));
+            std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+            *reinterpret_cast<std::uintptr_t*>(params.data()) = target_pawn;
+            if (params_size >= 16)
+            {
+                *reinterpret_cast<std::uintptr_t*>(params.data() + 8) = source_ps;
+            }
+            failure_out.clear();
+            if (process_event(ctx.pawn, kill_fn, params.data(), failure_out))
+            {
+                method_out = "KillPlayer";
+                return true;
+            }
+        }
+
+        if (endpoint_ptr)
+        {
+            for (const char* shot_name : {"SpawnShotEffect(Server)", "SpawnShotEffect_Server_"})
+            {
+                const auto shot_fn = ref.find_function(ctx.pawn, shot_name);
+                if (!shot_fn)
+                {
+                    continue;
+                }
+                const auto params_size = std::max(0x40, safe_read<int>(shot_fn + OffPropertiesSize, 0x40));
+                std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+                if (params_size >= static_cast<int>(sizeof(sdk::FVector)))
+                {
+                    *reinterpret_cast<sdk::FVector*>(params.data()) = *endpoint_ptr;
+                }
+                if (params_size > 0x18)
+                {
+                    params[0x18] = 1;
+                }
+                failure_out.clear();
+                if (process_event(ctx.pawn, shot_fn, params.data(), failure_out))
+                {
+                    method_out = shot_name;
+                    return true;
+                }
+            }
+        }
+
+        if (live_uobject(ctx.world))
+        {
+            const auto game_mode = safe_read<std::uintptr_t>(ctx.world + 0x1A8);
+            if (live_uobject(game_mode))
+            {
+                const auto gm_kill_fn = ref.find_function(game_mode, "KillPlayer");
+                if (gm_kill_fn)
+                {
+                    const auto params_size = std::max(0x10, safe_read<int>(gm_kill_fn + OffPropertiesSize, 0x10));
+                    std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+                    *reinterpret_cast<std::uintptr_t*>(params.data()) = target_pawn;
+                    if (params_size >= 16)
+                    {
+                        *reinterpret_cast<std::uintptr_t*>(params.data() + 8) = source_ps;
+                    }
+                    failure_out.clear();
+                    if (process_event(game_mode, gm_kill_fn, params.data(), failure_out))
+                    {
+                        method_out = "KillPlayer(gamemode)";
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if (failure_out.empty())
+        {
+            failure_out = "KillPlayer/SpawnShotEffect unavailable or rejected";
+        }
+        return false;
+    }
+
+    auto handle_game_kill_survivor(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        const auto target_pawn = static_cast<std::uintptr_t>(json_extract_double(payload, "target_pawn"));
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1, "local hunter pawn not available");
+        }
+        if (!live_uobject(target_pawn))
+        {
+            return response_json(false, "target_unavailable", 0, 1, "target survivor pawn invalid");
+        }
+
+        sdk::FVector endpoint{};
+        const sdk::FVector* endpoint_ptr = nullptr;
+        const bool endpoint_supplied =
+            payload.find("\"target_x\"") != std::string::npos ||
+            payload.find("\"target_y\"") != std::string::npos ||
+            payload.find("\"target_z\"") != std::string::npos;
+        if (endpoint_supplied)
+        {
+            endpoint.X = json_extract_double(payload, "target_x");
+            endpoint.Y = json_extract_double(payload, "target_y");
+            endpoint.Z = json_extract_double(payload, "target_z");
+            endpoint_ptr = &endpoint;
+        }
+
+        std::string method{};
+        std::string failure{};
+        if (!cheat_kill_survivor_internal(ref, ctx, target_pawn, endpoint_ptr, method, failure))
+        {
+            return response_json(false, "kill_survivor_failed", 0, 1, failure);
+        }
+
+        std::string meta = "\"method\":\"" + json_escape(method) + "\"";
+        meta += ",\"target_pawn\":\"" + hex_address(target_pawn) + "\"";
+        return response_json(true, "kill_survivor", 1, 0, "kill sent", meta);
+    }
+
+    auto handle_game_magnet_tick(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        if (!json_extract_bool(payload, "active"))
+        {
+            return response_json(true, "magnet_tick", 0, 0, "magnet inactive", "\"active\":false");
+        }
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1, "local hunter pawn not available");
+        }
+        if (!cheat_is_hunter_pawn(ref, ctx.pawn))
+        {
+            return response_json(false, "not_hunter", 0, 1, "magnet requires hunter pawn");
+        }
+
+        std::string failure{};
+        sdk::FVector my_location{};
+        if (!cheat_read_actor_location(ref, ctx.pawn, my_location, failure))
+        {
+            return response_json(false, "location_unavailable", 0, 1,
+                                failure.empty() ? "K2_GetActorLocation failed" : failure);
+        }
+
+        sdk::FVector forward{};
+        if (!cheat_read_actor_forward(ref, ctx.pawn, forward, failure))
+        {
+            return response_json(false, "forward_unavailable", 0, 1,
+                                failure.empty() ? "GetActorForwardVector failed" : failure);
+        }
+
+        const auto set_location_fn = ref.find_function(ctx.pawn, "K2_SetActorLocation");
+        if (!set_location_fn)
+        {
+            return response_json(false, "function_unavailable", 0, 1, "K2_SetActorLocation not found");
+        }
+
+        int depth_index = 0;
+        int survivors = 0;
+        int moved = 0;
+        ref.for_each_object([&](std::uintptr_t object) -> bool {
+            if (!live_uobject(object) || object == ctx.pawn)
+            {
+                return false;
+            }
+            if (!cheat_is_survivor_pawn(ref, object))
+            {
+                return false;
+            }
+            if (cheat_is_pawn_dead(object))
+            {
+                return false;
+            }
+            ++survivors;
+            const float depth_spread = static_cast<float>(depth_index) * 120.0f;
+            const float distance = 150.0f + depth_spread;
+            sdk::Actor_K2_SetActorLocation params{};
+            params.NewLocation = {
+                my_location.X + forward.X * distance,
+                my_location.Y + forward.Y * distance,
+                my_location.Z + forward.Z * distance,
+            };
+            params.bTeleport = true;
+            std::string pe_failure{};
+            if (process_event(object, set_location_fn, reinterpret_cast<std::uint8_t*>(&params), pe_failure))
+            {
+                ++moved;
+            }
+            ++depth_index;
+            return false;
+        });
+
+        std::string meta = "\"survivors\":" + std::to_string(survivors) +
+                           ",\"moved\":" + std::to_string(moved) +
+                           ",\"depth_used\":" + std::to_string(depth_index);
+        return response_json(true, "magnet_tick", moved, 0, "magnet applied", meta);
+    }
+
+    auto handle_game_kill_all_survivors(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1, "local hunter pawn not available");
+        }
+        if (!cheat_is_hunter_pawn(ref, ctx.pawn))
+        {
+            return response_json(false, "not_hunter", 0, 1, "kill-all requires hunter pawn");
+        }
+
+        const bool seed = json_extract_bool(payload, "seed");
+        std::lock_guard<std::mutex> lock(g_kill_all_mutex);
+        if (seed)
+        {
+            g_kill_all_queue.clear();
+            ref.for_each_object([&](std::uintptr_t object) -> bool {
+                if (!live_uobject(object) || object == ctx.pawn)
+                {
+                    return false;
+                }
+                if (!cheat_is_survivor_pawn(ref, object) || cheat_is_pawn_dead(object))
+                {
+                    return false;
+                }
+                g_kill_all_queue.push_back(object);
+                return false;
+            });
+            std::string meta = "\"seeded\":" + std::to_string(g_kill_all_queue.size()) +
+                               ",\"remaining\":" + std::to_string(g_kill_all_queue.size());
+            return response_json(true, "kill_all_survivors", 0, 0, "kill-all queue seeded", meta);
+        }
+
+        while (!g_kill_all_queue.empty())
+        {
+            const auto target = g_kill_all_queue.front();
+            if (!live_uobject(target) || !cheat_is_survivor_pawn(ref, target) || cheat_is_pawn_dead(target))
+            {
+                g_kill_all_queue.erase(g_kill_all_queue.begin());
+                continue;
+            }
+
+            std::string method{};
+            std::string failure{};
+            const bool ok = cheat_kill_survivor_internal(ref, ctx, target, nullptr, method, failure);
+            g_kill_all_queue.erase(g_kill_all_queue.begin());
+            std::string meta = "\"killed_this_tick\":" + std::string(ok ? "1" : "0") +
+                               ",\"remaining\":" + std::to_string(g_kill_all_queue.size()) +
+                               ",\"method\":\"" + json_escape(method) + "\"";
+            if (!ok)
+            {
+                meta += ",\"failure\":\"" + json_escape(failure) + "\"";
+            }
+            return response_json(ok, ok ? "kill_all_survivors" : "kill_all_survivors_failed",
+                                 ok ? 1 : 0, ok ? 0 : 1,
+                                 ok ? "killed one survivor" : failure, meta);
+        }
+
+        return response_json(true, "kill_all_survivors", 0, 0, "kill-all queue empty",
+                             "\"killed_this_tick\":0,\"remaining\":0");
+    }
+
     // SEH-safe hex dump of a memory window (byte-by-byte, never faults).
     auto netconn_hex_window(std::uintptr_t addr, std::size_t count) -> std::string
     {
@@ -2280,11 +2722,6 @@
         if (!live_uobject(ctx.controller))
         {
             return response_json(false, "controller_unavailable", 0, 1, "local PlayerController not available");
-        }
-        if (!live_uobject(ctx.pawn))
-        {
-            return response_json(false, "pawn_unavailable", 0, 1,
-                                "wait until spawned in before enabling anti-kick (hook installs on match load)");
         }
 
         g_anti_kick_session.world = ctx.world;
@@ -2639,12 +3076,11 @@
         add_class_named("BP_FirstPersonCharacter_Main_C", "Damage");
         add_class_named("BP_FirstPersonCharacter_LINK_C", "Damage");
         add_class_named("BP_FirstPersonCharacter_cLeon_Character_C", "DeathPlayer");
-        add_class_named("BP_FirstPersonCharacter_cLeon_Character_Hunter_C", "KillPlayer");
 
         if (blocked_count == 0)
         {
             return response_json(false, "god_mode_functions_unavailable", 0, 1,
-                                "could not resolve Damage/DeathPlayer/KillPlayer UFunctions");
+                                "could not resolve Damage/DeathPlayer UFunctions");
         }
 
         std::string pe_hook_failure{};
@@ -3001,6 +3437,17 @@
 
         if (steam_id.empty())
         {
+            const auto saved_off = ref.resolve_property_offset("PlayerState", "SavedNetworkAddress");
+            if (saved_off >= 0)
+            {
+                steam_id = extract_steam64_text(read_fstring_param(
+                    reinterpret_cast<const std::uint8_t*>(
+                        player_state + static_cast<std::uintptr_t>(saved_off))));
+            }
+        }
+
+        if (steam_id.empty())
+        {
             const auto msg = failure.empty() ? "Steam ID not replicated yet" : failure;
             return response_json(false, "steam_id_unavailable", 0, 1, msg);
         }
@@ -3122,6 +3569,18 @@
         if (request.find("\"type\":\"kill\"") != std::string::npos)
         {
             return handle_game_kill(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"kill_survivor\"") != std::string::npos)
+        {
+            return handle_game_kill_survivor(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"kill_all_survivors\"") != std::string::npos)
+        {
+            return handle_game_kill_all_survivors(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"magnet_tick\"") != std::string::npos)
+        {
+            return handle_game_magnet_tick(payload, ref, ctx);
         }
         if (request.find("\"type\":\"set_anti_kick\"") != std::string::npos)
         {

@@ -8,6 +8,73 @@ from typing import Tuple, List
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "esp_config.json")
 
 MAX_OVERLAY_FPS = 100
+MAX_OVERLAY_FPS_VSYNC = 240
+
+
+def get_primary_monitor_refresh_hz(default=60):
+    """Primary display refresh rate in Hz (Windows)."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hdc = user32.GetDC(0)
+        if hdc:
+            hz = int(gdi32.GetDeviceCaps(hdc, 117))  # VREFRESH
+            user32.ReleaseDC(0, hdc)
+            if 30 <= hz <= MAX_OVERLAY_FPS_VSYNC:
+                return hz
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DEVMODEW(ctypes.Structure):
+            _fields_ = [
+                ("dmDeviceName", wintypes.WCHAR * 32),
+                ("dmSpecVersion", wintypes.WORD),
+                ("dmDriverVersion", wintypes.WORD),
+                ("dmSize", wintypes.WORD),
+                ("dmDriverExtra", wintypes.WORD),
+                ("dmFields", wintypes.DWORD),
+                ("dmOrientation", wintypes.SHORT),
+                ("dmPaperSize", wintypes.SHORT),
+                ("dmPaperLength", wintypes.SHORT),
+                ("dmPaperWidth", wintypes.SHORT),
+                ("dmScale", wintypes.SHORT),
+                ("dmCopies", wintypes.SHORT),
+                ("dmDefaultSource", wintypes.SHORT),
+                ("dmPrintQuality", wintypes.SHORT),
+                ("dmColor", wintypes.SHORT),
+                ("dmDuplex", wintypes.SHORT),
+                ("dmYResolution", wintypes.SHORT),
+                ("dmTTOption", wintypes.SHORT),
+                ("dmCollate", wintypes.SHORT),
+                ("dmFormName", wintypes.WCHAR * 32),
+                ("dmLogPixels", wintypes.WORD),
+                ("dmBitsPerPel", wintypes.DWORD),
+                ("dmPelsWidth", wintypes.DWORD),
+                ("dmPelsHeight", wintypes.DWORD),
+                ("dmDisplayFlags", wintypes.DWORD),
+                ("dmDisplayFrequency", wintypes.DWORD),
+            ]
+
+        dm = DEVMODEW()
+        dm.dmSize = ctypes.sizeof(DEVMODEW)
+        ENUM_CURRENT_SETTINGS = -1
+        if ctypes.windll.user32.EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(dm)):
+            hz = int(dm.dmDisplayFrequency)
+            if 30 <= hz <= MAX_OVERLAY_FPS_VSYNC:
+                return hz
+    except Exception:
+        pass
+    return max(30, min(MAX_OVERLAY_FPS_VSYNC, int(default)))
+
+
+def clamp_overlay_fps(fps, *, vsync=False):
+    limit = MAX_OVERLAY_FPS_VSYNC if vsync else MAX_OVERLAY_FPS
+    return max(1, min(limit, int(fps)))
 
 
 @dataclass
@@ -27,6 +94,7 @@ class Config:
     team_filter: bool = False
     enemy_only: bool = False
     show_roles: bool = True
+    oof_arrows: bool = True
     oof_arrow_radius: int = 0   # 0 = screen edge; otherwise px from center
     oof_show_names: bool = True
     oof_show_distance: bool = True
@@ -68,6 +136,9 @@ class Config:
     aimbot_show_fov: bool = True
     aimbot_visible_check: bool = False
 
+    # UI language (menu labels) — en, es, fr, de, pt, ru, zh, ja, ko
+    ui_language: str = "en"
+
     # Console / file logging (DEBUGGING tab) — filters [TAG] lines in latest.log
     log_master: bool = True
     log_session: bool = True
@@ -100,6 +171,7 @@ class Config:
 
     # UI / overlay
     ui_overlay_fps: int = 60  # overlay refresh cap (1–MAX_OVERLAY_FPS); menu open throttles lower
+    ui_overlay_vsync: bool = False  # match overlay timer to primary monitor refresh rate
 
     # Radar
     radar_enabled: bool = False
@@ -163,6 +235,21 @@ def config_from_dict(d: dict) -> Config:
     # Flatten bone_indices if stored as list of pairs
     if "bone_indices" in d and isinstance(d["bone_indices"], list):
         d["bone_indices"] = {k: v for k, v in d["bone_indices"]}
+    # Older saves used full reference-skeleton indices (head=66) — revert to runtime map.
+    if "bone_indices" in d and isinstance(d["bone_indices"], dict):
+        head_idx = d["bone_indices"].get("head")
+        try:
+            if head_idx is not None and int(head_idx) > 40:
+                d["bone_indices"] = {
+                    "head": 6, "neck_01": 5, "spine_03": 4,
+                    "spine_02": 3, "spine_01": 2, "pelvis": 1,
+                    "clavicle_l": 8, "upperarm_l": 9, "lowerarm_l": 10, "hand_l": 11,
+                    "clavicle_r": 13, "upperarm_r": 14, "lowerarm_r": 15, "hand_r": 16,
+                    "thigh_l": 18, "calf_l": 19, "foot_l": 21,
+                    "thigh_r": 23, "calf_r": 24, "foot_r": 26,
+                }
+        except (TypeError, ValueError):
+            pass
     # Migrate renamed config keys from older saves.
     for old_key, val in list(d.items()):
         if old_key.startswith("trainer_"):
@@ -179,6 +266,9 @@ def config_from_dict(d: dict) -> Config:
             d["ui_overlay_fps"] = max(1, min(MAX_OVERLAY_FPS, int(d["ui_overlay_fps"])))
         except (TypeError, ValueError):
             d["ui_overlay_fps"] = 60
+    if "ui_language" in d:
+        from meccha_chameleon_tools.i18n import normalize_lang
+        d["ui_language"] = normalize_lang(d.get("ui_language"))
     # Strip unknown keys so stale JSON fields never crash the dataclass constructor.
     valid = {f.name for f in dataclasses.fields(Config)}
     d = {k: v for k, v in d.items() if k in valid}

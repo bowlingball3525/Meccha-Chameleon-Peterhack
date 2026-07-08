@@ -24,7 +24,14 @@ from meccha_chameleon_tools.core import (
     MecchaESP, rp, ru32, rfloat, wfloat, wvec3, rvec3, rvec3_f, dist,
     read_array, OFFSETS,
 )
-from meccha_chameleon_tools.config import Config, save_config, MAX_OVERLAY_FPS
+from meccha_chameleon_tools.config import (
+    Config,
+    save_config,
+    MAX_OVERLAY_FPS,
+    clamp_overlay_fps,
+    get_primary_monitor_refresh_hz,
+)
+from meccha_chameleon_tools.i18n import UI_LANGUAGES, normalize_lang, tr as i18n_tr
 from meccha_chameleon_tools.log_util import set_log_config
 from meccha_chameleon_tools.blocklist import (
     load_blocklist, save_blocklist, add_blocked_player, remove_blocked_player, blocklist_ids,
@@ -412,11 +419,10 @@ def draw_skeleton(painter, bone_data, camera, screen_w, screen_h, color):
     bone_positions = bone_positions or {}
     bone_screen = {}
     for name, pos in bone_positions.items():
-        sx, sy, on_screen = w2s(pos, camera, screen_w, screen_h)
+        sx, sy, _on_screen = w2s(pos, camera, screen_w, screen_h)
         if not (math.isfinite(sx) and math.isfinite(sy)):
             continue
-        cx, cy = clamp_screen(sx, sy, screen_w, screen_h)
-        bone_screen[name] = (cx, cy)
+        bone_screen[name] = (sx, sy)
     connections = MecchaESP.BONE_CONNECTIONS
     for a, b in connections:
         if a in bone_screen and b in bone_screen:
@@ -520,6 +526,25 @@ def _quality_to_image_grid(level: int) -> int:
     return _IMAGE_QUALITY_TABLE.get(max(1, min(5, int(level))), _IMAGE_QUALITY_TABLE[3])
 
 
+# Sidebar tab ids (internal) → English label keys for i18n
+TAB_ORDER = [
+    "VISUALS", "COLORS", "PLAYERS", "RADAR", "AIMBOT", "EXPLOITS",
+    "CAMOUFLAGE", "MISC", "CHANGELOG", "DEBUGGING",
+]
+TAB_LABELS = {
+    "VISUALS": "Visuals",
+    "COLORS": "Colors",
+    "PLAYERS": "Players (WIP)",
+    "RADAR": "Radar",
+    "AIMBOT": "Aimbot",
+    "EXPLOITS": "Exploits",
+    "CAMOUFLAGE": "Camouflage",
+    "MISC": "Misc",
+    "CHANGELOG": "Changelog",
+    "DEBUGGING": "Debugging",
+}
+
+
 # ---------------------------------------------------------------------------
 # Menu widget
 # ---------------------------------------------------------------------------
@@ -546,6 +571,12 @@ class Menu(QWidget):
     BG_INPUT          = "#1a2814"
     BORDER            = "#2a4a1a"
     BORDER_FOCUS      = "#489020"
+    COMBO_DROPDOWN_STYLE = (
+        "QComboBox { background-color: #1a2814; color: #ffffff; border: 1px solid #3a5a28; padding: 4px 8px; }"
+        " QComboBox QAbstractItemView { background-color: #1a2814; color: #ffffff;"
+        " selection-background-color: #2a4a18; selection-color: #ffffff; }"
+        " QComboBox::drop-down { border: none; }"
+    )
 
     STYLE = """
         QFrame {
@@ -560,7 +591,7 @@ class Menu(QWidget):
             background: #206010; border-color: #389020;
         }
         QComboBox {
-            background-color: #1a2814; color: #eee;
+            background-color: #1a2814; color: #ffffff;
             border: 1px solid #3a5a28; padding: 4px;
         }
         QPushButton {
@@ -572,7 +603,7 @@ class Menu(QWidget):
         QPushButton:pressed { background-color: #2a4a18; }
         QSpinBox, QDoubleSpinBox {
             background-color: #1a2814; color: #ffffff;
-            border: 1px solid #2a4a1a; padding: 1px 3px; border-radius: 3px;
+            border: 1px solid #3a5a28; padding: 1px 22px 1px 3px; border-radius: 3px;
             font-size: 12px; min-height: 22px;
         }
         QSpinBox:focus, QDoubleSpinBox:focus { border-color: #489020; }
@@ -580,17 +611,26 @@ class Menu(QWidget):
             color: #ffffff;
             background: transparent;
             border: none;
+            padding: 0;
             selection-color: #ffffff;
-            selection-background-color: #2a5a1a;
+            selection-background-color: #2a4a18;
         }
         QLineEdit {
             background-color: #1a2814; color: #ffffff;
-            border: 1px solid #2a4a1a; padding: 4px 6px; border-radius: 3px;
+            border: 1px solid #3a5a28; padding: 4px 6px; border-radius: 3px;
             font-size: 12px; min-height: 22px;
             selection-color: #ffffff;
-            selection-background-color: #2a5a1a;
+            selection-background-color: #2a4a18;
         }
         QLineEdit:focus { border-color: #489020; }
+        QTextEdit, QPlainTextEdit {
+            background-color: #1a2814; color: #ffffff;
+            border: 1px solid #3a5a28; padding: 4px 6px; border-radius: 3px;
+            font-size: 12px;
+            selection-color: #ffffff;
+            selection-background-color: #2a4a18;
+        }
+        QTextEdit:focus, QPlainTextEdit:focus { border-color: #489020; }
     """
 
     def __init__(self, config: Config, esp: MecchaESP):
@@ -633,6 +673,8 @@ class Menu(QWidget):
         self._stop_thread = None
         self._player_rows = []
         self._players_steam_resolve_pending = False
+        self._i18n_bindings = []
+        self._i18n_refreshers = []
         self._blocklist_entries = load_blocklist()
         self.esp.refresh_blocklist_cache(force=True)
         if hasattr(self.esp, "set_rename_notify"):
@@ -702,6 +744,7 @@ class Menu(QWidget):
 
     def attach_overlay(self, overlay):
         self._overlay = overlay
+        self.esp._menu_ref = self
         self.esp._magnet_hotkey_allowed = self._magnet_hotkey_allowed
         self.esp._magnet_poll_ui = True
         self._register_magnet_hotkey()
@@ -712,22 +755,59 @@ class Menu(QWidget):
             overlay._last_menu_visible = True
 
     def _on_ui_overlay_fps_label(self, fps):
-        fps = max(1, min(MAX_OVERLAY_FPS, int(fps)))
+        if getattr(self.config, "ui_overlay_vsync", False):
+            return
+        fps = clamp_overlay_fps(fps, vsync=False)
         self.config.ui_overlay_fps = fps
-        if hasattr(self, "lbl_ui_overlay_fps"):
-            if self.isVisible() and fps > Overlay.MENU_OPEN_OVERLAY_FPS_CAP:
-                self.lbl_ui_overlay_fps.setText(
-                    f"{fps} FPS (≤{Overlay.MENU_OPEN_OVERLAY_FPS_CAP} while menu open)"
-                )
-            else:
-                self.lbl_ui_overlay_fps.setText(f"{fps} FPS")
+        self._refresh_ui_overlay_fps_label(fps)
+
+    def _refresh_ui_overlay_fps_label(self, fps=None):
+        if not hasattr(self, "lbl_ui_overlay_fps"):
+            return
+        vsync = bool(getattr(self.config, "ui_overlay_vsync", False))
+        if vsync:
+            hz = get_primary_monitor_refresh_hz()
+            self.lbl_ui_overlay_fps.setText(f"{hz} FPS (VSync)")
+            return
+        if fps is None:
+            slider = getattr(self, "sld_ui_overlay_fps", None)
+            fps = int(slider.value()) if slider is not None else int(self.config.ui_overlay_fps)
+        fps = clamp_overlay_fps(fps, vsync=False)
+        if self.isVisible() and fps > Overlay.MENU_OPEN_OVERLAY_FPS_CAP:
+            self.lbl_ui_overlay_fps.setText(
+                f"{fps} FPS (≤{Overlay.MENU_OPEN_OVERLAY_FPS_CAP} while menu open)"
+            )
+        else:
+            self.lbl_ui_overlay_fps.setText(f"{fps} FPS")
 
     def _on_ui_overlay_fps_apply(self):
-        fps = max(1, min(MAX_OVERLAY_FPS, int(self.sld_ui_overlay_fps.value())))
+        if getattr(self.config, "ui_overlay_vsync", False):
+            return
+        fps = clamp_overlay_fps(self.sld_ui_overlay_fps.value(), vsync=False)
         self.config.ui_overlay_fps = fps
+        save_config(self.config)
         overlay = getattr(self, "_overlay", None)
         if overlay is not None:
             overlay.request_set_fps(fps)
+
+    def _on_ui_overlay_vsync_toggled(self, checked):
+        self.config.ui_overlay_vsync = bool(checked)
+        save_config(self.config)
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            if checked:
+                overlay.request_set_fps(get_primary_monitor_refresh_hz())
+            else:
+                fps = clamp_overlay_fps(self.sld_ui_overlay_fps.value(), vsync=False)
+                overlay.request_set_fps(fps)
+        self._sync_ui_overlay_vsync_controls()
+
+    def _sync_ui_overlay_vsync_controls(self):
+        vsync = bool(getattr(self.config, "ui_overlay_vsync", False))
+        slider = getattr(self, "sld_ui_overlay_fps", None)
+        if slider is not None:
+            slider.setEnabled(not vsync)
+        self._refresh_ui_overlay_fps_label()
 
     def _camo_set_overlay_feedback(self, text, frames=60):
         if self._overlay:
@@ -1060,6 +1140,81 @@ class Menu(QWidget):
             self._overlay._last_menu_visible = visible
             self._overlay._set_menu_ui_active(visible)
 
+    def _lang(self):
+        return normalize_lang(getattr(self.config, "ui_language", "en"))
+
+    def _t(self, text: str) -> str:
+        return i18n_tr(text, self._lang())
+
+    def _i18n_bind(self, widget, text: str, setter: str = "setText"):
+        self._i18n_bindings.append((widget, text, setter))
+
+    def _i18n_bind_refresh(self, callback):
+        self._i18n_refreshers.append(callback)
+
+    def _mk_label(self, text: str) -> QLabel:
+        lbl = QLabel(self._t(text))
+        self._i18n_bind(lbl, text)
+        return lbl
+
+    def _mk_btn(self, text: str) -> QPushButton:
+        btn = QPushButton(self._t(text))
+        self._i18n_bind(btn, text)
+        return btn
+
+    def _tab_label_text(self, tab_id: str) -> str:
+        lang = self._lang()
+        text = i18n_tr(TAB_LABELS[tab_id], lang)
+        if lang == "en":
+            return text.upper()
+        return text
+
+    def _apply_language(self):
+        lang = self._lang()
+        for widget, text, setter in self._i18n_bindings:
+            try:
+                getattr(widget, setter)(i18n_tr(text, lang))
+            except RuntimeError:
+                pass
+        for refresh in self._i18n_refreshers:
+            try:
+                refresh()
+            except Exception:
+                pass
+        self._refresh_tab_labels()
+        self._sync_esp_toggle_ui()
+
+    def _refresh_tab_labels(self):
+        if not hasattr(self, "tab_list"):
+            return
+        for i, tab_id in enumerate(TAB_ORDER):
+            item = self.tab_list.item(i)
+            if item is not None:
+                item.setText(self._tab_label_text(tab_id))
+
+    def _refresh_aim_key_label(self):
+        if hasattr(self, "lbl_aim_key"):
+            self.lbl_aim_key.setText(f"{self._t('Aim Key')}: {self.config.aimbot_key}")
+
+    def _refresh_magnet_key_label(self):
+        if hasattr(self, "lbl_magnet_key"):
+            key = getattr(self.config, "exploits_magnet_key", "G")
+            self.lbl_magnet_key.setText(f"{self._t('Magnet toggle key')}: {key}")
+
+    def _refresh_player_table_headers(self):
+        if not hasattr(self, "tbl_players"):
+            return
+        cols = getattr(self, "_player_table_columns", ["Name", "Team", "Steam ID", ""])
+        self.tbl_players.setHorizontalHeaderLabels([self._t(c) if c else "" for c in cols])
+
+    def _on_ui_language_changed(self, _index=0):
+        if not hasattr(self, "cmb_ui_language"):
+            return
+        code = self.cmb_ui_language.currentData()
+        self.config.ui_language = normalize_lang(code)
+        self._apply_language()
+        save_config(self.config)
+
     def _toggle_esp(self):
         self.config.enabled = not self.config.enabled
         self._sync_esp_toggle_ui()
@@ -1067,7 +1222,7 @@ class Menu(QWidget):
     def _sync_esp_toggle_ui(self):
         on = bool(self.config.enabled)
         if hasattr(self, "btn_esp"):
-            self.btn_esp.setText(f"ESP: {'ON' if on else 'OFF'}")
+            self.btn_esp.setText(self._t("ESP: ON") if on else self._t("ESP: OFF"))
             self.btn_esp.setStyleSheet(
                 "QPushButton { background-color: #1a3a14; border-color: #389020; color: #b8e8a0; }"
                 if on else
@@ -1178,15 +1333,15 @@ class Menu(QWidget):
 
     def _on_key_recorded(self, name):
         self.config.aimbot_key = name
-        self.lbl_aim_key.setText(f"Aim Key: {name}")
+        self.lbl_aim_key.setText(f"{self._t('Aim Key')}: {name}")
         self.btn_record_key.setEnabled(True)
-        self.btn_record_key.setText("Record Key")
+        self.btn_record_key.setText(self._t("Record Key"))
 
     def _on_magnet_key_recorded(self, name):
         self.config.exploits_magnet_key = name
-        self.lbl_magnet_key.setText(f"Magnet toggle key: {name}")
+        self.lbl_magnet_key.setText(f"{self._t('Magnet toggle key')}: {name}")
         self.btn_record_magnet_key.setEnabled(True)
-        self.btn_record_magnet_key.setText("Record Key")
+        self.btn_record_magnet_key.setText(self._t("Record Key"))
         self._register_magnet_hotkey()
 
     def _build_ui(self):
@@ -1277,14 +1432,14 @@ class Menu(QWidget):
             QScrollBar:vertical {{ width: 0px; }}
             QScrollBar:horizontal {{ height: 0px; }}
         """)
-        self.tab_list.addItems(["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG","DEBUGGING"])
+        self.tab_list.addItems([self._tab_label_text(t) for t in TAB_ORDER])
         self.tab_list.currentRowChanged.connect(self._switch_tab)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background: transparent;")
 
         self._pages = {}
-        for tab_name in ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG","DEBUGGING"]:
+        for tab_name in TAB_ORDER:
             page = QWidget()
             page.setStyleSheet("background: transparent;")
             self._pages[tab_name] = page
@@ -1297,13 +1452,13 @@ class Menu(QWidget):
         # Bottom bar
         bar = QHBoxLayout()
         bar.setSpacing(8)
-        self.btn_save = QPushButton("Save Config")
+        self.btn_save = self._mk_btn("Save Config")
         self.btn_save.clicked.connect(self._save_config)
-        self.btn_close = QPushButton("Close")
+        self.btn_close = self._mk_btn("Close")
         self.btn_close.clicked.connect(self._close_app)
         self.btn_close.setStyleSheet("QPushButton { background-color: #3a1a1a; border-color: #5a2a2a; } QPushButton:hover { background-color: #5a2a2a; }")
 
-        self.btn_discord = QPushButton("Discord")
+        self.btn_discord = self._mk_btn("Discord")
         self.btn_discord.setToolTip("Join our Discord server")
         self.btn_discord.clicked.connect(self._open_discord)
         self.btn_discord.setStyleSheet(
@@ -1313,7 +1468,7 @@ class Menu(QWidget):
             f" QPushButton:pressed {{ background-color: #3c45a5; }}"
         )
 
-        hint = QLabel("Ins/F1 toggle | Drag to move")
+        hint = self._mk_label("Ins/F1 toggle | Drag to move")
         hint.setStyleSheet("color: #5a7a4a; font-size: 9px;")
         self.btn_esp = QPushButton()
         self.btn_esp.clicked.connect(self._toggle_esp)
@@ -1344,17 +1499,15 @@ class Menu(QWidget):
         self._build_debugging_tab()
 
     def _switch_tab(self, idx):
-        names = ["VISUALS","COLORS","PLAYERS","RADAR","AIMBOT","EXPLOITS","CAMOUFLAGE","MISC","CHANGELOG","DEBUGGING"]
-        if 0 <= idx < len(names):
+        if 0 <= idx < len(TAB_ORDER):
             self.stack.setCurrentIndex(idx)
-            # Defer timer/tab work so stack layout cannot re-enter the event loop mid-switch.
-            tab_name = names[idx]
+            tab_name = TAB_ORDER[idx]
             QTimer.singleShot(0, lambda n=tab_name: self._after_tab_switch(n))
 
     def _after_tab_switch(self, tab_name):
         if tab_name == "PLAYERS":
             self._update_steam_features_active()
-            self._refresh_players_tab()
+            self._refresh_players_tab(force=True)
             if not self._player_list_timer.isActive():
                 self._player_list_timer.start(5000)
         else:
@@ -1391,7 +1544,7 @@ class Menu(QWidget):
             cb = self._chk(label, cfg)
             lo.addWidget(cb)
         dr = QHBoxLayout()
-        dr.addWidget(QLabel("Dot Radius:"))
+        dr.addWidget(self._mk_label("Dot Radius:"))
         self.spn_dot = QSpinBox()
         self.spn_dot.setRange(2, 32)
         self.spn_dot.setValue(self.config.dot_radius)
@@ -1399,13 +1552,13 @@ class Menu(QWidget):
         dr.addWidget(self.spn_dot)
         lo.addLayout(dr)
         # Health ESP (merged from old Health tab)
-        lo.addWidget(QLabel("Health ESP"))
+        lo.addWidget(self._mk_label("Health ESP"))
         self.cb_hp = self._chk("Health Bar","health_bar")
         self.cb_shield = self._chk("Shield Bar","shield_bar")
         lo.addWidget(self.cb_hp)
         lo.addWidget(self.cb_shield)
         hr = QHBoxLayout()
-        hr.addWidget(QLabel("Model Height:"))
+        hr.addWidget(self._mk_label("Model Height:"))
         self.spn_height = QSpinBox()
         self.spn_height.setRange(50, 250)
         self.spn_height.setValue(int(self.config.box_height_world))
@@ -1413,7 +1566,7 @@ class Menu(QWidget):
         hr.addWidget(self.spn_height)
         lo.addLayout(hr)
         yr = QHBoxLayout()
-        yr.addWidget(QLabel("Y Offset:"))
+        yr.addWidget(self._mk_label("Y Offset:"))
         self.spn_yoff = QSpinBox()
         self.spn_yoff.setRange(-50, 50)
         self.spn_yoff.setValue(self.config.box_y_offset)
@@ -1421,9 +1574,16 @@ class Menu(QWidget):
         yr.addWidget(self.spn_yoff)
         lo.addLayout(yr)
         # OOF arrows
-        lo.addWidget(QLabel("OOF Arrows"))
+        self.cb_oof_arrows = self._chk("OOF Arrows", "oof_arrows")
+        self.cb_oof_arrows.stateChanged.connect(lambda _s: self._sync_oof_settings_ui())
+        lo.addWidget(self.cb_oof_arrows)
+
+        self.oof_settings = QWidget()
+        oof_settings_lo = QVBoxLayout(self.oof_settings)
+        oof_settings_lo.setContentsMargins(12, 0, 0, 0)
+        oof_settings_lo.setSpacing(4)
         oof_row = QHBoxLayout()
-        oof_row.addWidget(QLabel("Radius:"))
+        oof_row.addWidget(self._mk_label("Radius:"))
         self.sld_oof = QSlider(Qt.Horizontal)
         self.sld_oof.setRange(0, 1000)
         self.sld_oof.setValue(self.config.oof_arrow_radius)
@@ -1432,16 +1592,18 @@ class Menu(QWidget):
         self.sld_oof.valueChanged.connect(self._on_oof_radius_changed)
         oof_row.addWidget(self.sld_oof, 1)
         oof_row.addWidget(self.lbl_oof)
-        lo.addLayout(oof_row)
+        oof_settings_lo.addLayout(oof_row)
         oof_lbl_row = QHBoxLayout()
         oof_lbl_row.setSpacing(6)
-        self.cb_oof_names = self._chk("Names","oof_show_names")
-        self.cb_oof_dist = self._chk("Distance","oof_show_distance")
-        self.cb_oof_hp = self._chk("Health #","oof_show_health")
+        self.cb_oof_names = self._chk("Names", "oof_show_names")
+        self.cb_oof_dist = self._chk("Distance", "oof_show_distance")
+        self.cb_oof_hp = self._chk("Health #", "oof_show_health")
         oof_lbl_row.addWidget(self.cb_oof_names)
         oof_lbl_row.addWidget(self.cb_oof_dist)
         oof_lbl_row.addWidget(self.cb_oof_hp)
-        lo.addLayout(oof_lbl_row)
+        oof_settings_lo.addLayout(oof_lbl_row)
+        lo.addWidget(self.oof_settings)
+        self._sync_oof_settings_ui()
         lo.addStretch()
 
     def _build_players_tab(self):
@@ -1450,12 +1612,12 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
 
-        hdr = QLabel("PLAYERS")
+        hdr = self._mk_label("PLAYERS (WIP)")
         hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
         lo.addWidget(hdr)
 
-        hint = QLabel(
-            "Session player list with Steam64 IDs. Save IDs to blocklist — "
+        hint = self._mk_label(
+            "Session player list (WIP) with Steam64 IDs. Save IDs to blocklist — "
             "Auto-Kick removes them when you are host; otherwise leaves the lobby."
         )
         hint.setWordWrap(True)
@@ -1463,7 +1625,11 @@ class Menu(QWidget):
         lo.addWidget(hint)
 
         self.tbl_players = QTableWidget(0, 4)
-        self.tbl_players.setHorizontalHeaderLabels(["Name", "Team", "Steam ID", ""])
+        self._player_table_columns = ["Name", "Team", "Steam ID", ""]
+        self.tbl_players.setHorizontalHeaderLabels(
+            [self._t(c) for c in self._player_table_columns if c]
+        )
+        self._i18n_bind_refresh(self._refresh_player_table_headers)
         self.tbl_players.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_players.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tbl_players.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1497,16 +1663,16 @@ class Menu(QWidget):
         lo.addWidget(self.tbl_players, 1)
 
         btn_row = QHBoxLayout()
-        self.btn_copy_steam_id = QPushButton("Copy Steam ID")
+        self.btn_copy_steam_id = self._mk_btn("Copy Steam ID")
         self.btn_copy_steam_id.setFocusPolicy(Qt.NoFocus)
         self.btn_copy_steam_id.clicked.connect(self._copy_selected_steam_id)
-        self.btn_save_block = QPushButton("Save to Blocklist")
+        self.btn_save_block = self._mk_btn("Save to Blocklist")
         self.btn_save_block.setFocusPolicy(Qt.NoFocus)
         self.btn_save_block.clicked.connect(self._save_selected_to_blocklist)
-        self.btn_kill_survivor = QPushButton("Kill Selected Survivor")
+        self.btn_kill_survivor = self._mk_btn("Kill Selected Survivor")
         self.btn_kill_survivor.setFocusPolicy(Qt.NoFocus)
         self.btn_kill_survivor.setToolTip(
-            "Hunter only: calls KillPlayer on the selected survivor (host/session rules apply)."
+            "Hunter only: sends KillPlayer server RPC on the selected survivor (in-match; bridge game-thread preferred)."
         )
         self.btn_kill_survivor.clicked.connect(self._kill_selected_survivor)
         btn_row.addWidget(self.btn_copy_steam_id)
@@ -1514,7 +1680,7 @@ class Menu(QWidget):
         btn_row.addWidget(self.btn_kill_survivor)
         lo.addLayout(btn_row)
 
-        lo.addWidget(QLabel("Blocklist (saved to C:\\peterhack\\blocked_players.json)"))
+        lo.addWidget(self._mk_label("Blocklist (saved to C:\\peterhack\\blocked_players.json)"))
         self.lst_blocklist = QListWidget()
         self.lst_blocklist.setMinimumHeight(110)
         self.lst_blocklist.setStyleSheet(
@@ -1523,7 +1689,7 @@ class Menu(QWidget):
         lo.addWidget(self.lst_blocklist)
 
         blk_row = QHBoxLayout()
-        self.btn_remove_block = QPushButton("Remove Selected")
+        self.btn_remove_block = self._mk_btn("Remove Selected")
         self.btn_remove_block.clicked.connect(self._remove_selected_blocklist)
         blk_row.addWidget(self.btn_remove_block)
         lo.addLayout(blk_row)
@@ -1552,7 +1718,8 @@ class Menu(QWidget):
             and self._pages.get("PLAYERS") is self.stack.currentWidget()
         )
         active = (
-            getattr(self.config, "show_steam_id", False)
+            on_players_tab
+            or getattr(self.config, "show_steam_id", False)
             or bool(getattr(self.esp, "_blocklist_cache_ids", set()))
             or getattr(self.config, "autokick_enabled", False)
         )
@@ -1593,7 +1760,10 @@ class Menu(QWidget):
         if ps and force:
             self.esp._steam_id_cache.pop(ps, None)
         if ps:
-            sid = self.esp.get_player_steam_id(ps, force=force)
+            if force:
+                sid = self.esp._bridge_resolve_steam_id(ps, timeout=12)
+            if not sid:
+                sid = self.esp.get_player_steam_id(ps, force=force)
         if not sid and pdata:
             sid = (pdata.get("steam_id") or "").strip()
         if not sid and pdata:
@@ -1602,6 +1772,9 @@ class Menu(QWidget):
                 item = self.tbl_players.item(row, 2)
                 if item:
                     sid = self._steam_id_from_display(item.text())
+        if sid and ps:
+            pdata["steam_id"] = sid
+            self.esp._steam_id_cache[ps] = (sid, time.monotonic())
         return sid
 
     def _players_status(self, text, ms=2500):
@@ -1639,13 +1812,16 @@ class Menu(QWidget):
             )
         return (tuple(parts), frozenset(blocked or ()))
 
-    def _refresh_players_tab(self):
+    def _refresh_players_tab(self, force=False):
         if not hasattr(self, "tbl_players"):
             return
         if self._pages.get("PLAYERS") is not self.stack.currentWidget():
             return
         try:
-            players = self.esp.get_session_players(force=False, resolve_steam=False)
+            players = self.esp.get_session_players(
+                force=force,
+                resolve_steam=force or self.esp._steam_features_active,
+            )
         except Exception:
             players = []
         blocked = self._blocklist_entries and blocklist_ids(self._blocklist_entries) or set()
@@ -1716,9 +1892,9 @@ class Menu(QWidget):
                 if not ps:
                     continue
                 row = i
-                sid = self.esp._bridge_resolve_steam_id(ps, timeout=4)
+                sid = self.esp._bridge_resolve_steam_id(ps, timeout=6)
                 if not sid:
-                    sid = self.esp.get_player_steam_id(ps, force=False)
+                    sid = self.esp.get_player_steam_id(ps, force=True)
                 if sid:
                     pdata["steam_id"] = sid
                 break
@@ -1745,28 +1921,32 @@ class Menu(QWidget):
         if pdata.get("is_hunter") is not False:
             self._players_status("Selected player is not a survivor")
             return
-        pawn = pdata.get("pawn") or 0
+        pawn = self.esp._fresh_kill_target_pawn(pdata) if hasattr(self.esp, "_fresh_kill_target_pawn") else (pdata.get("pawn") or 0)
         if not pawn:
             self._players_status("Survivor pawn not available yet")
             return
         if not hasattr(self.esp, "kill_survivor_pawn"):
             self._players_status("Kill not available")
             return
-        ok, err = self.esp.kill_survivor_pawn(pawn, config=self.config)
+        ok, err = self.esp.kill_survivor_pawn(pawn, config=self.config, pdata=pdata)
         name = pdata.get("player_name") or "survivor"
-        self._players_status(f"Killed {name}" if ok else f"Kill failed: {err}")
+        self._players_status(f"Kill sent for {name} ({err})" if ok else f"Kill failed: {err}")
 
     def _copy_selected_steam_id(self):
         pdata = self._selected_player_row()
         if not pdata:
             self._players_status("Select a player first")
             return
+        self._players_status("Resolving Steam ID...")
+        QApplication.processEvents()
         sid = self._resolve_player_steam_id(pdata, force=True)
         if not sid:
-            self._players_status("No Steam ID for that player yet")
+            self._players_status("No Steam ID yet — try again in a few seconds")
             return
         QApplication.clipboard().setText(sid)
         self._players_status(f"Copied {sid}")
+        self._players_tab_sig = None
+        self._refresh_players_tab()
 
     def _save_selected_to_blocklist(self):
         pdata = self._selected_player_row()
@@ -1811,7 +1991,7 @@ class Menu(QWidget):
         self.cb_radar = self._chk("Radar Enabled","radar_enabled")
         lo.addWidget(self.cb_radar)
         sr = QHBoxLayout()
-        sr.addWidget(QLabel("Radar Size:"))
+        sr.addWidget(self._mk_label("Radar Size:"))
         self.spn_radar_size = QSpinBox()
         self.spn_radar_size.setRange(80, 400)
         self.spn_radar_size.setValue(self.config.radar_size)
@@ -1819,7 +1999,7 @@ class Menu(QWidget):
         sr.addWidget(self.spn_radar_size)
         lo.addLayout(sr)
         rr = QHBoxLayout()
-        rr.addWidget(QLabel("Radar Range:"))
+        rr.addWidget(self._mk_label("Radar Range:"))
         self.spn_radar_range = QSpinBox()
         self.spn_radar_range.setRange(1000, 50000)
         self.spn_radar_range.setSingleStep(500)
@@ -1841,15 +2021,17 @@ class Menu(QWidget):
         lo.addWidget(self.cb_aim_fov)
         lo.addWidget(self.cb_aim_visible)
         kr = QHBoxLayout()
-        self.lbl_aim_key = QLabel("Aim Key: " + self.config.aimbot_key)
-        self.btn_record_key = QPushButton("Record Key")
+        self.lbl_aim_key = QLabel(f"{self._t('Aim Key')}: {self.config.aimbot_key}")
+        self._i18n_bind_refresh(self._refresh_aim_key_label)
+        self.btn_record_key = self._mk_btn("Record Key")
         self.btn_record_key.clicked.connect(self._start_aim_key_record)
         kr.addWidget(self.lbl_aim_key)
         kr.addWidget(self.btn_record_key)
         lo.addLayout(kr)
         br = QHBoxLayout()
-        br.addWidget(QLabel("Lock Bone:"))
+        br.addWidget(self._mk_label("Lock Bone:"))
         self.cmb_aim_bone = QComboBox()
+        self.cmb_aim_bone.setStyleSheet(self.COMBO_DROPDOWN_STYLE)
         for label, key in (
             ("Head", "head"),
             ("Neck", "neck_01"),
@@ -1870,7 +2052,7 @@ class Menu(QWidget):
         br.addWidget(self.cmb_aim_bone)
         lo.addLayout(br)
         fr = QHBoxLayout()
-        fr.addWidget(QLabel("FOV Radius:"))
+        fr.addWidget(self._mk_label("FOV Radius:"))
         self.spn_aim_fov = QSpinBox()
         self.spn_aim_fov.setRange(10, 600)
         self.spn_aim_fov.setValue(self.config.aimbot_fov)
@@ -1878,7 +2060,7 @@ class Menu(QWidget):
         fr.addWidget(self.spn_aim_fov)
         lo.addLayout(fr)
         sr = QHBoxLayout()
-        sr.addWidget(QLabel("Smooth:"))
+        sr.addWidget(self._mk_label("Smooth:"))
         self.spn_aim_smooth = QDoubleSpinBox()
         self.spn_aim_smooth.setRange(0.01, 1.0)
         self.spn_aim_smooth.setSingleStep(0.05)
@@ -1887,7 +2069,7 @@ class Menu(QWidget):
         sr.addWidget(self.spn_aim_smooth)
         lo.addLayout(sr)
         ar = QHBoxLayout()
-        ar.addWidget(QLabel("Chest Offset (fallback):"))
+        ar.addWidget(self._mk_label("Chest Offset (fallback):"))
         self.spn_aim_off = QSpinBox()
         self.spn_aim_off.setRange(-200, 200)
         self.spn_aim_off.setValue(int(self.config.aimbot_target_offset))
@@ -1902,11 +2084,11 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
 
-        hdr = QLabel("EXPLOITS (memory writes)")
+        hdr = self._mk_label("EXPLOITS (memory writes)")
         hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
         lo.addWidget(hdr)
 
-        hint = QLabel(
+        hint = self._mk_label(
             "Memory writes via resolved SDK offsets. Use the DEBUGGING tab to control log output."
         )
         hint.setWordWrap(True)
@@ -1923,7 +2105,7 @@ class Menu(QWidget):
         lo.addWidget(cb_anti_detect)
         cb_god_mode = self._chk("God Mode (Survivor)", "exploits_god_mode")
         cb_god_mode.setToolTip(
-            "MechaSRC god mode: bridge blocks Damage/DeathPlayer/KillPlayer ProcessEvent on your pawn\n"
+            "MechaSRC god mode: bridge blocks Damage/DeathPlayer on your survivor pawn (does not block hunter KillPlayer) "
             "and keeps Health/Invincible/Dead scrubbed. Survivor/hider only — host kills may still apply server-side."
         )
         lo.addWidget(cb_god_mode)
@@ -1931,7 +2113,7 @@ class Menu(QWidget):
         lo.addWidget(self._chk("Set Decoy Num", "exploits_set_decoy_num"))
 
         dr = QHBoxLayout()
-        dr.addWidget(QLabel("Decoy count:"))
+        dr.addWidget(self._mk_label("Decoy count:"))
         self.spn_decoy_count = QSpinBox()
         self.spn_decoy_count.setRange(0, 99)
         self.spn_decoy_count.setValue(int(self.config.exploits_decoy_count))
@@ -1942,8 +2124,11 @@ class Menu(QWidget):
         lo.addLayout(dr)
 
         magnet_row = QHBoxLayout()
-        self.lbl_magnet_key = QLabel("Magnet toggle key: " + getattr(self.config, "exploits_magnet_key", "G"))
-        self.btn_record_magnet_key = QPushButton("Record Key")
+        self.lbl_magnet_key = QLabel(
+            f"{self._t('Magnet toggle key')}: {getattr(self.config, 'exploits_magnet_key', 'G')}"
+        )
+        self._i18n_bind_refresh(self._refresh_magnet_key_label)
+        self.btn_record_magnet_key = self._mk_btn("Record Key")
         self.btn_record_magnet_key.setToolTip(
             "Press the key to toggle survivor magnet (default G). "
             "Works in-game and while the Peterhack menu is focused (not while typing in a text box)."
@@ -1952,7 +2137,8 @@ class Menu(QWidget):
         magnet_row.addWidget(self.lbl_magnet_key)
         magnet_row.addWidget(self.btn_record_magnet_key)
         lo.addLayout(magnet_row)
-        self.lbl_magnet_status = QLabel("Magnet: OFF")
+        self.lbl_magnet_status = QLabel(self._t("Magnet: OFF"))
+        self._i18n_bind_refresh(self._update_magnet_status_label)
         self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
         lo.addWidget(self.lbl_magnet_status)
 
@@ -1968,7 +2154,7 @@ class Menu(QWidget):
         lo.addWidget(cb_anti_kick)
 
         lobby_row = QHBoxLayout()
-        self.btn_return_lobby = QPushButton("Return to Main Lobby")
+        self.btn_return_lobby = self._mk_btn("Return to Main Lobby")
         self.btn_return_lobby.setToolTip(
             "One click: calls ClientReturnToMainMenu on your PlayerController.\n"
             "Leaves the current lobby/match and sends you back to the main menu.\n"
@@ -1983,7 +2169,7 @@ class Menu(QWidget):
         lo.addWidget(self.lbl_return_lobby_status)
 
         rr = QHBoxLayout()
-        rr.addWidget(QLabel("Rename to:"))
+        rr.addWidget(self._mk_label("Rename to:"))
         self.txt_exploits_rename = QLineEdit(self.config.exploits_rename_text)
         self.txt_exploits_rename.setMaxLength(32)
         self.txt_exploits_rename.setToolTip(
@@ -1993,7 +2179,7 @@ class Menu(QWidget):
         self.txt_exploits_rename.textChanged.connect(self._on_exploits_rename_text_changed)
         self.txt_exploits_rename.returnPressed.connect(self._run_exploits_rename)
         rr.addWidget(self.txt_exploits_rename)
-        self.btn_exploits_rename = QPushButton("Rename")
+        self.btn_exploits_rename = self._mk_btn("Rename")
         self.btn_exploits_rename.setToolTip(
             "Send SetName(Server) once via bridge.\n"
             "Works in lobby and in-match."
@@ -2011,11 +2197,11 @@ class Menu(QWidget):
         sep.setStyleSheet("color: #2a4a1a;")
         lo.addWidget(sep)
 
-        bridge_hdr = QLabel("Bridge commands (in-game DLL)")
+        bridge_hdr = self._mk_label("Bridge commands (in-game DLL)")
         bridge_hdr.setStyleSheet("font-size: 12px; font-weight: bold; color: #7ec850; padding: 4px 0 0 0;")
         lo.addWidget(bridge_hdr)
 
-        bridge_hint = QLabel(
+        bridge_hint = self._mk_label(
             "Teleport and kill use the camo bridge over localhost TCP.\n"
             "Bridge auto-injects when Peterhack connects to the game."
         )
@@ -2045,25 +2231,25 @@ class Menu(QWidget):
         lo.addLayout(tp_row)
 
         tp_btns = QHBoxLayout()
-        self.btn_tp_fill = QPushButton("Use My Position")
+        self.btn_tp_fill = self._mk_btn("Use My Position")
         self.btn_tp_fill.clicked.connect(self._fill_teleport_coords)
         tp_btns.addWidget(self.btn_tp_fill)
-        self.btn_tp_go = QPushButton("Teleport")
+        self.btn_tp_go = self._mk_btn("Teleport")
         self.btn_tp_go.clicked.connect(self._run_bridge_teleport)
         tp_btns.addWidget(self.btn_tp_go)
         lo.addLayout(tp_btns)
 
         kill_row = QHBoxLayout()
-        self.btn_bridge_kill = QPushButton("Kill Self")
+        self.btn_bridge_kill = self._mk_btn("Kill Self")
         self.btn_bridge_kill.setToolTip("Destroys local pawn via bridge K2_DestroyActor / damage fallback.")
         self.btn_bridge_kill.clicked.connect(self._run_bridge_kill)
         kill_row.addWidget(self.btn_bridge_kill)
         lo.addLayout(kill_row)
 
         hunter_row = QHBoxLayout()
-        self.btn_kill_all_survivors = QPushButton("Kill All Survivors")
+        self.btn_kill_all_survivors = self._mk_btn("Kill All Survivors")
         self.btn_kill_all_survivors.setToolTip(
-            "Hunter only: KillPlayer on every survivor in the session (one click, staggered)."
+            "WIP — Hunter only: KillPlayer on every survivor in the session (one click, staggered)."
         )
         self.btn_kill_all_survivors.clicked.connect(self._run_kill_all_survivors)
         hunter_row.addWidget(self.btn_kill_all_survivors)
@@ -2081,21 +2267,21 @@ class Menu(QWidget):
         lo = QVBoxLayout(p)
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(6)
-        self.btn_local_color = QPushButton("Local Player")
+        self.btn_local_color = self._mk_btn("Local Player")
         self.btn_local_color.clicked.connect(lambda: self._pick_color("local_color"))
-        self.btn_hunter_color = QPushButton("Hunter (enemy team)")
+        self.btn_hunter_color = self._mk_btn("Hunter (enemy team)")
         self.btn_hunter_color.clicked.connect(lambda: self._pick_color("hunter_color"))
-        self.btn_survivor_color = QPushButton("Survivor (friendly team)")
+        self.btn_survivor_color = self._mk_btn("Survivor (friendly team)")
         self.btn_survivor_color.clicked.connect(lambda: self._pick_color("survivor_color"))
-        self.btn_enemy_color = QPushButton("Unknown Team (fallback)")
+        self.btn_enemy_color = self._mk_btn("Unknown Team (fallback)")
         self.btn_enemy_color.clicked.connect(lambda: self._pick_color("enemy_color"))
-        self.btn_skeleton_color = QPushButton("Skeleton Color")
+        self.btn_skeleton_color = self._mk_btn("Skeleton Color")
         self.btn_skeleton_color.clicked.connect(lambda: self._pick_color("skeleton_color"))
-        self.btn_clone_color = QPushButton("Clone ESP Color")
+        self.btn_clone_color = self._mk_btn("Clone ESP Color")
         self.btn_clone_color.clicked.connect(lambda: self._pick_color("clone_color"))
-        self.btn_visible_color = QPushButton("Visible (Enemy Only mode)")
+        self.btn_visible_color = self._mk_btn("Visible (Enemy Only mode)")
         self.btn_visible_color.clicked.connect(lambda: self._pick_color("visible_color"))
-        self.btn_not_visible_color = QPushButton("Not Visible (Enemy Only mode)")
+        self.btn_not_visible_color = self._mk_btn("Not Visible (Enemy Only mode)")
         self.btn_not_visible_color.clicked.connect(lambda: self._pick_color("not_visible_color"))
         lo.addWidget(self.btn_local_color)
         lo.addWidget(self.btn_hunter_color)
@@ -2113,11 +2299,11 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
 
-        hdr = QLabel("CAMOUFLAGE")
+        hdr = self._mk_label("CAMOUFLAGE")
         hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
         lo.addWidget(hdr)
 
-        info = QLabel(
+        info = self._mk_label(
             "Fully automatic — 6-pass wrap: front → left → right → back, "
             "then head/shoulders + inner legs.\n"
             "Camera angles are computed dynamically from your pose (any angle/emote).\n"
@@ -2129,7 +2315,7 @@ class Menu(QWidget):
         lo.addWidget(info)
 
         camo_q_row = QHBoxLayout()
-        camo_q_row.addWidget(QLabel("Camo quality:"))
+        camo_q_row.addWidget(self._mk_label("Camo quality:"))
         self.sld_camo_quality = QSlider(Qt.Horizontal)
         self.sld_camo_quality.setRange(1, 20)
         self.sld_camo_quality.setValue(getattr(self.config, "paint_quality", 12))
@@ -2150,7 +2336,12 @@ class Menu(QWidget):
 
         def _on_camo_quality_change(v):
             setattr(self.config, "paint_quality", v)
-            self.lbl_camo_quality.setText(f"{_CAMO_QLABELS.get(v, '')} ({v})")
+            ql = self._t(_CAMO_QLABELS.get(v, ""))
+            self.lbl_camo_quality.setText(f"{ql} ({v})" if ql else str(v))
+
+        self._i18n_bind_refresh(
+            lambda: _on_camo_quality_change(self.sld_camo_quality.value())
+        )
 
         self.sld_camo_quality.valueChanged.connect(_on_camo_quality_change)
         camo_q_row.addWidget(self.lbl_camo_quality)
@@ -2187,11 +2378,11 @@ class Menu(QWidget):
         skip_front.stateChanged.connect(_sync_camo_pass_toggles)
         back_only.stateChanged.connect(_sync_camo_pass_toggles)
 
-        self.lbl_camo_status = QLabel("Injecting bridge...")
+        self.lbl_camo_status = QLabel(self._t("Injecting bridge..."))
         self.lbl_camo_status.setStyleSheet("color: #888; font-size: 10px; padding: 4px 0;")
         lo.addWidget(self.lbl_camo_status)
 
-        self.btn_camo_apply = QPushButton("Paint Now")
+        self.btn_camo_apply = self._mk_btn("Paint Now")
         self.btn_camo_apply.setFixedHeight(32)
         self.btn_camo_apply.setToolTip(
             "Launch bridge inject and apply environment camouflage automatically."
@@ -2205,7 +2396,7 @@ class Menu(QWidget):
         self.btn_camo_apply.clicked.connect(self._paint_camo_now)
         lo.addWidget(self.btn_camo_apply)
 
-        self.btn_camo_stop = QPushButton("Stop Camo (F9)")
+        self.btn_camo_stop = self._mk_btn("Stop Camo (F9)")
         self.btn_camo_stop.setFixedHeight(32)
         self.btn_camo_stop.setEnabled(True)
         self.btn_camo_stop.setToolTip("Cancel paint via bridge cancel_paint (same as F9).")
@@ -2223,7 +2414,7 @@ class Menu(QWidget):
         sep.setStyleSheet("color: #2a4a1a;")
         lo.addWidget(sep)
 
-        hdr = QLabel("Custom Character Paint")
+        hdr = self._mk_label("Custom Character Paint")
         hdr.setStyleSheet("color: #7ec850; font-size: 11px; font-weight: bold; padding-top: 4px;")
         lo.addWidget(hdr)
 
@@ -2234,19 +2425,21 @@ class Menu(QWidget):
             lambda t: setattr(self.config, "paint_image_path", t)
         )
         img_row.addWidget(self.txt_paint_image, 1)
-        btn_browse = QPushButton("Browse")
+        btn_browse = self._mk_btn("Browse")
         btn_browse.clicked.connect(self._browse_paint_image)
         img_row.addWidget(btn_browse)
         lo.addLayout(img_row)
 
-        btn_apply_img = QPushButton("Apply image to character")
+        btn_apply_img = self._mk_btn("Apply image to character")
         btn_apply_img.setToolTip(
-            "Face your character toward the camera (3rd person) for best placement."
+            "Projects your image onto the character using the same mesh-first "
+            "bridge paint route as Paint Now (camo). Face the character toward "
+            "the camera in third person for best placement."
         )
         btn_apply_img.clicked.connect(self._apply_paint_image)
         lo.addWidget(btn_apply_img)
 
-        btn_uv_test = QPushButton("Run UV Test")
+        btn_uv_test = self._mk_btn("Run UV Test")
         btn_uv_test.setToolTip(
             "Paints a UV diagnostic overlay on your character.\n"
             "Use the mode dropdown to switch views:\n"
@@ -2262,8 +2455,9 @@ class Menu(QWidget):
         lo.addWidget(btn_uv_test)
 
         uv_diag_row = QHBoxLayout()
-        uv_diag_row.addWidget(QLabel("UV test mode:"))
+        uv_diag_row.addWidget(self._mk_label("UV test mode:"))
         self.cmb_uv_diag_mode = QComboBox()
+        self.cmb_uv_diag_mode.setStyleSheet(self.COMBO_DROPDOWN_STYLE)
         _uv_modes = [
             ("Full (islands + grid)", "full"),
             ("Islands only", "islands"),
@@ -2316,8 +2510,9 @@ class Menu(QWidget):
 
         # ── Wrap mode dropdown ────────────────────────────────────────────────
         wrap_row = QHBoxLayout()
-        wrap_row.addWidget(QLabel("Wrap mode:"))
+        wrap_row.addWidget(self._mk_label("Wrap mode:"))
         self.cmb_wrap_mode = QComboBox()
+        self.cmb_wrap_mode.setStyleSheet(self.COMBO_DROPDOWN_STYLE)
         self.cmb_wrap_mode.addItem("Projector  (front → back)", "projector")
         self.cmb_wrap_mode.addItem("Centered   (chest outward)", "centered")
         _wrap_list = ["projector", "centered"]
@@ -2491,18 +2686,34 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(4)
 
-        lo.addWidget(QLabel("UI / Overlay"))
-        info = QLabel(
-            "ESP overlay refresh when the menu is hidden (1–100). While this menu\n"
-            "is open, overlay draw is capped at 30 FPS (or lower if you set below 30)\n"
-            "so the menu stays responsive. Release the slider to apply."
+        lo.addWidget(self._mk_label("Language"))
+        lang_info = self._mk_label(
+            "Menu labels update immediately when you change the language."
         )
-        info.setStyleSheet("color: #7a9a6a; font-size: 10px;")
-        info.setWordWrap(True)
-        lo.addWidget(info)
+        lang_info.setStyleSheet("color: #7a9a6a; font-size: 10px;")
+        lang_info.setWordWrap(True)
+        lo.addWidget(lang_info)
+
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(self._mk_label("Menu language"))
+        self.cmb_ui_language = QComboBox()
+        self.cmb_ui_language.setStyleSheet(self.COMBO_DROPDOWN_STYLE)
+        for code, name in UI_LANGUAGES:
+            self.cmb_ui_language.addItem(name, code)
+        cur = normalize_lang(getattr(self.config, "ui_language", "en"))
+        idx = self.cmb_ui_language.findData(cur)
+        self.cmb_ui_language.blockSignals(True)
+        self.cmb_ui_language.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_ui_language.blockSignals(False)
+        self.config.ui_language = cur
+        self.cmb_ui_language.currentIndexChanged.connect(self._on_ui_language_changed)
+        lang_row.addWidget(self.cmb_ui_language, 1)
+        lo.addLayout(lang_row)
+
+        lo.addWidget(self._mk_label("UI / Overlay"))
 
         fps_row = QHBoxLayout()
-        fps_row.addWidget(QLabel("Overlay FPS:"))
+        fps_row.addWidget(self._mk_label("Overlay FPS:"))
         self.sld_ui_overlay_fps = QSlider(Qt.Horizontal)
         self.sld_ui_overlay_fps.setRange(1, MAX_OVERLAY_FPS)
         init_fps = max(1, min(MAX_OVERLAY_FPS, int(getattr(self.config, "ui_overlay_fps", 60))))
@@ -2525,6 +2736,33 @@ class Menu(QWidget):
         fps_row.addWidget(self.lbl_ui_overlay_fps)
         lo.addLayout(fps_row)
 
+        self.cb_ui_overlay_vsync = QCheckBox(self._t("VSync (match monitor refresh)"))
+        self.cb_ui_overlay_vsync.setChecked(bool(getattr(self.config, "ui_overlay_vsync", False)))
+        self.cb_ui_overlay_vsync.setToolTip(
+            "When enabled, the overlay repaint rate follows your primary monitor's "
+            "refresh rate (e.g. 60 / 120 / 144 Hz). The FPS slider is disabled while "
+            "VSync is on."
+        )
+        self.cb_ui_overlay_vsync.toggled.connect(self._on_ui_overlay_vsync_toggled)
+        self._i18n_bind(self.cb_ui_overlay_vsync, "VSync (match monitor refresh)")
+        lo.addWidget(self.cb_ui_overlay_vsync)
+
+        info = self._mk_label(
+            "ESP overlay refresh when the menu is hidden (1–100). Enable VSync to match "
+            "your monitor Hz (up to 240). While this menu is open, overlay draw is capped "
+            "at 30 FPS (or lower if you set below 30) so the menu stays responsive. "
+            "Release the slider to apply."
+        )
+        info.setStyleSheet("color: #7a9a6a; font-size: 10px;")
+        info.setWordWrap(True)
+        lo.addWidget(info)
+
+        self._sync_ui_overlay_vsync_controls()
+        if getattr(self.config, "ui_overlay_vsync", False):
+            overlay = getattr(self, "_overlay", None)
+            if overlay is not None:
+                overlay.request_set_fps(get_primary_monitor_refresh_hz())
+
         lo.addStretch()
 
     def _build_changelog_tab(self):
@@ -2534,7 +2772,7 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(6)
 
-        hdr = QLabel("Changelog")
+        hdr = self._mk_label("Changelog")
         hdr.setStyleSheet(
             "color: #7ec850; font-size: 13px; font-weight: bold; padding-bottom: 2px;"
         )
@@ -2559,7 +2797,7 @@ class Menu(QWidget):
         )
         lo.addWidget(self.cb_auto_update)
 
-        btn_update = QPushButton("Check for updates now")
+        btn_update = self._mk_btn("Check for updates now")
         btn_update.clicked.connect(self._check_updates_now)
         lo.addWidget(btn_update)
 
@@ -2567,17 +2805,17 @@ class Menu(QWidget):
         txt.setReadOnly(True)
         txt.setStyleSheet(f"""
             QTextEdit {{
-                background: #111a0d;
+                background: #1a2814;
                 color: #c8e8b0;
-                border: 1px solid #2a4a1a;
+                border: 1px solid #3a5a28;
                 border-radius: 6px;
                 padding: 6px;
                 font-family: {mono_css_family()};
                 font-size: 11px;
-                selection-background-color: #2a5a1a;
+                selection-background-color: #2a4a18;
             }}
             QScrollBar:vertical {{
-                background: #111a0d; width: 10px; border-radius: 5px;
+                background: #1a2814; width: 10px; border-radius: 5px;
             }}
             QScrollBar::handle:vertical {{
                 background: #3a6a2a; border-radius: 5px; min-height: 20px;
@@ -2898,13 +3136,13 @@ class Menu(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
         lo.setSpacing(6)
 
-        hdr = QLabel("Console / log filters")
+        hdr = self._mk_label("Console / log filters")
         hdr.setStyleSheet(
             "color: #7ec850; font-size: 13px; font-weight: bold; padding-bottom: 2px;"
         )
         lo.addWidget(hdr)
 
-        hint = QLabel(
+        hint = self._mk_label(
             "Controls what is written to C:\\peterhack\\logs\\latest.log and the console.\n"
             "Lines are matched by [TAG] prefix — e.g. [EXPLOITS:ANTI-KICK], [CAMO], [PAINT].\n"
             "Timestamped session headers always go to the log file."
@@ -2914,8 +3152,8 @@ class Menu(QWidget):
         lo.addWidget(hint)
 
         btn_row = QHBoxLayout()
-        btn_all_on = QPushButton("Enable all")
-        btn_all_off = QPushButton("Disable all")
+        btn_all_on = self._mk_btn("Enable all")
+        btn_all_off = self._mk_btn("Disable all")
         btn_all_on.clicked.connect(lambda: self._set_log_toggles(True))
         btn_all_off.clicked.connect(lambda: self._set_log_toggles(False))
         btn_row.addWidget(btn_all_on)
@@ -3118,40 +3356,43 @@ class Menu(QWidget):
             self._set_paint_status("Image scaling failed.", ok=False)
             return
         opacity = int(self.config.paint_image_opacity)
-        # Grid size driven by the Image quality slider (1-5).
-        grid = _quality_to_image_grid(getattr(self.config, "image_quality", 3))
-
-        def _paint_progress(done, total):
-            self.paint_job_progress.emit(done, total)
-
-        fast_paint = getattr(self.config, "image_quality", 3) >= 5
-        wrap_mode = getattr(self.config, "image_wrap_mode", "projector")
-        mode_label = MecchaESP.image_wrap_mode_label(wrap_mode)
+        image_q = getattr(self.config, "image_quality", 3)
 
         def worker():
             print(
-                f"[PAINT] Apply Image to Character — mode={mode_label}, "
-                f"grid={grid}, quality={getattr(self.config, 'image_quality', 3)}"
+                f"[PAINT] Apply Image — mesh_first_paint (camo pipeline), "
+                f"res={resolution}, image_quality={image_q}"
             )
             print("[PAINT] image apply worker started")
-            pawn = self.esp.wait_for_paintable_pawn()
-            if not pawn:
+            if not self.esp.wait_for_paintable_pawn():
                 return False, "Could not find your character — spawn in a match first."
-            ok = self.esp.paint_image_bgra(
-                pawn, bgra, resolution, opacity=opacity, grid=grid,
-                progress_cb=_paint_progress,
-                img_aspect=img_aspect, img_w=orig_w, img_h=orig_h,
-                fast_paint=fast_paint,
-                wrap_mode=wrap_mode,
-            )
-            if ok:
-                return True, (
-                    f"Applied {orig_w}×{orig_h} image on front+back."
+
+            ok = False
+            if hasattr(self.esp, "image_apply_bgra"):
+                ok = self.esp.image_apply_bgra(bgra, resolution, resolution, opacity=opacity)
+            if not ok and hasattr(self.esp, "paint_image_bgra"):
+                print("[PAINT] bridge image apply failed — falling back to legacy UV path", flush=True)
+                grid = _quality_to_image_grid(image_q)
+                wrap_mode = getattr(self.config, "image_wrap_mode", "projector")
+                ok = self.esp.paint_image_bgra(
+                    self.esp.wait_for_paintable_pawn(),
+                    bgra,
+                    resolution,
+                    opacity=opacity,
+                    grid=grid,
+                    img_aspect=img_aspect,
+                    img_w=orig_w,
+                    img_h=orig_h,
+                    fast_paint=image_q >= 5,
+                    wrap_mode=wrap_mode,
                 )
-            return False, "Image apply failed — try again in a match."
+            if ok:
+                return True, f"Applied {orig_w}×{orig_h} via mesh-first paint."
+            err = getattr(self.esp, "_camo_last_error", None) or "Image apply failed — rebuild bridge DLL"
+            return False, err
 
         self._run_paint_job(
-            "Looking for character... game may stutter briefly while painting",
+            "Applying image via mesh-first paint (same route as camo)...",
             worker,
             progress_label="Painting",
         )
@@ -3262,6 +3503,10 @@ class Menu(QWidget):
             progress_label="Loading preset",
         )
 
+    def _sync_oof_settings_ui(self):
+        if hasattr(self, "oof_settings"):
+            self.oof_settings.setVisible(bool(getattr(self.config, "oof_arrows", True)))
+
     def _oof_radius_label(self, value):
         return "Edge" if value <= 0 else f"{value}px"
 
@@ -3270,9 +3515,10 @@ class Menu(QWidget):
         self.lbl_oof.setText(self._oof_radius_label(value))
 
     def _chk(self, text, attr):
-        cb = QCheckBox(text)
+        cb = QCheckBox(self._t(text))
         cb.setChecked(getattr(self.config, attr))
         cb.stateChanged.connect(lambda s, a=attr: setattr(self.config, a, bool(s)))
+        self._i18n_bind(cb, text)
         return cb
 
     def _pick_color(self, attr):
@@ -3283,13 +3529,13 @@ class Menu(QWidget):
 
     def _start_aim_key_record(self):
         self.btn_record_key.setEnabled(False)
-        self.btn_record_key.setText('Press key...')
+        self.btn_record_key.setText(self._t("Press key..."))
         self._key_recorder.start()
 
     def _start_magnet_key_record(self):
         self._unregister_magnet_hotkey()
         self.btn_record_magnet_key.setEnabled(False)
-        self.btn_record_magnet_key.setText("Press key...")
+        self.btn_record_magnet_key.setText(self._t("Press key..."))
         self._magnet_key_recorder.start()
 
     def _run_kill_all_survivors(self):
@@ -3314,10 +3560,14 @@ class Menu(QWidget):
         active = getattr(self.esp, "_magnet_active", False)
         key = getattr(self.config, "exploits_magnet_key", "G")
         if active:
-            self.lbl_magnet_status.setText(f"Magnet: ON — press {key} to disable")
+            self.lbl_magnet_status.setText(
+                f"{self._t('Magnet: ON')} — {self._t('press')} {key} {self._t('to disable')}"
+            )
             self.lbl_magnet_status.setStyleSheet("color: #ff6666; font-size: 10px; font-weight: bold;")
         else:
-            self.lbl_magnet_status.setText(f"Magnet: OFF — press {key} to toggle (hunter)")
+            self.lbl_magnet_status.setText(
+                f"{self._t('Magnet: OFF')} — {self._t('press')} {key} {self._t('to toggle (hunter)')}"
+            )
             self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
 
     def _on_update_check_failed(self, message):
@@ -3429,7 +3679,12 @@ class Overlay(QWidget):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_overlay)
-        self._target_overlay_fps = max(1, min(MAX_OVERLAY_FPS, int(getattr(self.config, "ui_overlay_fps", 60))))
+        if getattr(self.config, "ui_overlay_vsync", False):
+            self._target_overlay_fps = get_primary_monitor_refresh_hz()
+        else:
+            self._target_overlay_fps = clamp_overlay_fps(
+                getattr(self.config, "ui_overlay_fps", 60), vsync=False
+            )
         self._overlay_interval_applied_ms = None
         if menu is not None:
             self.esp._menu_ui_active = True
@@ -3610,18 +3865,27 @@ class Overlay(QWidget):
                 self.setGeometry(0, 0, 1920, 1080)
 
     @staticmethod
-    def _overlay_interval_ms(fps: int) -> int:
-        fps = max(1, min(MAX_OVERLAY_FPS, int(fps)))
+    def _overlay_interval_ms(fps: int, *, vsync: bool = False) -> int:
+        fps = clamp_overlay_fps(fps, vsync=vsync)
         return max(1, int(round(1000.0 / fps)))
 
     def request_set_fps(self, fps: int):
         """Queue an overlay timer update on the Qt UI thread."""
         self.fps_apply_requested.emit(int(fps))
 
+    def _resolve_target_overlay_fps(self) -> int:
+        if getattr(self.config, "ui_overlay_vsync", False):
+            return get_primary_monitor_refresh_hz()
+        return clamp_overlay_fps(getattr(self, "_target_overlay_fps", 60), vsync=False)
+
     def _apply_overlay_fps(self, fps: int):
         """Store user overlay cap and apply the effective timer interval."""
-        fps = max(1, min(MAX_OVERLAY_FPS, int(fps)))
-        self.config.ui_overlay_fps = fps
+        vsync = bool(getattr(self.config, "ui_overlay_vsync", False))
+        if vsync:
+            fps = get_primary_monitor_refresh_hz()
+        else:
+            fps = clamp_overlay_fps(fps, vsync=False)
+            self.config.ui_overlay_fps = fps
         self._target_overlay_fps = fps
         self._sync_overlay_timer_interval()
 
@@ -3643,19 +3907,23 @@ class Overlay(QWidget):
         )
 
     def _effective_overlay_fps(self) -> int:
-        target = max(1, min(MAX_OVERLAY_FPS, int(getattr(self, "_target_overlay_fps", 60))))
-        if self._esp_overlay_active():
+        vsync = bool(getattr(self.config, "ui_overlay_vsync", False))
+        target = self._resolve_target_overlay_fps()
+        if not vsync and self._esp_overlay_active():
             target = min(target, self.ESP_ACTIVE_OVERLAY_FPS_CAP)
         if self._menu_is_open():
             return min(target, self.MENU_OPEN_OVERLAY_FPS_CAP)
         if hasattr(self.esp, "_is_freecam_or_spectating") and self.esp._is_freecam_or_spectating():
+            if vsync:
+                return target
             return min(target, self.FREECAM_OVERLAY_FPS_CAP)
         return target
 
     def _sync_overlay_timer_interval(self):
         """Apply overlay repaint interval (menu open uses a lower cap)."""
+        vsync = bool(getattr(self.config, "ui_overlay_vsync", False))
         effective = self._effective_overlay_fps()
-        ms = self._overlay_interval_ms(effective)
+        ms = self._overlay_interval_ms(effective, vsync=vsync)
         prev_ms = getattr(self, "_overlay_interval_applied_ms", None)
         timer = getattr(self, "timer", None)
         if prev_ms == ms and timer is not None and timer.isActive():
@@ -3670,7 +3938,7 @@ class Overlay(QWidget):
         timer.setInterval(ms)
         if not timer.isActive():
             timer.start()
-        target = int(getattr(self, "_target_overlay_fps", effective))
+        target = self._resolve_target_overlay_fps()
         menu_open = self._menu_is_open()
         freecam = (
             hasattr(self.esp, "_is_freecam_or_spectating")
@@ -3724,6 +3992,8 @@ class Overlay(QWidget):
             if relaxed != getattr(self, "_overlay_relaxed_mode", None):
                 self._overlay_relaxed_mode = relaxed
                 self._sync_overlay_timer_interval()
+        if hasattr(self.esp, "_sync_esp_freecam_state"):
+            self.esp._sync_esp_freecam_state(self.config)
         self.esp._overlay_screen_geom = (max(1, self.width()), max(1, self.height()))
         self._fps_times.append(now)
         # Keep only timestamps within the last second
@@ -4617,37 +4887,48 @@ class Overlay(QWidget):
             # Draw each player — wrapped so one bad player never kills the whole frame
             for pdata in all_players:
               try:
-                is_local = pdata["is_local"]
+                is_local = bool(pdata.get("is_local"))
                 if is_local and not self.config.show_local:
                     continue
-                pos = pdata["pos"]
-                actor = pdata["actor"]
-                ps = pdata["player_state"]
-                idx = pdata["idx"]
+                is_hunter = pdata.get("is_hunter")
+                actor = pdata.get("actor")
+                ps = pdata.get("player_state")
+                idx = pdata.get("idx", 0)
 
-                # Distance scaling
-                d = dist(pos, cam["loc"])
+                dot_pos = None
+                if actor:
+                    dot_pos = self.esp._player_esp_dot_pos(actor)
+                if not dot_pos:
+                    dot_pos = pdata.get("dot_pos") or pdata.get("root_pos") or pdata.get("pos")
+                box_pos = pdata.get("root_pos") or pdata.get("pos") or dot_pos
+                if not dot_pos:
+                    continue
+                dot_sx, dot_sy, on_screen = w2s(dot_pos, cam, w, h)
+                if not (math.isfinite(dot_sx) and math.isfinite(dot_sy)):
+                    if getattr(self.config, "log_esp", False):
+                        name = (pdata.get("player_name") or "?").strip()
+                        print(
+                            f"[ESP] skip paint {name}: actor={actor or 0} "
+                            f"dot={dot_pos} root={pdata.get('root_pos')}",
+                            flush=True,
+                        )
+                    continue
+
+                # Distance scaling (world anchor = root/feet like upstream)
+                anchor = box_pos or dot_pos
+                d = dist(anchor, cam["loc"])
                 scale = 1.0
                 if self.config.distance_scaling and d > 0:
                     scale = self.config.scale_reference_dist / d
                     scale = max(0.3, min(scale, 3.0))
 
-                # Dot: chest position from snapshot (avoid per-frame bone reads).
-                dot_pos = pos
-                dot_sx, dot_sy, dot_on = w2s(dot_pos, cam, w, h)
-                dot_x, dot_y = dot_sx, dot_sy
-                if dot_on:
-                    dot_x, dot_y = clamp_screen(dot_x, dot_y, w, h)
-
-                chest_sx, chest_sy, on_screen = dot_sx, dot_sy, dot_on
-
-                sx, sy = chest_sx, chest_sy
+                dsx, dsy = clamp_screen(dot_sx, dot_sy, w, h)
+                dsy += self.config.box_y_offset
+                sx, sy = dsx, dsy
 
                 if is_local:
                     color = self.config.local_color
                 else:
-                    # Determine base color by team
-                    is_hunter = pdata.get("is_hunter")
                     steam_id = (pdata.get("steam_id") or "").strip()
                     blocked = self.esp.is_blocked_steam_id(steam_id)
                     if self.config.enemy_only:
@@ -4665,79 +4946,54 @@ class Overlay(QWidget):
 
                     color = (255, 140, 60) if blocked else base_color
 
-                # --- Off-screen indicator: triangle arrow pointing toward player ---
+                # Off-screen: dot ESP only (edge indicator — no boxes/skeleton/labels).
                 if not on_screen:
                     bearing = None
                     if cam:
                         cam_loc = cam["loc"]
-                        dxw = pos[0] - cam_loc[0]
-                        dyw = pos[1] - cam_loc[1]
+                        dxw = box_pos[0] - cam_loc[0]
+                        dyw = box_pos[1] - cam_loc[1]
                         if abs(dxw) + abs(dyw) > 1.0:
                             _, _, cam_yaw_rad = [math.radians(v) for v in cam["rot"]]
                             target = math.atan2(dyw, dxw)
                             bearing = target - cam_yaw_rad
-                    ex, ey, ux, uy = oof_indicator_pos(
+                    ex, ey, _ux, _uy = oof_indicator_pos(
                         sx, sy, w, h, self.config.oof_arrow_radius, bearing)
-                    # Perpendicular to arrow direction
-                    px, py = -uy, ux
-                    # Triangle: tip at edge, two base points behind
-                    SZ = 10
-                    tip  = (int(ex + ux * SZ), int(ey + uy * SZ))
-                    base1 = (int(ex - ux * SZ + px * SZ), int(ey - uy * SZ + py * SZ))
-                    base2 = (int(ex - ux * SZ - px * SZ), int(ey - uy * SZ - py * SZ))
-                    tri = QPolygonF([QPointF(*tip), QPointF(*base1), QPointF(*base2)])
-                    painter.setPen(QPen(QColor(0, 0, 0), 1))
-                    painter.setBrush(QColor(*color))
-                    painter.drawPolygon(tri)
-                    # OOF label — toggles for name / distance / health number
-                    oof_parts = []
-                    player_name = pdata.get("player_name", "").strip()
-                    if is_hunter is True:
-                        team_tag = "H"
-                    elif is_hunter is False:
-                        team_tag = "S"
-                    else:
-                        team_tag = "?"
-                    if self.config.oof_show_names:
-                        if player_name:
-                            oof_parts.append(f"[{team_tag}] {player_name}")
-                        else:
-                            oof_parts.append(f"[{team_tag}]")
-                    if self.config.show_steam_id:
-                        steam_id = (pdata.get("steam_id") or "").strip()
-                        if steam_id:
-                            oof_parts.append(steam_id)
-                    if self.config.oof_show_distance:
-                        d_m = int(d / 100.0)
-                        oof_parts.append(f"{d_m}m")
-                    if self.config.oof_show_health and actor:
-                        health_info = pdata.get("health_info")
-                        if health_info and health_info[0] is not None:
-                            oof_parts.append(f"{int(health_info[0])} HP")
-                    if oof_parts:
-                        _draw_label(painter, int(ex + ux * 14), int(ey + uy * 14),
-                                    " | ".join(oof_parts), QColor(*color))
-                    continue  # skip on-screen rendering for this player
+                    if self.config.dot_esp:
+                        radius = int(self.config.dot_radius * scale)
+                        self._draw_dot(painter, ex, ey, max(2, radius), color)
+                    continue
 
-                # Dot ESP — exact chest projection (no legacy screen nudge)
+                # Dot ESP — chest projection + optional Y offset (SilentJMA base)
                 if self.config.dot_esp:
                     radius = int(self.config.dot_radius * scale)
-                    self._draw_dot(painter, dot_x, dot_y, max(2, radius), color)
+                    self._draw_dot(painter, dsx, dsy, max(2, radius), color)
 
                 # 2D Box ESP
                 rot = pdata.get("rot")
                 hw = self.config.box_height_world / 3.0
-                if self.config.box_esp and not self.config.corner_box:
-                    draw_2d_box(painter, pos, cam, w, h,
+                if self.config.box_esp and not self.config.corner_box and box_pos:
+                    draw_2d_box(painter, box_pos, cam, w, h,
                                 self.config.box_height_world, hw, rot, color, scale)
-                if self.config.corner_box:
-                    draw_corner_box(painter, pos, cam, w, h,
+                if self.config.corner_box and box_pos:
+                    draw_corner_box(painter, box_pos, cam, w, h,
                                     self.config.box_height_world, hw, rot, color, scale)
 
                 # Skeleton ESP — isolated so bone-read failures never affect dot/box/labels
                 if self.config.skeleton_esp and actor and (not is_local or self.config.show_local):
                     try:
                         bones = pdata.get("bones")
+                        if not bones and not self._paint_throttle:
+                            bones = self.esp.get_skeleton_positions(actor)
+                            if not bones:
+                                mesh = self.esp.get_skeletal_mesh(actor)
+                                if mesh:
+                                    bone_data, count, _stride = self.esp._bones_array_info(mesh)
+                                    if bone_data and count:
+                                        idx_map = self.esp._effective_bone_index_map(
+                                            mesh, self.config, count)
+                                        bones = self.esp.get_skeleton_positions_by_indices(
+                                            actor, idx_map)
                         if bones:
                             draw_skeleton(
                                 painter, bones, cam, w, h, self.config.skeleton_color)
@@ -4749,14 +5005,14 @@ class Overlay(QWidget):
                     health_info = pdata.get("health_info")
                     if health_info and health_info[0] is not None:
                         hp, sh = health_info
-                        bar_x = dot_x - 12 * scale
-                        bar_y = dot_y - 20 * scale
+                        bar_x = dsx - 12 * scale
+                        bar_y = dsy - 20 * scale
                         draw_health_bar(painter, bar_x, bar_y, 24 * scale, 4, hp, sh if self.config.shield_bar else None)
 
                 # Snap lines
                 if self.config.snap_lines:
                     painter.setPen(QPen(QColor(*color), 1))
-                    painter.drawLine(int(w / 2), int(h), int(dot_x), int(dot_y))
+                    painter.drawLine(int(w / 2), int(h), int(sx), int(sy))
 
                 # Labels
                 label_parts = []
@@ -4785,22 +5041,22 @@ class Overlay(QWidget):
                     fm = painter.fontMetrics()
                     tw = fm.horizontalAdvance(text)
                     th = fm.height()
-                    label_x = int(dot_x - tw / 2)
-                    label_y = int(dot_y - th - 4)
+                    label_x = int(sx - tw / 2)
+                    label_y = int(sy - th - 4)
                     _draw_label(painter, label_x, label_y, text, QColor(*color))
 
               except Exception:
                 pass  # never let one bad player crash the whole frame
 
             # Player count
-            non_local = [p for p in all_players if not p["is_local"]]
+            non_local = [p for p in all_players if not p.get("is_local")]
             _draw_label(painter, 10, 20, f"Players: {len(non_local)}", QColor(255, 255, 255))
 
             # Radar
             if self.config.radar_enabled and local_pos:
                 radar_x = w - self.config.radar_size - 20
                 radar_y = 20 + self.config.radar_size // 2
-                enemy_list = [p for p in all_players if not p["is_local"]]
+                enemy_list = [p for p in all_players if not p.get("is_local")]
                 for p in enemy_list:
                     is_hunter = p.get("is_hunter")
                     if is_hunter is True:
@@ -4816,21 +5072,41 @@ class Overlay(QWidget):
 
         # Clone / decoy ESP — dot on stomach + owner name (standard ESP colors)
         if self.config.clone_esp:
+            clone_groups = {}
             for cdata in list((snap or {}).get("clones") or []):
                 try:
                     cpos = cdata.get("pos")
-                    if not cpos:
+                    if not cpos or not cam:
                         continue
                     csx, csy, con = w2s(cpos, cam, w, h)
-                    if not con:
+                    if not (math.isfinite(csx) and math.isfinite(csy)):
                         continue
-                    cx, cy = clamp_screen(csx, csy, w, h)
-                    cd = dist(cpos, cam["loc"])
+                    dsx, dsy = clamp_screen(csx, csy, w, h)
+                    dsy += self.config.box_y_offset
+                    owner_name = (cdata.get("owner_name") or "").strip()
+                    owner_name = owner_name.replace(" (clone)", "").strip()
+                    owner_key = cdata.get("owner_actor") or owner_name or cdata.get("actor")
+                    bucket = (owner_key, int(dsx) // 12, int(dsy) // 12)
+                    grp = clone_groups.setdefault(bucket, {
+                        "sx": dsx, "sy": dsy, "count": 0,
+                        "owner_name": owner_name,
+                        "owner_is_hunter": cdata.get("owner_is_hunter"),
+                        "dist": dist(cpos, cam["loc"]),
+                    })
+                    grp["count"] += 1
+                    grp["sx"] = (grp["sx"] * (grp["count"] - 1) + dsx) / grp["count"]
+                    grp["sy"] = (grp["sy"] * (grp["count"] - 1) + dsy) / grp["count"]
+                except Exception:
+                    pass
+            for grp in clone_groups.values():
+                try:
+                    cx, cy = grp["sx"], grp["sy"]
+                    cd = grp["dist"]
                     cscale = 1.0
                     if self.config.distance_scaling and cd > 0:
                         cscale = self.config.scale_reference_dist / cd
                         cscale = max(0.3, min(cscale, 3.0))
-                    owner_is_hunter = cdata.get("owner_is_hunter")
+                    owner_is_hunter = grp.get("owner_is_hunter")
                     if owner_is_hunter is True:
                         color = self.config.hunter_color
                     elif owner_is_hunter is False:
@@ -4839,23 +5115,28 @@ class Overlay(QWidget):
                         color = self.config.enemy_color
                     radius = max(2, int(self.config.dot_radius * cscale))
                     self._draw_dot(painter, cx, cy, radius, color)
-                    owner_name = (cdata.get("owner_name") or "").strip()
+                    owner_name = grp.get("owner_name") or ""
+                    count = int(grp.get("count") or 1)
                     if owner_name:
-                        fm = painter.fontMetrics()
-                        tw = fm.horizontalAdvance(owner_name)
-                        th = fm.height()
-                        _draw_label(
-                            painter,
-                            int(cx - tw / 2),
-                            int(cy - th - 4),
-                            owner_name,
-                            QColor(*color),
-                        )
+                        label = f"{owner_name} (clone)" if count == 1 else f"{owner_name} (clone x{count})"
+                    else:
+                        label = "(clone)" if count == 1 else f"(clone x{count})"
+                    fm = painter.fontMetrics()
+                    tw = fm.horizontalAdvance(label)
+                    th = fm.height()
+                    _draw_label(
+                        painter,
+                        int(cx - tw / 2),
+                        int(cy - th - 4),
+                        label,
+                        QColor(*color),
+                    )
                 except Exception:
                     pass
 
         # FPS counters — effective cap + measured paint rate + in-game FPS
-        target_fps = int(getattr(self, "_target_overlay_fps", 0) or getattr(self.config, "ui_overlay_fps", 60))
+        vsync = bool(getattr(self.config, "ui_overlay_vsync", False))
+        target_fps = self._resolve_target_overlay_fps()
         effective_cap = self._effective_overlay_fps()
         overlay_fps = self._current_fps
         timer_ms = max(1, self.timer.interval())
@@ -4878,9 +5159,14 @@ class Overlay(QWidget):
                 else QColor(255, 80, 80)
             ) if game_fps > 0 else QColor(150, 150, 150)
 
-            cap_note = f" saved:{target_fps}" if effective_cap < target_fps else ""
+            cap_note = ""
+            if vsync:
+                cap_note = " vsync"
+            elif effective_cap < target_fps:
+                cap_note = f" saved:{target_fps}"
             if (
-                self._esp_overlay_active()
+                not vsync
+                and self._esp_overlay_active()
                 and effective_cap < target_fps
                 and not self._menu_is_open()
             ):

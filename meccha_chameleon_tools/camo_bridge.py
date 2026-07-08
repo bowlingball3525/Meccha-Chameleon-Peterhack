@@ -1551,6 +1551,105 @@ class CamoBridgeMixin:
             except Exception:
                 pass
 
+    @staticmethod
+    def _image_quality_to_paint_quality(image_quality):
+        """Map Apply Image quality slider (1–5) to camo paint_quality (1–20)."""
+        q = max(1, min(5, int(image_quality)))
+        return {1: 4, 2: 8, 3: 12, 4: 16, 5: 20}[q]
+
+    @staticmethod
+    def _bgra_to_rgba_bytes(bgra_bytes, opacity=255):
+        scale = max(0, min(255, int(opacity))) / 255.0
+        rgba = bytearray(len(bgra_bytes))
+        for i in range(0, len(bgra_bytes), 4):
+            b = bgra_bytes[i]
+            g = bgra_bytes[i + 1]
+            r = bgra_bytes[i + 2]
+            a = int(bgra_bytes[i + 3] * scale)
+            rgba[i] = r
+            rgba[i + 1] = g
+            rgba[i + 2] = b
+            rgba[i + 3] = a
+        return bytes(rgba)
+
+    def _image_paint_payload(self, pid, rgba_b64, width, height):
+        """mesh_first_paint payload using a user-supplied RGBA image as color source."""
+        cfg = getattr(self, "config", None)
+        image_q = getattr(cfg, "image_quality", 3) if cfg else 3
+        tuning = self._quality_to_mesh_first_tuning(self._image_quality_to_paint_quality(image_q))
+        payload = self._paint_payload(pid)
+        for key in (
+            "stroke_size_texels",
+            "coverage_step_texels",
+            "side_source_max_uv",
+            "front_back_source_max_uv",
+            "server_batch_delay_ms",
+        ):
+            payload[key] = tuning[key]
+            payload.setdefault("tuning", {})[key] = tuning[key]
+        payload["route"] = "image_mesh_first_paint"
+        payload["paint_source"] = "user_image"
+        payload["source_image_rgba_b64"] = rgba_b64
+        payload["source_image_width"] = int(width)
+        payload["source_image_height"] = int(height)
+        return payload
+
+    def image_apply_bgra(self, bgra_bytes, width, height, opacity=255):
+        """Apply a user image via the same mesh_first_paint bridge route as camouflage."""
+        import base64
+
+        if not getattr(self, "pm", None) or not self.pm:
+            print("[PAINT] no pymem handle", flush=True)
+            return False
+        if not bgra_bytes or width <= 0 or height <= 0:
+            print("[PAINT] invalid image buffer", flush=True)
+            return False
+
+        self._camo_abort = False
+        self._bridge_port = None
+        try:
+            pid = self.pm.process_id
+            if not pid:
+                return False
+            if not self._ensure_bridge(force=True):
+                return False
+
+            rgba = self._bgra_to_rgba_bytes(bgra_bytes, opacity=opacity)
+            rgba_b64 = base64.b64encode(rgba).decode("ascii")
+            cfg = getattr(self, "config", None)
+            image_q = getattr(cfg, "image_quality", 3) if cfg else 3
+            print(
+                f"[PAINT] pid={pid} route=mesh_first_paint source=user_image "
+                f"{width}x{height} image_quality={image_q}",
+                flush=True,
+            )
+            payload = self._image_paint_payload(pid, rgba_b64, width, height)
+            resp = self._bridge_request(
+                "paint_full_route",
+                payload,
+                timeout=self.CAMO_PAINT_ROUTE_TIMEOUT,
+            )
+            print(f"[PAINT] image apply response={resp}", flush=True)
+            if not resp or not resp.get("success", False):
+                err = resp.get("message") or resp.get("stage") if resp else "no response"
+                self._camo_last_error = f"Image apply failed: {err}"
+                print(f"[PAINT] {self._camo_last_error}", flush=True)
+                self._finalize_camo_paint()
+                return False
+            self._finalize_camo_paint()
+            print("[PAINT] image apply complete", flush=True)
+            return True
+        except Exception as exc:
+            import traceback
+
+            print(f"[PAINT] image apply exception: {exc}", flush=True)
+            traceback.print_exc()
+            try:
+                self._finalize_camo_paint()
+            except Exception:
+                pass
+            return False
+
     def camo_apply(self, r=None, g=None, b=None, a=None, full_wrap=True):
         """Environment camo via official mesh_first_paint (single bridge call)."""
         del r, g, b, a, full_wrap
@@ -1649,6 +1748,45 @@ class CamoBridgeMixin:
         ok = bool(resp and resp.get("success"))
         print(f"[CAMO] kill {'ok' if ok else 'failed'}: {resp}", flush=True)
         return ok
+
+    def bridge_kill_survivor(self, target_pawn, endpoint=None):
+        """Kill one survivor on the game thread (chameleonEsp-style KillPlayer RPC)."""
+        payload = {"target_pawn": int(target_pawn)}
+        if endpoint and len(endpoint) >= 3:
+            payload["target_x"] = float(endpoint[0])
+            payload["target_y"] = float(endpoint[1])
+            payload["target_z"] = float(endpoint[2])
+        resp = self._bridge_request("kill_survivor", payload, timeout=15)
+        return resp if resp and resp.get("success") else None
+
+    def bridge_magnet_tick(self, active=True):
+        """Pull survivors in front of the hunter pawn (game-thread magnet_tick)."""
+        resp = self._bridge_request("magnet_tick", {"active": bool(active)}, timeout=8)
+        return resp if resp and resp.get("success") else None
+
+    def bridge_kill_all_survivors(self):
+        """Seed and drain the bridge kill-all queue (one kill per game-thread tick)."""
+        seed = self._bridge_request("kill_all_survivors", {"seed": True}, timeout=15)
+        if not seed or not seed.get("success"):
+            return seed
+        meta = seed.get("metadata") or {}
+        remaining = int(meta.get("seeded") or meta.get("remaining") or 0)
+        killed = 0
+        last = seed
+        for _ in range(max(remaining + 4, 32)):
+            last = self._bridge_request("kill_all_survivors", {}, timeout=15)
+            if not last:
+                break
+            tick_meta = last.get("metadata") or {}
+            if last.get("success") and int(tick_meta.get("killed_this_tick") or 0):
+                killed += 1
+            if int(tick_meta.get("remaining") or 0) <= 0:
+                break
+        if last is not None:
+            last = dict(last)
+            last.setdefault("metadata", {})
+            last["metadata"]["killed_total"] = killed
+        return last
 
     def bridge_set_anti_kick(self, enabled=True):
         """Enable/disable in-game kick RPC blocking via bridge ProcessEvent hook."""

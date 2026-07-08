@@ -1468,7 +1468,7 @@ namespace
         if (!function)
         {
             return "";
-        }
+            }
         return paint_probe_property_schema(ref, function, 24);
     }
 
@@ -1583,7 +1583,7 @@ namespace
     }
 
     auto paint_replication_function_probe_metadata(Reflection& ref,
-                                                   std::uintptr_t object,
+                                     std::uintptr_t object,
                                                    const char* prefix,
                                                    const std::vector<const char*>& function_names) -> std::string
     {
@@ -2407,19 +2407,19 @@ namespace
         };
         auto resolve_target = []() -> HookTarget {
             HookTarget target{};
-            EnumWindows(
-                [](HWND hwnd, LPARAM lparam) -> BOOL {
-                    DWORD owner_pid = 0;
-                    const DWORD tid = GetWindowThreadProcessId(hwnd, &owner_pid);
-                    if (owner_pid == GetCurrentProcessId() && tid != 0 && IsWindowVisible(hwnd))
-                    {
+        EnumWindows(
+            [](HWND hwnd, LPARAM lparam) -> BOOL {
+                DWORD owner_pid = 0;
+                const DWORD tid = GetWindowThreadProcessId(hwnd, &owner_pid);
+                if (owner_pid == GetCurrentProcessId() && tid != 0 && IsWindowVisible(hwnd))
+                {
                         auto* out = reinterpret_cast<HookTarget*>(lparam);
                         out->thread_id = tid;
                         out->hwnd = hwnd;
-                        return FALSE;
-                    }
-                    return TRUE;
-                },
+                    return FALSE;
+                }
+                return TRUE;
+            },
                 reinterpret_cast<LPARAM>(&target));
             return target;
         };
@@ -4335,6 +4335,12 @@ namespace
                                   const SdkNativeFrontSampleResult& native_front,
                                   int target_width,
                                   int target_height) -> SdkFrontCaptureResult;
+    auto sdk_capture_front_from_user_image(Reflection& ref,
+                                           const SdkContext& ctx,
+                                           const SdkNativeFrontSampleResult& native_front,
+                                           const std::string& rgba_b64,
+                                           int image_width,
+                                           int image_height) -> SdkFrontCaptureResult;
     auto sdk_capture_metadata(const SdkFrontCaptureResult& capture) -> std::string;
     auto sdk_srgb_to_linear_unit(double value) -> double;
     auto sdk_make_channel(double r,
@@ -9972,7 +9978,19 @@ namespace
                                   0.0,
                                   "\"source_samples\":" + std::to_string(native_front.samples.size()));
             const auto capture_started = std::chrono::steady_clock::now();
-            capture = sdk_capture_front_colors(ref, ctx, native_front, capture_request_width, capture_request_height);
+            const std::string user_image_b64 = json_string_field(request, "source_image_rgba_b64");
+            const int user_image_width = json_int_field(request, "source_image_width", 0, 0, 4096);
+            const int user_image_height = json_int_field(request, "source_image_height", 0, 0, 4096);
+            if (!user_image_b64.empty() && user_image_width > 0 && user_image_height > 0)
+            {
+                capture = sdk_capture_front_from_user_image(
+                    ref, ctx, native_front, user_image_b64, user_image_width, user_image_height);
+                metadata += ",\"mesh_source_model\":\"user_image_projection\"";
+            }
+            else
+            {
+                capture = sdk_capture_front_colors(ref, ctx, native_front, capture_request_width, capture_request_height);
+            }
             const auto capture_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - capture_started).count();
             metadata += sdk_capture_metadata(capture);
             metadata += ",\"mesh_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
@@ -12333,12 +12351,12 @@ namespace
     }
 
     auto sdk_make_packed_paint_data(const std::vector<sdk::FPaintStroke>& strokes,
-                                    std::size_t offset,
-                                    std::size_t count,
+                                     std::size_t offset,
+                                     std::size_t count,
                                     const sdk::FGuid& source_id,
                                     int texture_size,
                                     std::vector<std::uint8_t>& packed,
-                                    std::string& failure) -> bool
+                                     std::string& failure) -> bool
     {
         if (offset > strokes.size() || count > strokes.size() - offset || count <= 0)
         {
@@ -12365,7 +12383,7 @@ namespace
             {
                 failure = "packed_paint_requires_skeletal_triangle_anchor index=" + std::to_string(offset + i);
                 packed.clear();
-                return false;
+            return false;
             }
             sdk_append_i32_le(packed, stroke.SkeletalTriangleIndex);
             sdk_append_u16_le(packed, sdk_unit_to_u16(stroke.SkeletalTriangleBarycentric.X));
@@ -13693,6 +13711,8 @@ namespace
 
     constexpr bool kEnableNativeSceneCaptureForF10 = true;
 
+#include "bridge_image_capture.inc"
+
     auto sdk_capture_front_colors(Reflection& ref,
                                   const SdkContext& ctx,
                                   const SdkNativeFrontSampleResult& native_front,
@@ -14560,10 +14580,10 @@ namespace
         if (!ref.init(failure))
         {
             return response_json(false,
-                                 "sdk_update_required",
-                                 0,
-                                 1,
-                                 failure.empty() ? "SDK reflection init failed" : failure,
+                                                         "sdk_update_required",
+                                                         0,
+                                                         1,
+                                                         failure.empty() ? "SDK reflection init failed" : failure,
                                  "\"route\":\"paint_packed_replay_probe\",\"sdk_resolution_exception\":true");
         }
 
@@ -14575,10 +14595,10 @@ namespace
         catch (const SdkResolutionException& ex)
         {
             return response_json(false,
-                                 ex.stage.c_str(),
-                                 0,
-                                 1,
-                                 ex.what(),
+                                                         ex.stage.c_str(),
+                                                         0,
+                                                         1,
+                                                         ex.what(),
                                  "\"route\":\"paint_packed_replay_probe\",\"sdk_resolution_exception\":true");
         }
         if (!ctx.ok)
@@ -14661,14 +14681,14 @@ namespace
         tick_mesh_first_batch_async_job();
 
         std::vector<std::shared_ptr<QueuedPaintJob>> jobs{};
-        {
-            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            {
+                std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
             jobs.swap(g_paint_jobs);
         }
         for (const auto& job : jobs)
         {
-            if (!job)
-            {
+        if (!job)
+        {
                 continue;
             }
             if (is_paint_packed_replay_probe_request(job->request))
@@ -14706,13 +14726,13 @@ namespace
         if (anti_kick_should_block(object, function, params))
         {
             g_active_hook_callbacks.fetch_sub(1);
-            return;
-        }
+                    return;
+                }
         if (god_mode_should_block(object, function))
         {
             g_active_hook_callbacks.fetch_sub(1);
-            return;
-        }
+                    return;
+                }
         const auto original = g_original_process_event.load();
         (void)object;
         if (function && params)
@@ -14880,7 +14900,7 @@ namespace
         }
         if (line.find("\"type\":\"capabilities\"") != std::string::npos)
         {
-            std::string commands = "[\"ping\",\"capabilities\",\"paint_full_route\",\"paint_replication_probe\",\"paint_replication_pressure_probe\",\"paint_packed_replay_probe\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"rotate\",\"set_anti_kick\",\"set_god_mode\",\"get_skeleton\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\",\"set_netconn_watch\",\"dump_netconn_vtable\"]";
+            std::string commands = "[\"ping\",\"capabilities\",\"paint_full_route\",\"paint_replication_probe\",\"paint_replication_pressure_probe\",\"paint_packed_replay_probe\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"kill_survivor\",\"kill_all_survivors\",\"magnet_tick\",\"rotate\",\"set_anti_kick\",\"set_god_mode\",\"get_skeleton\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\",\"set_netconn_watch\",\"dump_netconn_vtable\"]";
             return std::string("{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,") +
                    "\"message\":\"ok\",\"timing_ms\":{}," +
                    "\"metadata\":{\"commands\":" + commands + "," +
@@ -14923,7 +14943,7 @@ namespace
             uninstall_process_event_inline_hook();
             uninstall_process_event_hook();
             g_running.store(false);
-            return response_json(true,
+        return response_json(true,
                                  "shutdown",
                                  0,
                                  0,
@@ -14950,6 +14970,18 @@ namespace
             return execute_game_command_on_game_thread(line);
         }
         if (line.find("\"type\":\"kill\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"kill_survivor\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"kill_all_survivors\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"magnet_tick\"") != std::string::npos)
         {
             return execute_game_command_on_game_thread(line);
         }
@@ -15313,8 +15345,8 @@ namespace
         g_bridge_state.store(MC_BRIDGE_STOPPING);
         force_cancel_active_mesh_first_batch_job("loader_stop");
         cancel_queued_paint_jobs("loader_stop");
-        uninstall_process_event_hook();
-        g_running.store(false);
+            uninstall_process_event_hook();
+            g_running.store(false);
         return MC_OK;
     }
 

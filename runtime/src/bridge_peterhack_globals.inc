@@ -32,7 +32,7 @@
     bool g_anti_kick_vtable_hook_installed{false};
     std::atomic<bool> g_anti_kick_enabled{false};
 
-    // God mode (MechaSRC port) — block Damage/DeathPlayer/KillPlayer on local pawn.
+    // God mode (MechaSRC port) — block Damage/DeathPlayer on local pawn.
     constexpr std::size_t GodModeMaxBlockedFunctions = 8;
     std::atomic<bool> g_god_mode_enabled{false};
     std::atomic<std::uintptr_t> g_god_mode_local_pawn{0};
@@ -165,3 +165,7 @@
     std::mutex g_game_cmd_mutex;
     std::condition_variable g_game_cmd_cv;
     std::vector<std::shared_ptr<QueuedGameCommand>> g_game_cmds;
+
+    // Kill-all queue (chameleonEsp: one survivor per game-thread tick).
+    std::mutex g_kill_all_mutex;
+    std::vector<std::uintptr_t> g_kill_all_queue;
