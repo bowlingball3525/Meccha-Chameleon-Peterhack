@@ -16,8 +16,8 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 
 | | |
 |---|---|
-| **Version (Git)** | `ecb4120` |
-| **Full SHA** | `ecb4120343e9e91e3c874a031965f88da77324a3` |
+| **Version (Git)** | `1c21d60` |
+| **Full SHA** | `1c21d60d135d7a23bd3d364eafe0dd6b2c47c234` |
 | **Branch** | `main` |
 | **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,540,608 bytes |
 | **Paint pipeline** | Official `mesh_first_paint` (SilentJMA v1.6+ route) |
@@ -278,7 +278,7 @@ pip install -r requirements.txt
 4. **CAMOUFLAGE** — set quality, **Paint Now** or **F10**.
 5. **EXPLOITS** — enable anti-kick after spawn; check `anti_kick.log` if disconnected.
 
-**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `ecb4120` or newer).
+**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `1c21d60` or newer).
 
 ---
 
@@ -317,10 +317,10 @@ On launch, Peterhack can check GitHub `main` and apply updates, then restart.
 |---|---|
 | `failed to communicate with bridge DLL` | Run as Admin; be in a match; check `latest.log` |
 | `mesh_profile_missing` | Ensure `bridge/mesh-profiles/` exists next to the DLL |
-| ESP shows only clones | Update to `5be0aaf`+ (features from `fff8094`) |
+| ESP shows only clones | Update to `ecb4120`+ (features from `fff8094`) |
 | ESP missing players | Turn off team filter to test; check `[ESP] discovery` in log with debug ESP logging |
 | ESP shows dead bodies | Ragdoll latch should hide corpses; report if they linger after elimination |
-| `RecursionError` in log | Fixed in `fff8094` — pull `5be0aaf`+ and restart |
+| `RecursionError` in log | Fixed in `fff8094` — pull `ecb4120`+ and restart |
 | Anti-kick log is huge | `[capture-session]` lines are diagnostics, not errors; bridge filters noise in latest build |
 | Anti-kick enabled but kicked | Check `anti_kick.log` for `[capture-kick]`; EOS may bypass UE RPCs |
 | Magnet does nothing | Must be hunter; press **G** to toggle ON |
