@@ -16,11 +16,12 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 
 | | |
 |---|---|
-| **Version (Git)** | `fff8094` |
-| **Full SHA** | `fff8094202f774242c6b8ae756de79d33b638f97` |
+| **Version (Git)** | `78da238` |
+| **Full SHA** | `78da238ef7fa3a8ed28b28db80c9137d37dee934` |
 | **Branch** | `main` |
 | **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,540,608 bytes |
 | **Paint pipeline** | Official `mesh_first_paint` (SilentJMA v1.6+ route) |
+| **Code base** | ESP/dead-filter/bridge fixes from `fff8094` + this README |
 
 The in-app **CHANGELOG** tab shows the same short SHA from the `VERSION` file. Auto-update pulls from [GitHub main](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack).
 
@@ -277,7 +278,7 @@ pip install -r requirements.txt
 4. **CAMOUFLAGE** — set quality, **Paint Now** or **F10**.
 5. **EXPLOITS** — enable anti-kick after spawn; check `anti_kick.log` if disconnected.
 
-**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `fff8094` or newer).
+**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `78da238` or newer).
 
 ---
 
@@ -316,10 +317,10 @@ On launch, Peterhack can check GitHub `main` and apply updates, then restart.
 |---|---|
 | `failed to communicate with bridge DLL` | Run as Admin; be in a match; check `latest.log` |
 | `mesh_profile_missing` | Ensure `bridge/mesh-profiles/` exists next to the DLL |
-| ESP shows only clones | Update to `fff8094+` — fixes false dead elimination / recursion bugs |
+| ESP shows only clones | Update to `78da238`+ — fixes false dead elimination / recursion bugs |
 | ESP missing players | Turn off team filter to test; check `[ESP] discovery` in log with debug ESP logging |
 | ESP shows dead bodies | Ragdoll latch should hide corpses; report if they linger after elimination |
-| `RecursionError` in log | Fixed in `fff8094` — restart Peterhack after update |
+| `RecursionError` in log | Fixed in `fff8094` / `78da238` — restart Peterhack after update |
 | Anti-kick log is huge | `[capture-session]` lines are diagnostics, not errors; bridge filters noise in latest build |
 | Anti-kick enabled but kicked | Check `anti_kick.log` for `[capture-kick]`; EOS may bypass UE RPCs |
 | Magnet does nothing | Must be hunter; press **G** to toggle ON |
