@@ -9302,7 +9302,6 @@ namespace
         const bool preview_only = json_bool_field(request, "preview_only", false);
         const bool unpreview_only = json_bool_field(request, "unpreview_only", false);
         const bool normal_paint_requires_packed = !preview_only && !unpreview_only;
-        const int packed_server_batch_limit = PackedReplicationBatchSize;
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
         const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 9.0), 1.0, 12.0);
         const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 9.0), 1.0, 12.0);
@@ -9320,6 +9319,7 @@ namespace
             json_bool_field(request, "replication_pacing_enabled", json_bool_field(request, "adaptive_batch_enabled", true));
         const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", PackedReplicationDefaultBatchLimit, 1, PackedReplicationMaxBatchLimit);
         const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", PackedReplicationDefaultPacingMs, 50, 100);
+        const int packed_server_batch_limit = std::clamp(tuning_server_batch_limit, 1, PackedReplicationMaxBatchLimit);
         const int packed_server_batch_seed_delay_ms = tuning_server_batch_delay_ms;
         const std::string requested_server_batch_rpc = json_string_field(request, "server_batch_rpc", "");
         const std::string requested_server_batch_rpc_normalized = lower_copy(requested_server_batch_rpc);
@@ -10390,7 +10390,9 @@ namespace
         metadata += ",\"planner_strokes_back\":" + std::to_string(replay_back);
         metadata += ",\"planner_strokes_total\":" + std::to_string(strokes.size());
         const int effective_replay_server_batch_limit =
-            normal_paint_requires_packed ? packed_server_batch_limit : tuning_server_batch_limit;
+            normal_paint_requires_packed
+                ? std::clamp(tuning_server_batch_limit, 1, PackedReplicationMaxBatchLimit)
+                : tuning_server_batch_limit;
         const int effective_server_batch_delay_ms =
             normal_paint_requires_packed ? packed_server_batch_seed_delay_ms
                                          : std::max(PackedReplicationMinPacingMs, tuning_server_batch_delay_ms);
@@ -10462,9 +10464,9 @@ namespace
         metadata += ",\"server_packed_source_id_offset\":\"" + hex_address(RuntimePaintableComponentPackedSourceIdOffset) + "\"";
         metadata += ",\"server_packed_source_id_available\":" + std::string(json_bool(packed_source_id_available));
         metadata += ",\"server_packed_source_id_failure\":\"" + json_escape(packed_source_id_failure) + "\"";
-        metadata += ",\"server_packed_batch_limit_cap\":" + std::to_string(PackedReplicationBatchSize);
+        metadata += ",\"server_packed_batch_limit_cap\":" + std::to_string(PackedReplicationMaxBatchLimit);
         metadata += ",\"server_batch_limit_requested\":" + std::to_string(tuning_server_batch_limit);
-        metadata += ",\"server_batch_limit_ignored_for_packed\":" + std::string(json_bool(normal_paint_requires_packed));
+        metadata += ",\"server_batch_limit_ignored_for_packed\":" + std::string(json_bool(false));
         metadata += ",\"server_batch_limit_effective\":" + std::to_string(effective_replay_server_batch_limit);
         metadata += ",\"server_packed_paint_batch_ignored\":\"" + json_escape(packed_ignored_reason) + "\"";
         if (normal_paint_requires_packed && !packed_component_available)
@@ -11436,7 +11438,9 @@ namespace
             {
                 job->server_batch_elapsed_ms = elapsed_ms();
             }
-            finish_done();
+            // Push full texture to the server after all stroke batches so other
+            // players see the camo — local_visual_sync only updates this client.
+            begin_server_texture_sync();
             return;
         }
 
@@ -11781,12 +11785,12 @@ namespace
             post_next_after(job->server_batch_delay_ms);
             return;
         }
-        if (job->local_visual_sync_enabled)
+        if (job->server_batch_elapsed_ms < 0.0)
         {
-            finish_done();
-            return;
+            job->server_batch_elapsed_ms = elapsed_ms();
         }
-        finish_done();
+        begin_server_texture_sync();
+        return;
     }
 
     auto sdk_find_front_mesh(Reflection& ref, const SdkContext& ctx) -> std::uintptr_t

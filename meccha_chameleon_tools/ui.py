@@ -1130,6 +1130,12 @@ class Menu(QWidget):
             if hasattr(self.esp, "_magnet_key_was_down"):
                 self.esp._magnet_key_was_down = down
             return
+        if not getattr(self.config, "exploits_magnet_enabled", False):
+            vk = vk_from_name(getattr(self.config, "exploits_magnet_key", "G"))
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+            if hasattr(self.esp, "_magnet_key_was_down"):
+                self.esp._magnet_key_was_down = down
+            return
         vk = vk_from_name(getattr(self.config, "exploits_magnet_key", "G"))
         down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
         was_down = bool(getattr(self.esp, "_magnet_key_was_down", False))
@@ -2133,6 +2139,26 @@ class Menu(QWidget):
         dr.addWidget(self.spn_decoy_count)
         lo.addLayout(dr)
 
+        cb_magnet_enable = self._chk("Enable Magnet (Hunter)", "exploits_magnet_enabled")
+        cb_magnet_enable.setToolTip(
+            "Master switch — magnet hotkey and the toggle button do nothing until this is checked.\n"
+            "Prevents accidentally pulling the whole lobby when you are host."
+        )
+        cb_magnet_enable.stateChanged.connect(lambda _s: self._on_magnet_enable_changed())
+        lo.addWidget(cb_magnet_enable)
+        self.cb_magnet_enable = cb_magnet_enable
+
+        magnet_toggle_row = QHBoxLayout()
+        self.btn_magnet_toggle = self._mk_btn("Magnet: OFF")
+        self.btn_magnet_toggle.setCheckable(True)
+        self.btn_magnet_toggle.setToolTip(
+            "Toggle survivor magnet ON/OFF (hunter only). Requires Enable Magnet above.\n"
+            "When ON, survivors are pulled along your view — dangerous as host in a lobby."
+        )
+        self.btn_magnet_toggle.toggled.connect(self._on_magnet_toggle_button)
+        magnet_toggle_row.addWidget(self.btn_magnet_toggle)
+        lo.addLayout(magnet_toggle_row)
+
         magnet_row = QHBoxLayout()
         self.lbl_magnet_key = QLabel(
             f"{self._t('Magnet toggle key')}: {getattr(self.config, 'exploits_magnet_key', 'G')}"
@@ -2151,6 +2177,7 @@ class Menu(QWidget):
         self._i18n_bind_refresh(self._update_magnet_status_label)
         self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
         lo.addWidget(self.lbl_magnet_status)
+        self._update_magnet_status_label()
 
         lo.addWidget(self._chk("Anti-Clipping (noclip)", "exploits_anti_clipping"))
         cb_anti_kick = self._chk("Anti-Kick", "exploits_anti_kick")
@@ -2842,6 +2869,22 @@ class Menu(QWidget):
             "  + Run scripts/extract_dump_offsets.py --apply after future dumps.\n"
             "\n"
             "--- Latest ---\n"
+            "\n"
+            "[Camo — replication to other players]\n"
+            "  + After server stroke batches finish, bridge calls RequestFullTextureSync\n"
+            "    so other players see full camo (not just slow stroke trickle).\n"
+            "  + Faster replication: 50 strokes/batch, 50 ms pacing (was 20 / 80 ms).\n"
+            "  + Log shows [CAMO] server replication X.Xs texture_sync=ok when peers should\n"
+            "    see you fully painted.\n"
+            "\n"
+            "[Magnet — safety switch]\n"
+            "  + Enable Magnet (Hunter) master checkbox (default OFF).\n"
+            "  + Hotkey G and Magnet button do nothing until master switch is ON.\n"
+            "\n"
+            "[Stability — game-thread RPCs + ESP dead filter]\n"
+            "  + Exploit RPCs (rename, kill, decoy count, teleport) run on game thread.\n"
+            "  + GUObjectArray liveness check before ProcessEvent (prevents lobby→match crash).\n"
+            "  + ESP ragdoll hide is recoverable — knocked-down survivors reappear.\n"
             "\n"
             "[ESP alignment + skeleton]\n"
             "  + Dot ESP anchored at chest; skeleton uses Chameleon bone map.\n"
@@ -3567,18 +3610,59 @@ class Menu(QWidget):
     def _update_magnet_status_label(self):
         if not hasattr(self, "lbl_magnet_status"):
             return
+        enabled = getattr(self.config, "exploits_magnet_enabled", False)
         active = getattr(self.esp, "_magnet_active", False)
         key = getattr(self.config, "exploits_magnet_key", "G")
+        if hasattr(self, "btn_magnet_toggle"):
+            self.btn_magnet_toggle.blockSignals(True)
+            self.btn_magnet_toggle.setChecked(active)
+            self.btn_magnet_toggle.setEnabled(enabled)
+            if active:
+                self.btn_magnet_toggle.setText(self._t("Magnet: ON"))
+                self.btn_magnet_toggle.setStyleSheet(
+                    "QPushButton { background-color: #8b2020; color: #fff; font-weight: bold; }"
+                    "QPushButton:checked { background-color: #c03030; }"
+                )
+            else:
+                self.btn_magnet_toggle.setText(self._t("Magnet: OFF"))
+                self.btn_magnet_toggle.setStyleSheet("")
+        if not enabled:
+            self.lbl_magnet_status.setText(
+                self._t("Magnet disabled — check Enable Magnet to arm hotkey / button")
+            )
+            self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
+            return
         if active:
             self.lbl_magnet_status.setText(
-                f"{self._t('Magnet: ON')} — {self._t('press')} {key} {self._t('to disable')}"
+                f"{self._t('Magnet: ON')} — {self._t('press')} {key} {self._t('or click button to disable')}"
             )
             self.lbl_magnet_status.setStyleSheet("color: #ff6666; font-size: 10px; font-weight: bold;")
         else:
             self.lbl_magnet_status.setText(
-                f"{self._t('Magnet: OFF')} — {self._t('press')} {key} {self._t('to toggle (hunter)')}"
+                f"{self._t('Magnet: OFF')} — {self._t('click button or press')} {key} {self._t('to toggle (hunter)')}"
             )
             self.lbl_magnet_status.setStyleSheet("color: #888; font-size: 10px;")
+
+    def _on_magnet_enable_changed(self):
+        if not getattr(self.config, "exploits_magnet_enabled", False):
+            if hasattr(self.esp, "set_magnet_active"):
+                self.esp.set_magnet_active(False, self.config)
+            elif hasattr(self.esp, "_magnet_active"):
+                self.esp._magnet_active = False
+        self._update_magnet_status_label()
+
+    def _on_magnet_toggle_button(self, checked):
+        if not getattr(self.config, "exploits_magnet_enabled", False):
+            self.btn_magnet_toggle.blockSignals(True)
+            self.btn_magnet_toggle.setChecked(False)
+            self.btn_magnet_toggle.blockSignals(False)
+            return
+        if hasattr(self.esp, "set_magnet_active"):
+            self.esp.set_magnet_active(checked, self.config)
+        elif hasattr(self.esp, "toggle_magnet"):
+            if bool(getattr(self.esp, "_magnet_active", False)) != checked:
+                self.esp.toggle_magnet(self.config)
+        self._update_magnet_status_label()
 
     def _on_update_check_failed(self, message):
         QMessageBox.warning(self, "Update failed", message)

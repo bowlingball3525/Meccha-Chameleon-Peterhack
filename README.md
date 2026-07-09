@@ -16,12 +16,11 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 
 | | |
 |---|---|
-| **Version (Git)** | `2878d67` |
-| **Full SHA** | `2878d67b808eed921a6f65588d941b6e5963ca8e` |
+| **Version (Git)** | *(see `VERSION` / CHANGELOG tab after pull)* |
 | **Branch** | `main` |
-| **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,544,704 bytes |
+| **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,545,216 bytes |
 | **Paint pipeline** | Official `mesh_first_paint` (SilentJMA v1.6+ route) |
-| **Feature commit** | ESP/dead-filter/bridge fixes in `fff8094` |
+| **Recent fixes** | Camo replication to other players; magnet master arm switch; game-thread RPCs + recoverable ESP dead filter (`23e5267`+) |
 
 The in-app **CHANGELOG** tab shows the same short SHA from the `VERSION` file. Auto-update pulls from [GitHub main](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack). After `git pull`, `VERSION` should match the table below.
 
@@ -73,6 +72,7 @@ Peterhack classifies your local client (`in_match`, `freecam`, `spectating`, `un
 The injected DLL exposes a **TCP JSON API** on port **47654**. Python sends commands; the DLL runs game-thread work (paint, teleport, rename, decoy count, anti-kick hooks, skeleton batch reads).
 
 - **Environment camo** — `mesh_first_paint` pipeline with quality tuning 1–20 and `bridge/mesh-profiles/`.
+- **Camo replication** — Local **visual sync** paints you fully on your screen immediately. Stroke batches replicate to the server (50 strokes/batch, ~50 ms pacing). After all batches finish, the bridge calls **`RequestFullTextureSync`** / **`ServerRequestTextureSync`** so other players receive the full texture — not just the slow stroke trickle.
 - **Custom image paint** — Same `mesh_first_paint` route with a user RGBA buffer (wrap modes: projector / centered).
 - **Anti-kick** — Vtable `ProcessEvent` hooks on local PlayerController / PlayerState / NetConnection; blocks kick and return-to-menu RPCs.
 - **Skeleton ESP** — `get_skeleton` batch reads bone world positions when skeleton overlay is enabled.
@@ -173,7 +173,7 @@ Applied on the exploits tick when toggled (~20 Hz, paused when `unpossessed`). P
 | **Infinite Bullets** | memory | `InfinityBullet` flag (hunter) |
 | **Anti-Clipping** | memory | Disables body mesh + capsule collision |
 | **God Mode (Survivor)** | bridge | Blocks damage/death RPCs + scrubs local dead flags |
-| **Magnet** | bridge | **G** toggle — pulls survivors along view (hunter), `magnet_tick` |
+| **Magnet** | bridge | **Enable Magnet (Hunter)** master switch (default OFF) + **G** toggle / UI button — pulls survivors along view (hunter), `magnet_tick` |
 | **Set Decoy Num** | bridge | Max decoy spawn count via `set_decoy_num` (game-thread RPC) |
 | **Anti-Kick** | bridge | Vtable hooks (see below) |
 | **Auto-Rename / Rename** | bridge | `set_player_name` on game thread |
@@ -226,12 +226,16 @@ Shipped binaries live in **`bridge/`** (DLL, injector, **`mesh-profiles/`**).
 
 **Paint Now** or **F10** starts the official mesh-first paint pipeline over TCP.
 
+After paint completes, check `latest.log` for `[CAMO] server replication X.Xs texture_sync=ok` — `texture_sync=ok` means other players should see your full camo (not just partial stroke replication).
+
 | Control | Description |
 |---|---|
 | **Quality 1–20** | Stroke density / sharpness (20 = extreme, slower) |
 | **Disable front pass** | Flat maps only |
 | **Back pass only** | Spine/rear orbit |
 | **Stop (F9)** | `cancel_paint` |
+
+**Replication timing:** At quality 12, expect ~15–25 s for server stroke batches plus texture sync. You look fully painted locally right away; others catch up once batches + sync finish. Painting after the match starts (not lobby-only) gives the most reliable visibility to other players.
 
 Default orbit: front → left → right → back → head/shoulders → inner legs.
 
@@ -256,7 +260,7 @@ Image quality 1–5, opacity slider, UV test presets, save/load.
 | **F10** | Apply environment camouflage |
 | **F9** | Stop / cancel camouflage |
 | **MB5** (default) | Aimbot hold |
-| **G** (default) | Toggle survivor magnet (hunter) |
+| **G** (default) | Toggle survivor magnet (hunter) — requires **Enable Magnet** in EXPLOITS |
 | **Enter** (rename field) | Queue manual rename |
 
 Drag the menu title bar to reposition.
@@ -285,7 +289,7 @@ pip install -r requirements.txt
 2. Run **`Peterhack.bat`** (self-elevates to Administrator).
 3. Configure ESP/exploits in the menu; toggle **ESP** in the bottom bar.
 4. **CAMOUFLAGE** — set quality, **Paint Now** or **F10**.
-5. **EXPLOITS** — enable anti-kick after spawn; check `anti_kick.log` if disconnected.
+5. **EXPLOITS** — check **Enable Magnet (Hunter)** before using **G**; enable anti-kick after spawn; check `anti_kick.log` if disconnected.
 
 **Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `2878d67` or newer).
 
@@ -326,15 +330,17 @@ On launch, Peterhack can check GitHub `main` and apply updates, then restart.
 |---|---|
 | `failed to communicate with bridge DLL` | Run as Admin; be in a match; check `latest.log` |
 | `mesh_profile_missing` | Ensure `bridge/mesh-profiles/` exists next to the DLL |
-| ESP shows only clones | Update to `2878d67`+ (features from `fff8094`) |
+| ESP shows only clones | Pull latest `main` (ESP discovery fixes from `fff8094`+) |
 | ESP missing players | Turn off team filter to test; check `[ESP] discovery` in log with debug ESP logging |
 | ESP forgets / loses survivors | Fixed — ragdoll physics is now a recoverable hide, not a match-long latch; knocked-down survivors reappear when they get up |
 | ESP shows dead bodies | Corpses ragdoll continuously and stay hidden; a genuine corpse may briefly show for ~1.25 s before hiding |
 | Game crashes — *"Pure virtual function being called"* | Fixed — exploit RPCs run on the game thread via the bridge and validate objects against `GUObjectArray`; rebuild/replace `bridge/meccha-xenos-bridge.dll` |
-| `RecursionError` in log | Fixed in `fff8094` — pull `2878d67`+ and restart |
+| Camo looks full for me but not others | Fixed — bridge now runs server texture sync after stroke batches; pull latest + replace DLL; wait for `texture_sync=ok` in log |
+| Camo others see partial paint until hunter spawns | Same fix — old builds skipped `RequestFullTextureSync` after batches; update bridge DLL |
+| `RecursionError` in log | Fixed in `fff8094` — pull latest and restart |
 | Anti-kick log is huge | `[capture-session]` lines are diagnostics, not errors; bridge filters noise in latest build |
 | Anti-kick enabled but kicked | Check `anti_kick.log` for `[capture-kick]`; EOS may bypass UE RPCs |
-| Magnet does nothing | Must be hunter; press **G** to toggle ON |
+| Magnet does nothing | Check **Enable Magnet (Hunter)** in EXPLOITS; must be hunter; press **G** or use Magnet button to toggle ON |
 | Bridge inject OK but no TCP | Use committed `bridge/meccha-xenos-bridge.dll`; quit game before DLL swap |
 
 ---

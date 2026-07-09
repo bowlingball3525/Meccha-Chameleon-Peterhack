@@ -163,6 +163,7 @@ class Config:
     exploits_anti_detection: bool = False
     exploits_infinite_bullets: bool = False
     exploits_god_mode: bool = False
+    exploits_magnet_enabled: bool = False  # master arm — hotkey/button do nothing until ON
     exploits_magnet_key: str = "G"
     exploits_anti_kick: bool = False
     exploits_rename_text: str = "Player"

@@ -1469,9 +1469,11 @@ class CamoBridgeMixin:
         side_uv = max(0.04, min(0.50, side_uv))
         front_back_uv = round(1.15 - t * 1.0, 4)  # 1.15 → 0.15
         front_back_uv = max(0.08, min(1.20, front_back_uv))
-        # Slightly faster batch pacing at low quality; patient at extreme.
-        batch_delay_ms = int(round(95 - t * 45))  # 95 ms → 50 ms
-        batch_delay_ms = max(50, min(100, batch_delay_ms))
+        # Slightly faster batch pacing at low quality; at high quality use the
+        # minimum (50 ms) so server replication hits the game's max batch rate
+        # and other players see camo sooner (local visual sync is instant).
+        batch_delay_ms = int(round(80 - t * 30))  # 80 ms → 50 ms
+        batch_delay_ms = max(50, min(80, batch_delay_ms))
         return {
             "stroke_size_texels": stroke,
             "coverage_step_texels": stroke,
@@ -1513,6 +1515,7 @@ class CamoBridgeMixin:
             "side_source_max_uv": tuning["side_source_max_uv"],
             "front_back_source_max_uv": tuning["front_back_source_max_uv"],
             "server_batch_delay_ms": tuning["server_batch_delay_ms"],
+            "server_batch_limit": 50,
             "tuning": {
                 "stroke_size_texels": tuning["stroke_size_texels"],
                 "server_batch_delay_ms": tuning["server_batch_delay_ms"],
@@ -1700,6 +1703,17 @@ class CamoBridgeMixin:
                 return False
 
             self._finalize_camo_paint()
+            import time as _t
+            self._camo_last_success_ts = _t.monotonic()
+            meta = (resp or {}).get("metadata") or {}
+            server_ms = meta.get("server_batch_elapsed_ms")
+            sync_ok = meta.get("server_texture_sync_ok")
+            if server_ms is not None:
+                print(
+                    f"[CAMO] server replication {float(server_ms)/1000:.1f}s"
+                    f" texture_sync={'ok' if sync_ok else 'pending/failed'}",
+                    flush=True,
+                )
             print("[CAMO] apply complete", flush=True)
             return True
         except Exception as exc:
