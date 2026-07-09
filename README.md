@@ -16,11 +16,12 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 
 | | |
 |---|---|
-| **Version (Git)** | *(see `VERSION` / CHANGELOG tab after pull)* |
+| **Version (Git)** | `3355c5c` |
+| **Full SHA** | `3355c5c4a32b682cb1f2e6b7844f2a0143f164fa` |
 | **Branch** | `main` |
 | **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,545,216 bytes |
 | **Paint pipeline** | Official `mesh_first_paint` (SilentJMA v1.6+ route) |
-| **Recent fixes** | Camo replication to other players; magnet master arm switch; game-thread RPCs + recoverable ESP dead filter (`23e5267`+) |
+| **Feature commit** | Camo texture sync for other players + magnet master switch |
 
 The in-app **CHANGELOG** tab shows the same short SHA from the `VERSION` file. Auto-update pulls from [GitHub main](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack). After `git pull`, `VERSION` should match the table below.
 
@@ -291,7 +292,7 @@ pip install -r requirements.txt
 4. **CAMOUFLAGE** — set quality, **Paint Now** or **F10**.
 5. **EXPLOITS** — check **Enable Magnet (Hunter)** before using **G**; enable anti-kick after spawn; check `anti_kick.log` if disconnected.
 
-**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `2878d67` or newer).
+**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `3355c5c` or newer).
 
 ---
 
