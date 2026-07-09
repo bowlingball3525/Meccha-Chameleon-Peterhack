@@ -16,8 +16,8 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 
 | | |
 |---|---|
-| **Version (Git)** | `b711ca6` |
-| **Full SHA** | `b711ca64217abb2d1a94121eedde32ef0f543e61` |
+| **Version (Git)** | `80d5ce0` |
+| **Full SHA** | `80d5ce0d53192728a4821fe078c6c230c037e816` |
 | **Branch** | `main` |
 | **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,545,216 bytes |
 | **Paint pipeline** | Official `mesh_first_paint` (SilentJMA v1.6+ route) |
@@ -292,7 +292,7 @@ pip install -r requirements.txt
 4. **CAMOUFLAGE** — set quality, **Paint Now** or **F10**.
 5. **EXPLOITS** — check **Enable Magnet (Hunter)** before using **G**; enable anti-kick after spawn; check `anti_kick.log` if disconnected.
 
-**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `b711ca6` or newer).
+**Pre-built EXE:** download the **Peterhack** artifact from [GitHub Actions](https://github.com/bowlingball3525/Meccha-Chameleon-Peterhack/actions) after a push to `main` (build `80d5ce0` or newer).
 
 ---
 
