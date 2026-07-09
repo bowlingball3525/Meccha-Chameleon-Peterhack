@@ -1765,6 +1765,84 @@
         return actors;
     }
 
+    // RuntimePaintableComponent layout (matches Python OFF_RUNTIME_PAINTABLE / OFF_MAX_DECOY_SPAWN).
+    constexpr std::uintptr_t OffPawnRuntimePaintable = 0x0B68;
+    constexpr std::uintptr_t OffCompMaxDecoySpawnCount = 0x01A8;
+
+    auto handle_game_set_decoy_num(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
+    {
+        int count = static_cast<int>(json_extract_double(payload, "count"));
+        if (count < 0) count = 0;
+        if (count > 99) count = 99;
+
+        if (!live_uobject(ctx.pawn))
+        {
+            return response_json(false, "pawn_unavailable", 0, 1, "local pawn not available");
+        }
+
+        const auto comp = safe_read<std::uintptr_t>(ctx.pawn + OffPawnRuntimePaintable);
+        if (!live_uobject(comp))
+        {
+            return response_json(false, "component_unavailable", 0, 1, "RuntimePaintableComponent not available");
+        }
+
+        // Write the cap directly, then fire the replicated RPC on the game thread
+        // so the server accepts the new value. Both run under live_uobject guards.
+        const bool wrote_mem = safe_write<std::int32_t>(comp + OffCompMaxDecoySpawnCount, count);
+
+        std::string rpc_used{};
+        bool rpc_ok = false;
+        for (const char* fn_name : {"ServerSetMaxDecoySpawnCount", "SetMaxDecoySpawnCount"})
+        {
+            const auto fn = ref.find_function(comp, fn_name);
+            if (!fn)
+            {
+                continue;
+            }
+            const auto params_size = safe_read<int>(fn + OffPropertiesSize, 0);
+            if (params_size < 0 || params_size > 1024)
+            {
+                continue;
+            }
+            std::vector<std::uint8_t> params(static_cast<std::size_t>(std::max(4, params_size)), 0);
+            bool wrote_param = false;
+            for (auto prop = safe_read<std::uintptr_t>(fn + OffChildProperties); prop;
+                 prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+            {
+                const auto pname = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+                if (pname == "ReturnValue")
+                {
+                    continue;
+                }
+                const auto off = prop_offset(prop);
+                if (off >= 0 && static_cast<std::size_t>(off) + 4 <= params.size())
+                {
+                    wrote_param = safe_write<std::int32_t>(
+                        reinterpret_cast<std::uintptr_t>(params.data() + off), count);
+                }
+                break;  // single int32 param
+            }
+            if (!wrote_param)
+            {
+                safe_write<std::int32_t>(reinterpret_cast<std::uintptr_t>(params.data()), count);
+            }
+            std::string failure{};
+            if (process_event(comp, fn, params.data(), failure))
+            {
+                rpc_ok = true;
+                rpc_used = fn_name;
+                break;
+            }
+        }
+
+        const std::string meta = "\"count\":" + std::to_string(count) +
+                                 ",\"mem_write\":" + (wrote_mem ? "true" : "false") +
+                                 ",\"rpc\":\"" + json_escape(rpc_used) + "\"";
+        const bool ok = wrote_mem || rpc_ok;
+        return response_json(ok, "set_decoy_num", ok ? 1 : 0, ok ? 0 : 1,
+                             ok ? "decoy count applied" : "failed to apply decoy count", meta);
+    }
+
     auto handle_game_get_skeleton(const std::string& payload, Reflection& ref, const SdkContext& ctx) -> std::string
     {
         (void)ctx;
@@ -3589,6 +3667,10 @@
         if (request.find("\"type\":\"set_god_mode\"") != std::string::npos)
         {
             return handle_game_set_god_mode(payload, ref, ctx);
+        }
+        if (request.find("\"type\":\"set_decoy_num\"") != std::string::npos)
+        {
+            return handle_game_set_decoy_num(payload, ref, ctx);
         }
         if (request.find("\"type\":\"get_skeleton\"") != std::string::npos)
         {

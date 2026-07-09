@@ -145,6 +145,16 @@ def oof_indicator_pos(sx, sy, screen_w, screen_h, radius_px=0, bearing_rad=None)
     return int(cx + ux * r), int(cy + uy * r), ux, uy
 
 
+def oof_ring_radius_px(config):
+    """OOF ring radius in pixels; 0 means indicators snap to the screen edge."""
+    return max(0, int(getattr(config, "oof_arrow_radius", 0) or 0))
+
+
+def dist_from_screen_center(px, py, screen_w, screen_h):
+    cx, cy = screen_w / 2.0, screen_h / 2.0
+    return math.hypot(px - cx, py - cy)
+
+
 # ---------------------------------------------------------------------------
 # Key name mapping (shared between Menu and Overlay)
 # ---------------------------------------------------------------------------
@@ -3627,7 +3637,8 @@ class Overlay(QWidget):
     fps_apply_requested = pyqtSignal(int)
     # Keep the menu event loop responsive while it is on screen.
     MENU_OPEN_OVERLAY_FPS_CAP = 30
-    FREECAM_OVERLAY_FPS_CAP = 15
+    SPECTATE_OVERLAY_FPS_CAP = 60
+    FREECAM_OVERLAY_FPS_CAP = 30
     ESP_ACTIVE_OVERLAY_FPS_CAP = 90
 
     def __init__(self, esp: MecchaESP, config: Config, menu=None):
@@ -3791,8 +3802,13 @@ class Overlay(QWidget):
                 self.hide()
                 QApplication.processEvents()
 
-            sx = int(self.x() + rx0)
-            sy = int(self.y() + ry0)
+            if self.game_hwnd:
+                tl = win32gui.ClientToScreen(self.game_hwnd, (0, 0))
+                sx = int(tl[0] + rx0)
+                sy = int(tl[1] + ry0)
+            else:
+                sx = int(self.x() + rx0)
+                sy = int(self.y() + ry0)
 
             hwnd_dc = win32gui.GetDC(0)
             if not hwnd_dc:
@@ -3913,7 +3929,11 @@ class Overlay(QWidget):
             target = min(target, self.ESP_ACTIVE_OVERLAY_FPS_CAP)
         if self._menu_is_open():
             return min(target, self.MENU_OPEN_OVERLAY_FPS_CAP)
-        if hasattr(self.esp, "_is_freecam_or_spectating") and self.esp._is_freecam_or_spectating():
+        if hasattr(self.esp, "_esp_spectating") and self.esp._esp_spectating():
+            if vsync:
+                return target
+            return min(target, self.SPECTATE_OVERLAY_FPS_CAP)
+        if hasattr(self.esp, "_is_freecam_or_spectating") and self.esp._esp_freecam():
             if vsync:
                 return target
             return min(target, self.FREECAM_OVERLAY_FPS_CAP)
@@ -3941,12 +3961,21 @@ class Overlay(QWidget):
         target = self._resolve_target_overlay_fps()
         menu_open = self._menu_is_open()
         freecam = (
-            hasattr(self.esp, "_is_freecam_or_spectating")
-            and self.esp._is_freecam_or_spectating()
+            hasattr(self.esp, "_esp_freecam")
+            and self.esp._esp_freecam()
+        )
+        spectate = (
+            hasattr(self.esp, "_esp_spectating")
+            and self.esp._esp_spectating()
         )
         if menu_open and effective < target:
             print(
                 f"[UI] overlay timer {effective} FPS ({ms} ms) — menu open (saved {target} FPS)",
+                flush=True,
+            )
+        elif spectate and effective < target:
+            print(
+                f"[UI] overlay timer {effective} FPS ({ms} ms) — spectate (saved {target} FPS)",
                 flush=True,
             )
         elif freecam and effective < target:
@@ -3987,7 +4016,17 @@ class Overlay(QWidget):
         if esp_active != getattr(self, "_overlay_esp_active", None):
             self._overlay_esp_active = esp_active
             self._sync_overlay_timer_interval()
-        if hasattr(self.esp, "_is_freecam_or_spectating"):
+        if hasattr(self.esp, "_esp_spectating"):
+            spectate = self.esp._esp_spectating()
+            freecam = self.esp._esp_freecam() if hasattr(self.esp, "_esp_freecam") else False
+            relaxed = spectate or freecam
+            if relaxed != getattr(self, "_overlay_relaxed_mode", None):
+                self._overlay_relaxed_mode = relaxed
+                self._sync_overlay_timer_interval()
+            if spectate != getattr(self, "_overlay_spectate_mode", None):
+                self._overlay_spectate_mode = spectate
+                self._sync_overlay_timer_interval()
+        elif hasattr(self.esp, "_is_freecam_or_spectating"):
             relaxed = self.esp._is_freecam_or_spectating()
             if relaxed != getattr(self, "_overlay_relaxed_mode", None):
                 self._overlay_relaxed_mode = relaxed
@@ -4125,9 +4164,8 @@ class Overlay(QWidget):
             print("[CAMO-SAMPLE] no root pos", flush=True)
             return None
 
-        w = self.width()
-        h = self.height()
-        print(f"[CAMO-SAMPLE] overlay size w={w} h={h} campos={cam.get('loc')} pawnpos={pos}", flush=True)
+        w, h = self.esp.get_viewport_size()
+        print(f"[CAMO-SAMPLE] viewport size w={w} h={h} campos={cam.get('loc')} pawnpos={pos}", flush=True)
         if w < 100 or h < 100:
             print("[CAMO-SAMPLE] overlay too small", flush=True)
             return None
@@ -4279,8 +4317,7 @@ class Overlay(QWidget):
             print("[CAMO-SS] no root pos", flush=True)
             return None
 
-        sw = self.width()
-        sh = self.height()
+        sw, sh = self.esp.get_viewport_size()
         if sw < 100 or sh < 100:
             return None
 
@@ -4834,8 +4871,11 @@ class Overlay(QWidget):
 
     def _paint_esp(self, event):
         painter = QPainter(self)
-        freecam = bool(getattr(self, "_overlay_relaxed_mode", False))
-        if not freecam:
+        freecam_only = (
+            hasattr(self.esp, "_esp_freecam")
+            and self.esp._esp_freecam()
+        )
+        if not freecam_only:
             painter.setRenderHint(QPainter.Antialiasing)
         font = mono_font(10)
         painter.setFont(font)
@@ -4878,11 +4918,26 @@ class Overlay(QWidget):
         steam_active = self._overlay_steam_features_active()
         self.esp.set_steam_features_active(steam_active)
 
+        oof_ring_r = (
+            oof_ring_radius_px(self.config)
+            if getattr(self.config, "oof_arrows", True)
+            else 0
+        )
+
         if not self.config.enabled:
             _draw_label(painter, 10, 20, "ESP OFF", QColor(200, 200, 200))
         else:
             all_players = list((snap or {}).get("players") or [])
             local_pos = (snap or {}).get("local_pos")
+
+            if oof_ring_r > 0:
+                cx_oof, cy_oof = w / 2.0, h / 2.0
+                painter.setPen(QPen(QColor(160, 160, 160, 90), 1))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(
+                    int(cx_oof - oof_ring_r), int(cy_oof - oof_ring_r),
+                    int(oof_ring_r * 2), int(oof_ring_r * 2),
+                )
 
             # Draw each player — wrapped so one bad player never kills the whole frame
             for pdata in all_players:
@@ -4895,11 +4950,9 @@ class Overlay(QWidget):
                 ps = pdata.get("player_state")
                 idx = pdata.get("idx", 0)
 
-                dot_pos = None
-                if actor:
+                dot_pos = pdata.get("dot_pos") or pdata.get("root_pos") or pdata.get("pos")
+                if not dot_pos and actor:
                     dot_pos = self.esp._player_esp_dot_pos(actor)
-                if not dot_pos:
-                    dot_pos = pdata.get("dot_pos") or pdata.get("root_pos") or pdata.get("pos")
                 box_pos = pdata.get("root_pos") or pdata.get("pos") or dot_pos
                 if not dot_pos:
                     continue
@@ -4946,8 +4999,10 @@ class Overlay(QWidget):
 
                     color = (255, 140, 60) if blocked else base_color
 
-                # Off-screen: dot ESP only (edge indicator — no boxes/skeleton/labels).
+                # Off-screen: OOF ring/edge dot only (no boxes/skeleton/labels).
                 if not on_screen:
+                    if not getattr(self.config, "oof_arrows", True):
+                        continue
                     bearing = None
                     if cam:
                         cam_loc = cam["loc"]
@@ -4964,10 +5019,15 @@ class Overlay(QWidget):
                         self._draw_dot(painter, ex, ey, max(2, radius), color)
                     continue
 
-                # Dot ESP — chest projection + optional Y offset (SilentJMA base)
+                # Dot ESP — skip chest dot inside OOF ring (ring is for off-screen only).
                 if self.config.dot_esp:
-                    radius = int(self.config.dot_radius * scale)
-                    self._draw_dot(painter, dsx, dsy, max(2, radius), color)
+                    skip_dot = (
+                        oof_ring_r > 0
+                        and dist_from_screen_center(dsx, dsy, w, h) < oof_ring_r
+                    )
+                    if not skip_dot:
+                        radius = int(self.config.dot_radius * scale)
+                        self._draw_dot(painter, dsx, dsy, max(2, radius), color)
 
                 # 2D Box ESP
                 rot = pdata.get("rot")
@@ -5081,7 +5141,28 @@ class Overlay(QWidget):
                     csx, csy, con = w2s(cpos, cam, w, h)
                     if not (math.isfinite(csx) and math.isfinite(csy)):
                         continue
-                    dsx, dsy = clamp_screen(csx, csy, w, h)
+                    if not con and not getattr(self.config, "oof_arrows", True):
+                        continue
+                    if not con:
+                        bearing = None
+                        box_pos = cpos
+                        if cam:
+                            cam_loc = cam["loc"]
+                            dxw = box_pos[0] - cam_loc[0]
+                            dyw = box_pos[1] - cam_loc[1]
+                            if abs(dxw) + abs(dyw) > 1.0:
+                                _, _, cam_yaw_rad = [math.radians(v) for v in cam["rot"]]
+                                target = math.atan2(dyw, dxw)
+                                bearing = target - cam_yaw_rad
+                        dsx, dsy, _, _ = oof_indicator_pos(
+                            csx, csy, w, h, self.config.oof_arrow_radius, bearing)
+                    else:
+                        dsx, dsy = clamp_screen(csx, csy, w, h)
+                        if (
+                            oof_ring_r > 0
+                            and dist_from_screen_center(dsx, dsy, w, h) < oof_ring_r
+                        ):
+                            continue
                     dsy += self.config.box_y_offset
                     owner_name = (cdata.get("owner_name") or "").strip()
                     owner_name = owner_name.replace(" (clone)", "").strip()

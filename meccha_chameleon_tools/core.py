@@ -562,6 +562,8 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
     ESP_FRESH_MISS_LIMIT = 90       # frames to keep a player missing from a partial read
     ESP_POS_MISS_LIMIT = 30         # frames before dropping a cached player (pos miss)
     ESP_DEAD_STREAK_LIMIT = 2       # consecutive ambiguous dead reads before hiding
+    ESP_RAGDOLL_CONFIRM_SEC = 1.25  # ragdoll must persist this long before hiding a pawn
+    ESP_RAGDOLL_RECOVER_SEC = 0.6   # non-ragdoll this long → survivor recovered, show again
     ESP_TELEPORT_CLEAR_DIST = 2500.0  # local pawn jumps this far → lobby→match, clear cache
     # Ragdoll / death detection (BP_FirstPersonCharacter_Main_C + UE mesh physics)
     PAWN_OFF_DEAD = 0x05AA                    # bool — local only, not replicated on remote corpses
@@ -738,7 +740,9 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         self._world_last_good = 0
         self._world_last_good_time = 0.0
         self._esp_dead_streak = {}             # pawn -> consecutive dead reads
+        self._esp_ragdoll_pending = {}         # pawn -> first monotonic ts ragdoll was seen (debounce)
         self._esp_ragdoll_latch = set()        # pawns that ragdolled — stays dead after physics reset
+        self._esp_ragdoll_state = {}           # pawn -> recoverable down/up hysteresis state
         self._esp_eliminated_pawns = set()     # confirmed dead pawn ptrs (infection corpse latch)
         self._esp_eliminated_ps = set()        # PlayerState ptrs whose character is eliminated
         self._ps_pawn_sticky = {}              # PlayerState -> last known pawn (infection/replication gaps)
@@ -899,6 +903,8 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         return out
 
     def get_camera(self):
+        if self._esp_spectating():
+            return self._get_camera_spectate()
         if self._esp_perf_relaxed():
             return self._get_camera_relaxed()
         world = self._get_world()
@@ -1003,8 +1009,49 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
             return cam
         return last_cam if last_cam else None
 
+    def _get_camera_spectate(self):
+        """ViewTarget-first POV for spectator cameras — no ControlRotation blending."""
+        world = self._get_world()
+        if not world:
+            return getattr(self, "_last_camera", None)
+        pc = self._get_local_controller(world)
+        if not pc:
+            return getattr(self, "_last_camera", None)
+        cam_mgr = rp(self.pm, pc + self.offsets["APlayerController::PlayerCameraManager"])
+        if not cam_mgr:
+            return getattr(self, "_last_camera", None)
+
+        pov_off = self.offsets["FCameraCacheEntry::POV"]
+        loc_off = self.offsets["FMinimalViewInfo::Location"]
+        rot_off = self.offsets["FMinimalViewInfo::Rotation"]
+        fov_off = self.offsets["FMinimalViewInfo::FOV"]
+        aspect_off = self.offsets.get("FMinimalViewInfo::AspectRatio", 0x5C)
+        cc_off = self.offsets["APlayerCameraManager::CameraCachePrivate"]
+
+        for pov_addr in (
+            cam_mgr + 0x0340 + pov_off,
+            cam_mgr + cc_off + pov_off,
+            cam_mgr + 0x1E00 + pov_off,
+        ):
+            loc = rvec3(self.pm, pov_addr + loc_off)
+            rot = rvec3(self.pm, pov_addr + rot_off)
+            fov = rfloat(self.pm, pov_addr + fov_off)
+            aspect = rfloat(self.pm, pov_addr + aspect_off)
+            if not all(math.isfinite(v) for v in loc + rot):
+                continue
+            if not self._is_valid_world_loc(loc):
+                continue
+            if not (5.0 < fov < 170.0):
+                fov = 90.0
+            if not (0.1 < aspect < 5.0):
+                aspect = None
+            cam = {"loc": loc, "rot": rot, "fov": fov, "aspect": aspect}
+            self._last_camera = cam
+            return cam
+        return getattr(self, "_last_camera", None)
+
     def _get_camera_relaxed(self):
-        """Minimal camera reads during freecam/spectate — avoids heavy POV blending."""
+        """Minimal camera reads during freecam — avoids heavy POV blending."""
         world = self._get_world()
         if not world:
             return getattr(self, "_last_camera", None)
@@ -1195,19 +1242,25 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         dot = (root[0], root[1], root[2] + 85.0)
         return self._smooth_esp_world_pos(("player_dot", actor), dot, alpha=0.55)
 
-    def _apply_sticky_player_esp(self, entry, actor, config=None):
+    def _apply_sticky_player_esp(self, entry, actor, config=None, fast_track=False):
         """Stable player overlay coords — root + 85, smoothed, isolated from clone reads."""
         if not actor or self._is_clone_actor(actor):
             return entry
+        root_alpha = 0.82 if fast_track else 0.42
+        dot_alpha = 0.90 if fast_track else 0.55
         root = self._player_esp_root_pos(actor)
         if not root or not self._is_valid_world_loc(root):
             root = entry.get("root_pos") or entry.get("pos")
         if root and self._is_valid_world_loc(root):
-            root = self._smooth_esp_world_pos(("player_root", actor), root)
+            root = self._smooth_esp_world_pos(
+                ("player_root", actor), root, alpha=root_alpha,
+            )
             entry["root_pos"] = root
             entry["pos"] = root
             dot = (root[0], root[1], root[2] + 85.0)
-            entry["dot_pos"] = self._smooth_esp_world_pos(("player_dot", actor), dot)
+            entry["dot_pos"] = self._smooth_esp_world_pos(
+                ("player_dot", actor), dot, alpha=dot_alpha,
+            )
         return entry
 
     def _ensure_player_draw_fields(self, entry, actor, config=None, bridge_bones=None, relaxed=False):
@@ -2747,7 +2800,9 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
             print(msg, flush=True)
         self._players_cache = []
         self._esp_dead_streak.clear()
+        self._esp_ragdoll_pending.clear()
         self._esp_ragdoll_latch.clear()
+        self._esp_ragdoll_state.clear()
         self._esp_eliminated_pawns.clear()
         self._esp_eliminated_ps.clear()
         self._ps_pawn_sticky.clear()
@@ -3436,23 +3491,94 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         return False
 
     def _touch_ragdoll_latch(self, pawn):
-        """Latch ragdoll — corpses can reset physics while the player stays dead."""
+        """Latch ragdoll — corpses can reset physics while the player stays dead.
+
+        A living survivor briefly blends physics on hit reactions / knockdowns /
+        stagger, which would false-positive here and permanently erase them from
+        ESP (the latch is match-long). Require the ragdoll signal to persist for
+        ESP_RAGDOLL_CONFIRM_SEC before latching so transient blends don't drop
+        real players. Genuine corpses ragdoll continuously and latch quickly.
+        """
         if not pawn:
             return False
         latch = self._esp_ragdoll_latch
+        if pawn in latch:
+            return True
+        pending = getattr(self, "_esp_ragdoll_pending", None)
+        if pending is None:
+            pending = {}
+            self._esp_ragdoll_pending = pending
         if self._is_pawn_ragdolling(pawn):
-            latch.add(pawn)
-        return pawn in latch
+            import time as _time
+            now = _time.monotonic()
+            first = pending.get(pawn)
+            if first is None:
+                pending[pawn] = now
+                return False
+            if (now - first) >= self.ESP_RAGDOLL_CONFIRM_SEC:
+                latch.add(pawn)
+                pending.pop(pawn, None)
+                return True
+            return False
+        # Not ragdolling this read — it was a transient blend, so reset the timer.
+        pending.pop(pawn, None)
+        return False
+
+    def _pawn_is_downed_ragdoll(self, pawn):
+        """Recoverable ragdoll hide (distinguishes a corpse from a knocked-down survivor).
+
+        A genuine corpse simulates ragdoll physics *continuously*, so it stays
+        hidden. A living survivor only blends physics briefly (hit reaction,
+        knockdown, stagger, stun) and then gets back up — so once the physics
+        stops for ESP_RAGDOLL_RECOVER_SEC we show them again. This replaces the
+        old permanent latch that erased any survivor who ragdolled for 0.4 s.
+        """
+        if not pawn:
+            return False
+        import time as _time
+        now = _time.monotonic()
+        states = self._esp_ragdoll_state
+        state = states.get(pawn)
+        if state is None:
+            # Safety cap: pointers can be reused across rounds; keep bounded even
+            # if a cache clear is missed. Lobbies are small so this is generous.
+            if len(states) > 256:
+                states.clear()
+            state = {"down": False, "ragdoll_since": 0.0, "clear_since": 0.0}
+            states[pawn] = state
+        if self._is_pawn_ragdolling(pawn):
+            state["clear_since"] = 0.0
+            if state["ragdoll_since"] == 0.0:
+                state["ragdoll_since"] = now
+            if not state["down"] and (now - state["ragdoll_since"]) >= self.ESP_RAGDOLL_CONFIRM_SEC:
+                state["down"] = True
+        else:
+            state["ragdoll_since"] = 0.0
+            if state["down"]:
+                if state["clear_since"] == 0.0:
+                    state["clear_since"] = now
+                elif (now - state["clear_since"]) >= self.ESP_RAGDOLL_RECOVER_SEC:
+                    state["down"] = False
+                    state["clear_since"] = 0.0
+        return state["down"]
 
     def _prune_ragdoll_latch(self, active_pawns):
         """Drop latched corpses that despawned (round restart / pointer reuse)."""
-        latch = getattr(self, "_esp_ragdoll_latch", None)
-        if not latch:
-            return
         active = set(active_pawns or [])
-        for pawn in list(latch):
-            if pawn not in active:
-                latch.discard(pawn)
+        latch = getattr(self, "_esp_ragdoll_latch", None)
+        if latch:
+            for pawn in list(latch):
+                if pawn not in active:
+                    latch.discard(pawn)
+        pending = getattr(self, "_esp_ragdoll_pending", None)
+        if pending:
+            for pawn in list(pending):
+                if pawn not in active:
+                    pending.pop(pawn, None)
+        # NOTE: _esp_ragdoll_state is intentionally NOT pruned here. A downed pawn
+        # is hidden (absent from `active`), and pruning would reset its recovery
+        # hysteresis every frame, making real corpses flicker. It is cleared on
+        # cache clear (session change / match end) and size-capped below.
 
     def _is_local_owned_pawn_ptr(self, pawn):
         """True if pawn belongs to the local client — no alive/context recursion."""
@@ -3487,14 +3613,17 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
             return True
         if self._is_eliminated(pawn=pawn, ps=player_state):
             return True
-        if self._touch_ragdoll_latch(pawn):
-            self._mark_eliminated(pawn, player_state)
-            return True
         cls_name = self.objects.class_name(pawn) or ""
         if not self._is_player_class(cls_name):
             return False
+        # Class name flips to a corpse/ragdoll type — a genuine, permanent death.
         if "Ragdoll" in cls_name or "Corpse" in cls_name or "Dead" in cls_name:
             self._mark_eliminated(pawn, player_state)
+            return True
+        # Physics ragdoll alone is NOT permanent: downed survivors recover. Hide
+        # them only while the corpse keeps simulating (recoverable, no elimination
+        # latch), so a knockdown/stun no longer erases a live player for the match.
+        if self._pawn_is_downed_ragdoll(pawn):
             return True
         if not self._can_read_game_memory():
             return False
@@ -3732,6 +3861,10 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         if last and dist(pos, last) >= self.ESP_TELEPORT_CLEAR_DIST:
             if self._players_cache:
                 self.clear_players_cache("local pawn teleported (lobby→match)")
+            # Suspend exploit ProcessEvent RPCs briefly: the world is swapping and
+            # off-thread PE calls on objects mid-teardown crash the game (purecall).
+            import time as _time
+            self._exploits_rpc_block_until = _time.monotonic() + 2.0
             # Bone TArray offsets are per mesh component, not world position — keep them.
 
     def get_players(self, include_local=False, team_filter=False, enemy_only=False):
@@ -4150,7 +4283,7 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         if min_ttl is not None:
             ttl = float(min_ttl)
         elif mode in ("freecam", "spectating"):
-            ttl = 0.5
+            ttl = 0.12
         else:
             ttl = 0.08
         if not force:
@@ -4203,7 +4336,7 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         cache_ts = getattr(self, "_local_pawn_ctx_ts", 0.0)
         cached = getattr(self, "_local_pawn_ctx_cache", None)
         mode = self._cached_session_mode()
-        cache_ttl = 0.5 if mode in ("freecam", "spectating") else 0.08
+        cache_ttl = 0.12 if mode in ("freecam", "spectating") else 0.08
         if cached and (now - cache_ts) < cache_ttl:
             return cached.get("resolved_pawn") or 0
         ctx = self._local_pawn_context()
@@ -4216,11 +4349,11 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         import time as _time
         now = _time.monotonic()
         mode = self._cached_session_mode()
-        cache_ttl = 0.5 if mode in ("freecam", "spectating") else 0.1
+        cache_ttl = 0.12 if mode in ("freecam", "spectating") else 0.1
         if (now - getattr(self, "_session_mode_ts", 0.0)) < cache_ttl:
             return mode if mode != "unknown" else getattr(self, "_session_mode_cached", "unknown")
         ctx = getattr(self, "_local_pawn_ctx_cache", None)
-        ctx_ttl = 0.5 if mode in ("freecam", "spectating") else 0.08
+        ctx_ttl = 0.12 if mode in ("freecam", "spectating") else 0.08
         if ctx is None or (now - getattr(self, "_local_pawn_ctx_ts", 0.0)) >= ctx_ttl:
             ctx = self._local_pawn_context()
             self._local_pawn_ctx_cache = ctx
@@ -4232,6 +4365,18 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
 
     def _is_freecam_or_spectating(self):
         return self._local_session_mode() in ("freecam", "spectating")
+
+    def _esp_session_mode(self):
+        mode = self._cached_session_mode()
+        if mode == "unknown":
+            mode = self._local_session_mode()
+        return mode
+
+    def _esp_spectating(self):
+        return self._esp_session_mode() == "spectating"
+
+    def _esp_freecam(self):
+        return self._esp_session_mode() == "freecam"
 
     def _notify_esp_enabled_ui(self):
         """Refresh menu ESP toggle from config.enabled (safe from any thread)."""
@@ -4251,33 +4396,27 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
             pass
 
     def _sync_esp_freecam_state(self, config):
-        """Disable ESP while freecam/spectating; restore prior state when leaving."""
-        if not config:
-            return
-        in_freecam = self._is_freecam_or_spectating()
-        prev = getattr(self, "_esp_freecam_active", False)
-        if in_freecam == prev:
-            return
-        self._esp_freecam_active = in_freecam
-        if in_freecam:
-            self._esp_enabled_before_freecam = bool(config.enabled)
-            if config.enabled:
-                config.enabled = False
-                self._notify_esp_enabled_ui()
-        else:
-            if getattr(self, "_esp_enabled_before_freecam", False):
-                config.enabled = True
-                self._notify_esp_enabled_ui()
-            self._esp_enabled_before_freecam = None
+        """ESP stays enabled during spectate/freecam — perf is tuned in the snapshot loop."""
+        return
 
     def _esp_perf_relaxed(self):
-        """True when we should cut overlay/snapshot work to protect game FPS."""
+        """True when heavy ESP work should back off (menu open or freecam only)."""
         if bool(getattr(self, "_menu_ui_active", False)):
             return True
-        mode = self._cached_session_mode()
-        if mode == "unknown":
-            mode = self._local_session_mode()
-        return mode in ("freecam", "spectating")
+        return self._esp_freecam()
+
+    def _esp_snapshot_timing(self, menu_open, heavy):
+        """Return (loop_hz, snap_interval_sec, cam_interval_sec) for the snapshot thread."""
+        if menu_open:
+            return 20, 0.25, 0.05
+        mode = self._esp_session_mode()
+        if mode == "spectating":
+            return 50, 0.066, 0.016
+        if mode == "freecam":
+            return 24, 0.18, 0.04
+        if heavy:
+            return 35, 0.12, 0.033
+        return 45, 0.044, 0.022
 
     def _esp_snapshot_heavy(self, config):
         """True when a snapshot pass needs extra throttling (bones, clones, vis checks)."""
@@ -5014,7 +5153,7 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
                 }
             self._esp_paint_snapshot = snap
 
-    def _refresh_esp_snapshot_positions(self):
+    def _refresh_esp_snapshot_positions(self, fast_track=False):
         """Lightweight position refresh between full snapshot passes."""
         if not self._can_read_game_memory():
             return
@@ -5035,7 +5174,7 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
                     if not actor or not self._pawn_alive_for_esp(actor, ps):
                         continue
                     entry = dict(pdata)
-                    self._apply_sticky_player_esp(entry, actor)
+                    self._apply_sticky_player_esp(entry, actor, fast_track=fast_track)
                     updated.append(entry)
                 new_snap["players"] = updated
             if clones:
@@ -5080,27 +5219,11 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
                     cfg = None
                 if cfg is not None:
                     self._esp_bone_indices = getattr(cfg, "bone_indices", None) or {}
-                relaxed = self._esp_perf_relaxed()
+                mode = self._esp_session_mode()
                 heavy = self._esp_snapshot_heavy(cfg)
-                # Snapshot loop is decoupled from overlay FPS — high overlay caps must not
-                # drive 144+ Hz memory reads (that was starving the game and Qt).
-                if menu_open:
-                    loop_hz = 20
-                    snap_interval = 0.25
-                    cam_interval = 0.05
-                elif relaxed:
-                    loop_hz = 4
-                    snap_interval = 0.75
-                    cam_interval = 0.25
-                elif heavy:
-                    loop_hz = 35
-                    snap_interval = 0.12
-                    cam_interval = 0.033
-                else:
-                    loop_hz = 45
-                    snap_interval = 0.044
-                    cam_interval = 0.022
+                loop_hz, snap_interval, cam_interval = self._esp_snapshot_timing(menu_open, heavy)
                 wait_s = 1.0 / loop_hz
+                spectate = mode == "spectating"
 
                 try:
                     now = _time.monotonic()
@@ -5117,8 +5240,8 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
                             or getattr(cfg, "clone_esp", False)
                         )
                     )
-                    if esp_active and not menu_open and not relaxed:
-                        self._refresh_esp_snapshot_positions()
+                    if esp_active and not menu_open and (spectate or not self._esp_perf_relaxed()):
+                        self._refresh_esp_snapshot_positions(fast_track=spectate)
 
                     if not menu_open and cfg is not None:
                         if (now - last_full_snap) >= snap_interval:
@@ -5509,6 +5632,46 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
             return {}
         return self._fetch_bridge_skeleton_batch(pairs, bones_only=bones_only)
 
+    def _build_esp_paint_snapshot_spectate(self, config):
+        """Spectator path — fast camera + player list, no skeleton/clone scans."""
+        cam = self.get_camera()
+        show_local = bool(getattr(config, "show_local", False))
+        team_filter = bool(getattr(config, "team_filter", False))
+        enemy_only = bool(getattr(config, "enemy_only", False))
+        try:
+            source = self.get_players(
+                include_local=show_local,
+                team_filter=team_filter,
+                enemy_only=enemy_only,
+            )
+        except Exception:
+            source = list(getattr(self, "_players_cache", []) or [])
+        players = []
+        for pdata in source:
+            if pdata.get("is_local") and not show_local:
+                continue
+            actor = pdata.get("actor")
+            ps = pdata.get("player_state", 0)
+            if not actor or not self._pawn_alive_for_esp(actor, ps):
+                continue
+            entry = dict(pdata)
+            self._apply_sticky_player_esp(entry, actor, config=config, fast_track=True)
+            players.append(entry)
+        local_pos = None
+        view_pawn = 0
+        ctx = getattr(self, "_local_pawn_ctx_cache", None) or {}
+        view_pawn = ctx.get("view_target") or ctx.get("ack_pawn") or 0
+        if view_pawn:
+            local_pos = self._fast_esp_pos(view_pawn)
+        return {
+            "cam": cam,
+            "players": players,
+            "clones": [],
+            "local_pos": local_pos,
+            "aim_target": None,
+            "aim_actor": None,
+        }
+
     def _build_esp_paint_snapshot_light(self, config):
         """Freecam/spectate snapshot — cached players + fast positions only."""
         cam = self.get_camera()
@@ -5563,6 +5726,8 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         """Collect camera, players, and draw helpers off the UI thread."""
         if not self._can_read_game_memory():
             return self._build_esp_paint_snapshot_light(config)
+        if self._esp_spectating():
+            return self._build_esp_paint_snapshot_spectate(config)
         if self._esp_perf_relaxed():
             return self._build_esp_paint_snapshot_light(config)
         cam = self.get_camera()

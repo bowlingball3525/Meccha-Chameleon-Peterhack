@@ -30,12 +30,13 @@
         out.capture_resolution_source = "user_image";
         out.capture_aspect = static_cast<double>(std::max(1, image_width)) /
                              static_cast<double>(std::max(1, image_height));
-        out.capture_scale_x = 1.0;
-        out.capture_scale_y = 1.0;
-
         const auto viewport = sdk_get_viewport_info(ref, ctx);
         out.viewport_width = viewport.width;
         out.viewport_height = viewport.height;
+        out.capture_scale_x = static_cast<double>(image_width) /
+                              static_cast<double>(std::max(1, viewport.width));
+        out.capture_scale_y = static_cast<double>(image_height) /
+                              static_cast<double>(std::max(1, viewport.height));
         out.viewport_aspect = static_cast<double>(std::max(1, viewport.width)) /
                               static_cast<double>(std::max(1, viewport.height));
         if (out.viewport_width <= 0 || out.viewport_height <= 0)
@@ -172,25 +173,35 @@
             double sy = clamp01(surface.screen_ny) * static_cast<double>(out.height);
             if (surface.has_world_position)
             {
-                const auto rel = sdk_vec_sub(surface.world_position, out.capture_location);
-                const double depth = sdk_vec_dot(rel, capture_forward);
-                if (std::isfinite(depth) && depth > 0.000001 &&
-                    sdk_vec_len(capture_forward) > 0.000001 &&
-                    sdk_vec_len(capture_right) > 0.000001 &&
-                    sdk_vec_len(capture_up) > 0.000001 &&
-                    std::isfinite(tan_half_horizontal) &&
-                    std::isfinite(tan_half_vertical) &&
-                    tan_half_horizontal > 0.000001 &&
-                    tan_half_vertical > 0.000001)
+                double viewport_x = 0.0;
+                double viewport_y = 0.0;
+                if (sdk_project_world_to_screen(ref, ctx, surface.world_position, viewport_x, viewport_y))
                 {
-                    const double right = sdk_vec_dot(rel, capture_right);
-                    const double up = sdk_vec_dot(rel, capture_up);
-                    const double ndc_x = right / (depth * tan_half_horizontal);
-                    const double ndc_y = up / (depth * tan_half_vertical);
-                    if (std::isfinite(ndc_x) && std::isfinite(ndc_y))
+                    sx = viewport_x * out.capture_scale_x;
+                    sy = viewport_y * out.capture_scale_y;
+                }
+                else
+                {
+                    const auto rel = sdk_vec_sub(surface.world_position, out.capture_location);
+                    const double depth = sdk_vec_dot(rel, capture_forward);
+                    if (std::isfinite(depth) && depth > 0.000001 &&
+                        sdk_vec_len(capture_forward) > 0.000001 &&
+                        sdk_vec_len(capture_right) > 0.000001 &&
+                        sdk_vec_len(capture_up) > 0.000001 &&
+                        std::isfinite(tan_half_horizontal) &&
+                        std::isfinite(tan_half_vertical) &&
+                        tan_half_horizontal > 0.000001 &&
+                        tan_half_vertical > 0.000001)
                     {
-                        sx = (ndc_x * 0.5 + 0.5) * static_cast<double>(out.width);
-                        sy = (0.5 - ndc_y * 0.5) * static_cast<double>(out.height);
+                        const double right = sdk_vec_dot(rel, capture_right);
+                        const double up = sdk_vec_dot(rel, capture_up);
+                        const double ndc_x = right / (depth * tan_half_horizontal);
+                        const double ndc_y = up / (depth * tan_half_vertical);
+                        if (std::isfinite(ndc_x) && std::isfinite(ndc_y))
+                        {
+                            sx = (ndc_x * 0.5 + 0.5) * static_cast<double>(out.width);
+                            sy = (0.5 - ndc_y * 0.5) * static_cast<double>(out.height);
+                        }
                     }
                 }
             }

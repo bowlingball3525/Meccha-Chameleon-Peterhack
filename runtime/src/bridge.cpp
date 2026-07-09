@@ -73,7 +73,13 @@ namespace
     constexpr std::uintptr_t OffName = 0x18;
     constexpr std::uintptr_t OffOuter = 0x20;
     constexpr std::uintptr_t OffObjectFlags = 0x08;
+    constexpr std::uintptr_t OffInternalIndex = 0x0C;
     constexpr std::uint32_t RFClassDefaultObject = 0x10;
+    // EInternalObjectFlags (FUObjectItem.Flags): objects the GC has condemned.
+    constexpr std::uint32_t InternalFlagGarbage = 1u << 21;
+    constexpr std::uint32_t InternalFlagUnreachable = 1u << 28;
+    constexpr int GUObjectChunkCapacity = 65536;
+    constexpr std::uintptr_t GUObjectItemStride = 0x18;
     constexpr std::uintptr_t OffSuperStruct = 0x40;
     constexpr std::uintptr_t OffChildren = 0x48;
     constexpr std::uintptr_t OffChildProperties = 0x50;
@@ -100,6 +106,7 @@ namespace
     std::atomic<std::uint32_t> g_active_ue_calls{0};
     std::atomic<DWORD> g_game_thread_id{0};
     std::atomic<HWND> g_game_window{nullptr};
+    std::atomic<std::uintptr_t> g_guobject_array{0};
     std::atomic<std::uintptr_t> g_observed_sync_channel_function{0};
     std::atomic<std::uintptr_t> g_observed_sync_compressed_channel_function{0};
     std::atomic<int> g_observed_sync_channel_calls{0};
@@ -686,7 +693,41 @@ namespace
             return false;
         }
         const auto flags = safe_read<std::uint32_t>(object + OffObjectFlags, 0);
-        return (flags & RFClassDefaultObject) == 0;
+        if ((flags & RFClassDefaultObject) != 0)
+        {
+            return false;
+        }
+        // Verify the pointer still names a registered UObject. Stale pointers
+        // cached across a map travel otherwise reach ProcessEvent on destructed
+        // objects and kill the game with "Pure virtual function being called".
+        const auto array = g_guobject_array.load(std::memory_order_relaxed);
+        if (!array)
+        {
+            return true;
+        }
+        const auto index = safe_read<std::int32_t>(object + OffInternalIndex, -1);
+        if (index < 0)
+        {
+            return false;
+        }
+        const auto chunks = safe_read<std::uintptr_t>(array + 0x10);
+        if (!chunks)
+        {
+            return true;
+        }
+        const auto chunk = safe_read<std::uintptr_t>(
+            chunks + static_cast<std::uintptr_t>(index / GUObjectChunkCapacity) * sizeof(std::uintptr_t));
+        if (!chunk)
+        {
+            return false;
+        }
+        const auto item = chunk + static_cast<std::uintptr_t>(index % GUObjectChunkCapacity) * GUObjectItemStride;
+        if (safe_read<std::uintptr_t>(item) != object)
+        {
+            return false;
+        }
+        const auto internal_flags = safe_read<std::uint32_t>(item + 0x08, 0);
+        return (internal_flags & (InternalFlagGarbage | InternalFlagUnreachable)) == 0;
     }
 
     auto match_pattern(const std::uint8_t* data, const std::uint8_t* pattern, const std::uint8_t* mask, std::size_t length) -> bool
@@ -854,6 +895,7 @@ namespace
             }
             const auto rel = safe_read<std::int32_t>(gu_ref + 3);
             guobject_array = gu_ref + 7 + rel;
+            g_guobject_array.store(guobject_array, std::memory_order_relaxed);
             const auto delta_candidate = guobject_array - 0xE3B40;
             names.pool = delta_candidate;
             names.detect();
@@ -13987,20 +14029,36 @@ namespace
             bool has_depth = false;
             if (surface.has_world_position)
             {
-                if (!project_to_capture(surface.world_position, sx, sy, depth))
+                double viewport_x = 0.0;
+                double viewport_y = 0.0;
+                const bool projected_via_player_camera =
+                    sdk_project_world_to_screen(ref, ctx, surface.world_position, viewport_x, viewport_y);
+                double manual_x = 0.0;
+                double manual_y = 0.0;
+                const bool projected_via_capture_camera =
+                    project_to_capture(surface.world_position, manual_x, manual_y, depth);
+                if (projected_via_player_camera)
+                {
+                    sx = viewport_x * capture_scale_x;
+                    sy = viewport_y * capture_scale_y;
+                    if (projected_via_capture_camera)
+                    {
+                        const auto dx = sx - manual_x;
+                        const auto dy = sy - manual_y;
+                        const auto delta = std::sqrt(dx * dx + dy * dy);
+                        out.project_delta_sum_px += delta;
+                        out.project_delta_max_px = std::max(out.project_delta_max_px, delta);
+                    }
+                }
+                else if (projected_via_capture_camera)
+                {
+                    sx = manual_x;
+                    sy = manual_y;
+                }
+                else
                 {
                     ++out.project_failed;
                     continue;
-                }
-                double player_projected_x = 0.0;
-                double player_projected_y = 0.0;
-                if (sdk_project_world_to_screen(ref, ctx, surface.world_position, player_projected_x, player_projected_y))
-                {
-                    const auto dx = sx - player_projected_x * capture_scale_x;
-                    const auto dy = sy - player_projected_y * capture_scale_y;
-                    const auto delta = std::sqrt(dx * dx + dy * dy);
-                    out.project_delta_sum_px += delta;
-                    out.project_delta_max_px = std::max(out.project_delta_max_px, delta);
                 }
                 if (!std::isfinite(depth) || depth <= 0.0)
                 {
@@ -14900,7 +14958,7 @@ namespace
         }
         if (line.find("\"type\":\"capabilities\"") != std::string::npos)
         {
-            std::string commands = "[\"ping\",\"capabilities\",\"paint_full_route\",\"paint_replication_probe\",\"paint_replication_pressure_probe\",\"paint_packed_replay_probe\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"kill_survivor\",\"kill_all_survivors\",\"magnet_tick\",\"rotate\",\"set_anti_kick\",\"set_god_mode\",\"get_skeleton\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\",\"set_netconn_watch\",\"dump_netconn_vtable\"]";
+            std::string commands = "[\"ping\",\"capabilities\",\"paint_full_route\",\"paint_replication_probe\",\"paint_replication_pressure_probe\",\"paint_packed_replay_probe\",\"cancel_paint\",\"shutdown\",\"teleport\",\"set_fov\",\"kill\",\"kill_survivor\",\"kill_all_survivors\",\"magnet_tick\",\"rotate\",\"set_anti_kick\",\"set_god_mode\",\"set_decoy_num\",\"get_skeleton\",\"get_anti_kick_log\",\"set_player_name\",\"get_player_steam_id\",\"set_netconn_watch\",\"dump_netconn_vtable\"]";
             return std::string("{\"success\":true,\"stage\":\"capabilities\",\"applied\":0,\"failures\":0,") +
                    "\"message\":\"ok\",\"timing_ms\":{}," +
                    "\"metadata\":{\"commands\":" + commands + "," +
@@ -14990,6 +15048,10 @@ namespace
             return execute_game_command_on_game_thread(line);
         }
         if (line.find("\"type\":\"set_god_mode\"") != std::string::npos)
+        {
+            return execute_game_command_on_game_thread(line);
+        }
+        if (line.find("\"type\":\"set_decoy_num\"") != std::string::npos)
         {
             return execute_game_command_on_game_thread(line);
         }

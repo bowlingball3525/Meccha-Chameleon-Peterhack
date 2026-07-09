@@ -1679,6 +1679,12 @@ class CamoBridgeMixin:
                 return False
 
             payload = self._paint_payload(pid)
+            vp_w, vp_h = self.get_viewport_size() if hasattr(self, "get_viewport_size") else (0, 0)
+            print(
+                f"[CAMO] color source=in-game scene capture "
+                f"(official MecchaCamouflage — viewport {vp_w}x{vp_h}, no screen upload)",
+                flush=True,
+            )
             print("[CAMO] sending mesh_first_paint (official camo pipeline)...", flush=True)
             resp = self._bridge_request(
                 "paint_full_route",

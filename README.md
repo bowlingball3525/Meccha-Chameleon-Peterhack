@@ -19,7 +19,7 @@ External ESP, aimbot, exploits, player tracking, and character-paint tools for *
 | **Version (Git)** | `2878d67` |
 | **Full SHA** | `2878d67b808eed921a6f65588d941b6e5963ca8e` |
 | **Branch** | `main` |
-| **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,540,608 bytes |
+| **Bridge DLL** | `bridge/meccha-xenos-bridge.dll` — 1,544,704 bytes |
 | **Paint pipeline** | Official `mesh_first_paint` (SilentJMA v1.6+ route) |
 | **Feature commit** | ESP/dead-filter/bridge fixes in `fff8094` |
 
@@ -57,7 +57,7 @@ Peterhack is a **fully external** cheat. It does not modify game files on disk.
 | **Player discovery** | Primary: `AGameStateBase::PlayerArray` → `PawnPrivate` per `PlayerState`. Supplemental actor scan catches lobby mannequins and null/stale `PawnPrivate` (infection / replication lag). |
 | **Sticky pawn cache** | Brief misses do not drop players; cache clears on disconnect, map change, match end, or large local teleport (lobby→match). |
 | **Team filter** | Uses replicated **`IsHunter`** role byte (`pawn+0x0C3A`) — not pawn class names. |
-| **Dead player filter** | Hides on ragdoll physics latch, elimination latch, dead class names (`Ragdoll`/`Corpse`/`Dead`), and local-only `bDead`. Does **not** guess from unreliable remote health reads. |
+| **Dead player filter** | Permanent elimination only on strong signals — dead class names (`Ragdoll`/`Corpse`/`Dead`) and local-only `bDead`. Ragdoll **physics** is a *recoverable* hide: a corpse ragdolls continuously (stays hidden), a knocked-down survivor stops and reappears. A knockdown/stun no longer erases a live player for the match. Never guesses from unreliable remote health reads. |
 | **ESP snapshot thread** | Background thread builds paint snapshots (camera, positions, bones, clones) at 4–45 Hz depending on menu/heavy mode — decoupled from overlay FPS cap. |
 | **Overlay paint** | UI thread only reads the latest snapshot and draws; no blocking game memory reads during paint. |
 
@@ -70,12 +70,20 @@ Peterhack classifies your local client (`in_match`, `freecam`, `spectating`, `un
 
 ### Bridge (camo + native exploits)
 
-The injected DLL exposes a **TCP JSON API** on port **47654**. Python sends commands; the DLL runs game-thread work (paint, teleport, rename, anti-kick hooks, skeleton batch reads).
+The injected DLL exposes a **TCP JSON API** on port **47654**. Python sends commands; the DLL runs game-thread work (paint, teleport, rename, decoy count, anti-kick hooks, skeleton batch reads).
 
 - **Environment camo** — `mesh_first_paint` pipeline with quality tuning 1–20 and `bridge/mesh-profiles/`.
 - **Custom image paint** — Same `mesh_first_paint` route with a user RGBA buffer (wrap modes: projector / centered).
 - **Anti-kick** — Vtable `ProcessEvent` hooks on local PlayerController / PlayerState / NetConnection; blocks kick and return-to-menu RPCs.
 - **Skeleton ESP** — `get_skeleton` batch reads bone world positions when skeleton overlay is enabled.
+
+#### Why RPCs go through the bridge
+
+Any Unreal `ProcessEvent` call (RPCs like rename, kill, god mode, decoy count, teleport) **must run on the game thread**. Calling them from an external thread races the engine — during a map/world transition it can hit an object mid-teardown and crash the game with *"Pure virtual function being called."* So every RPC exploit is queued to the DLL, which drains it on the game thread inside its `ProcessEvent` hook. Pure memory-poke exploits (gun cooldown, recoil, decoy cooldown, anti-detection, infinite bullets, anti-clipping) stay in Python — they never call a virtual function and are safe.
+
+#### Object-liveness validation
+
+Pointers Python caches (players, meshes, components) can go stale across a lobby→match transition. Before the bridge invokes `ProcessEvent` on any object it validates the pointer against **`GUObjectArray`**: it confirms the object still occupies its own array slot and is not flagged `Garbage`/`Unreachable`. Stale pointers are rejected (the call safely no-ops) instead of crashing the game. Python mirrors the same check plus a short post-transition cooldown.
 
 ### Config & logs
 
@@ -154,23 +162,23 @@ Hold **MB5** (rebindable) to aim at the closest enemy inside the FOV circle. Wri
 
 ## Exploits (EXPLOITS tab)
 
-Memory writes on the exploits tick when toggled (~20 Hz, paused when `unpossessed`):
+Applied on the exploits tick when toggled (~20 Hz, paused when `unpossessed`). Pure memory pokes run in Python; anything that calls a game function (RPC) is dispatched to the bridge and runs on the game thread.
 
-| Toggle | Effect |
-|---|---|
-| **No Gun Cooldown** | Hunter gun cooldown → 0 |
-| **No Recoil** | Camera shake modifier → 0 |
-| **No Decoy Cooldown** | Survivor decoy slots forced ready |
-| **Anti Detection** | Clears `OverlapCheckCapsules` (Too Buried) |
-| **God Mode (Survivor)** | Bridge blocks damage/death RPCs + scrubs local dead flags |
-| **Infinite Bullets** | `InfinityBullet` flag (hunter) |
-| **Magnet** | **G** toggle — pulls survivors along view (hunter) |
-| **Anti-Clipping** | Disables body mesh + capsule collision |
-| **Set Decoy Num** | Max decoy spawn count |
-| **Anti-Kick** | Bridge vtable hooks (see below) |
-| **Auto-Rename / Rename** | Bridge `set_player_name` on game thread |
-| **Return to Main Lobby** | Temporarily disables anti-kick, then calls return-to-menu RPC |
-| **Teleport / Kill Self** | Bridge `teleport` / `kill` |
+| Toggle | Type | Effect |
+|---|---|---|
+| **No Gun Cooldown** | memory | Hunter gun cooldown → 0 |
+| **No Recoil** | memory | Camera shake modifier → 0 |
+| **No Decoy Cooldown** | memory | Survivor decoy slots forced ready |
+| **Anti Detection** | memory | Clears `OverlapCheckCapsules` (Too Buried) |
+| **Infinite Bullets** | memory | `InfinityBullet` flag (hunter) |
+| **Anti-Clipping** | memory | Disables body mesh + capsule collision |
+| **God Mode (Survivor)** | bridge | Blocks damage/death RPCs + scrubs local dead flags |
+| **Magnet** | bridge | **G** toggle — pulls survivors along view (hunter), `magnet_tick` |
+| **Set Decoy Num** | bridge | Max decoy spawn count via `set_decoy_num` (game-thread RPC) |
+| **Anti-Kick** | bridge | Vtable hooks (see below) |
+| **Auto-Rename / Rename** | bridge | `set_player_name` on game thread |
+| **Return to Main Lobby** | bridge | Temporarily disables anti-kick, then calls return-to-menu RPC |
+| **Teleport / Kill Self** | bridge | `teleport` / `kill` |
 
 ### Anti-Kick
 
@@ -204,6 +212,7 @@ Enable after joining a match. Fully quit the game before replacing `meccha-xenos
 | `get_player_steam_id` | Steam64 lookup via bridge |
 | `get_skeleton` | Batch bone world positions for ESP |
 | `set_god_mode` / `magnet_tick` | Survivor god mode / hunter magnet helpers |
+| `set_decoy_num` | Set max decoy spawn count (game-thread RPC) |
 | `kill_survivor` / `kill_all_survivors` | Host kill RPCs |
 | `shutdown` | Stop bridge TCP server |
 
@@ -293,8 +302,8 @@ runtime/scripts/build.ps1
 
 | Path | Role |
 |---|---|
-| `runtime/src/bridge.cpp` | TCP server, camo, anti-kick, teleport/kill/rename |
-| `runtime/src/bridge_peterhack.inc` | Peterhack extensions (anti-kick capture, image paint) |
+| `runtime/src/bridge.cpp` | TCP server, camo, anti-kick, teleport/kill/rename, `GUObjectArray` object-liveness guard |
+| `runtime/src/bridge_peterhack.inc` | Peterhack extensions (anti-kick capture, image paint, skeleton, `set_decoy_num`) |
 | `bridge/` | Shipped DLL + **mesh-profiles/** (committed to Git) |
 
 Peterhack extends [SilentJMA/Meccha-Chameleon-Tools](https://github.com/SilentJMA/Meccha-Chameleon-Tools) with mesh-first camo, vtable anti-kick, and external ESP/exploits.
@@ -317,10 +326,12 @@ On launch, Peterhack can check GitHub `main` and apply updates, then restart.
 |---|---|
 | `failed to communicate with bridge DLL` | Run as Admin; be in a match; check `latest.log` |
 | `mesh_profile_missing` | Ensure `bridge/mesh-profiles/` exists next to the DLL |
-| ESP shows only clones | Update to `1c21d60`+ (features from `fff8094`) |
+| ESP shows only clones | Update to `2878d67`+ (features from `fff8094`) |
 | ESP missing players | Turn off team filter to test; check `[ESP] discovery` in log with debug ESP logging |
-| ESP shows dead bodies | Ragdoll latch should hide corpses; report if they linger after elimination |
-| `RecursionError` in log | Fixed in `fff8094` — pull `1c21d60`+ and restart |
+| ESP forgets / loses survivors | Fixed — ragdoll physics is now a recoverable hide, not a match-long latch; knocked-down survivors reappear when they get up |
+| ESP shows dead bodies | Corpses ragdoll continuously and stay hidden; a genuine corpse may briefly show for ~1.25 s before hiding |
+| Game crashes — *"Pure virtual function being called"* | Fixed — exploit RPCs run on the game thread via the bridge and validate objects against `GUObjectArray`; rebuild/replace `bridge/meccha-xenos-bridge.dll` |
+| `RecursionError` in log | Fixed in `fff8094` — pull `2878d67`+ and restart |
 | Anti-kick log is huge | `[capture-session]` lines are diagnostics, not errors; bridge filters noise in latest build |
 | Anti-kick enabled but kicked | Check `anti_kick.log` for `[capture-kick]`; EOS may bypass UE RPCs |
 | Magnet does nothing | Must be hunter; press **G** to toggle ON |
