@@ -53,7 +53,9 @@ namespace
     constexpr int PackedReplicationDefaultBatchLimit = 50;
     constexpr int PackedReplicationMaxBatchLimit = 50;
     constexpr int PackedReplicationDefaultPacingMs = 75;
-    constexpr int PackedReplicationMinPacingMs = 50;
+    constexpr int PackedReplicationMinPacingMs = 25;
+    constexpr int PackedReplicationLocalDefaultBatchLimit = 20;
+    constexpr int PackedReplicationLocalDefaultPacingMs = 75;
     constexpr int PackedReplicationFallbackMaxStrokesPerTick = 24;
     constexpr int PackedReplicationResolvedPacingMinMs = 1;
     constexpr int PackedReplicationBatchSize = 20;
@@ -8327,6 +8329,8 @@ namespace
         std::size_t offset{0};
         std::string first_failure{};
         bool local_visual_sync_enabled{false};
+        bool local_visual_sync_decoupled{false};
+        bool local_visual_sync_bulk_complete{false};
         bool local_sync_started{false};
         bool local_texture_import_started{false};
         bool local_texture_import_ok{false};
@@ -8379,6 +8383,8 @@ namespace
         double local_visual_sync_elapsed_ms{0.0};
         double server_texture_sync_elapsed_ms{-1.0};
         std::chrono::steady_clock::time_point next_dispatch_time{};
+        std::chrono::steady_clock::time_point next_server_dispatch_time{};
+        std::chrono::steady_clock::time_point next_local_dispatch_time{};
         UINT_PTR dispatch_timer_id{0};
         MeshFirstBatchPhase phase{MeshFirstBatchPhase::Planning};
         std::atomic<bool> cancel_requested{false};
@@ -8582,8 +8588,21 @@ namespace
         if (job->server_batch_limit > job->replication_pacing_resolved_batch_limit)
         {
             job->server_batch_limit = job->replication_pacing_resolved_batch_limit;
-            job->local_visual_sync_batch_limit = job->server_batch_limit;
         }
+    }
+
+    void mesh_first_set_local_visual_sync_pacing(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
+                                                 int batch_limit,
+                                                 int delay_ms)
+    {
+        if (!job)
+        {
+            return;
+        }
+        job->local_visual_sync_batch_limit =
+            std::clamp(batch_limit, 1, PackedReplicationMaxBatchLimit);
+        job->local_visual_sync_delay_ms =
+            std::clamp(delay_ms, 35, PackedReplicationMaxPacingMs);
     }
 
     auto mesh_first_replication_pacing_clamp_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job, int value) -> int
@@ -8594,8 +8613,8 @@ namespace
     auto mesh_first_replication_pacing_clamp_delay(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job, int value) -> int
     {
         const int requested = std::clamp(value, PackedReplicationMinPacingMs, PackedReplicationMaxPacingMs);
-        const int resolved = mesh_first_replication_pacing_resolved_pacing(job);
-        return std::clamp(std::max(requested, resolved), PackedReplicationMinPacingMs, PackedReplicationMaxPacingMs);
+        (void)job;
+        return requested;
     }
 
     void mesh_first_set_replication_pacing_effective(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
@@ -8608,8 +8627,6 @@ namespace
         }
         job->server_batch_limit = mesh_first_replication_pacing_clamp_batch(job, batch_limit);
         job->server_batch_delay_ms = mesh_first_replication_pacing_clamp_delay(job, delay_ms);
-        job->local_visual_sync_batch_limit = job->server_batch_limit;
-        job->local_visual_sync_delay_ms = job->server_batch_delay_ms;
     }
 
     auto mesh_first_replication_pacing_latest_pressure(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job)
@@ -8693,7 +8710,7 @@ namespace
             job && job->replication_pacing_resolved_outgoing_batches_per_second > 0
                 ? job->replication_pacing_resolved_outgoing_batches_per_second
                 : PackedReplicationFallbackOutgoingBatchesPerSecond;
-        return std::max(1, outgoing_batches_per_second * 2);
+        return std::max(1, outgoing_batches_per_second * 4);
     }
 
     auto mesh_first_replication_pacing_queue_gate_open(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
@@ -9318,7 +9335,15 @@ namespace
         const bool tuning_replication_pacing_enabled =
             json_bool_field(request, "replication_pacing_enabled", json_bool_field(request, "adaptive_batch_enabled", true));
         const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", PackedReplicationDefaultBatchLimit, 1, PackedReplicationMaxBatchLimit);
-        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", PackedReplicationDefaultPacingMs, 50, 100);
+        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", PackedReplicationDefaultPacingMs, 25, 100);
+        const int tuning_local_batch_limit =
+            json_int_field(request, "local_batch_limit", PackedReplicationLocalDefaultBatchLimit, 1, PackedReplicationMaxBatchLimit);
+        const int tuning_local_batch_delay_ms =
+            json_int_field(request, "local_batch_delay_ms", PackedReplicationLocalDefaultPacingMs, 35, 100);
+        const bool tuning_local_visual_sync_decoupled =
+            json_bool_field(request, "local_visual_sync_decoupled",
+                            tuning_server_batch_limit != tuning_local_batch_limit ||
+                                tuning_server_batch_delay_ms != tuning_local_batch_delay_ms);
         const int packed_server_batch_limit = std::clamp(tuning_server_batch_limit, 1, PackedReplicationMaxBatchLimit);
         const int packed_server_batch_seed_delay_ms = tuning_server_batch_delay_ms;
         const std::string requested_server_batch_rpc = json_string_field(request, "server_batch_rpc", "");
@@ -10390,9 +10415,7 @@ namespace
         metadata += ",\"planner_strokes_back\":" + std::to_string(replay_back);
         metadata += ",\"planner_strokes_total\":" + std::to_string(strokes.size());
         const int effective_replay_server_batch_limit =
-            normal_paint_requires_packed
-                ? std::clamp(tuning_server_batch_limit, 1, PackedReplicationMaxBatchLimit)
-                : tuning_server_batch_limit;
+            normal_paint_requires_packed ? packed_server_batch_limit : tuning_server_batch_limit;
         const int effective_server_batch_delay_ms =
             normal_paint_requires_packed ? packed_server_batch_seed_delay_ms
                                          : std::max(PackedReplicationMinPacingMs, tuning_server_batch_delay_ms);
@@ -10467,6 +10490,9 @@ namespace
         metadata += ",\"server_packed_batch_limit_cap\":" + std::to_string(PackedReplicationMaxBatchLimit);
         metadata += ",\"server_batch_limit_requested\":" + std::to_string(tuning_server_batch_limit);
         metadata += ",\"server_batch_limit_ignored_for_packed\":" + std::string(json_bool(false));
+        metadata += ",\"local_batch_limit_requested\":" + std::to_string(tuning_local_batch_limit);
+        metadata += ",\"local_batch_delay_requested_ms\":" + std::to_string(tuning_local_batch_delay_ms);
+        metadata += ",\"local_visual_sync_decoupled\":" + std::string(json_bool(tuning_local_visual_sync_decoupled));
         metadata += ",\"server_batch_limit_effective\":" + std::to_string(effective_replay_server_batch_limit);
         metadata += ",\"server_packed_paint_batch_ignored\":\"" + json_escape(packed_ignored_reason) + "\"";
         if (normal_paint_requires_packed && !packed_component_available)
@@ -10778,6 +10804,10 @@ namespace
             async_job->server_packed_paint_source_id = packed_source_id;
             async_job->server_batch_rpc = "ServerPackedPaintBatch";
             async_job->local_visual_sync_enabled = true;
+            async_job->local_visual_sync_decoupled = tuning_local_visual_sync_decoupled;
+            mesh_first_set_local_visual_sync_pacing(async_job,
+                                                    tuning_local_batch_limit,
+                                                    tuning_local_batch_delay_ms);
             async_job->strokes = std::move(strokes);
             async_job->metadata = metadata + ",\"server_batch_schedule\":\"timer_drained\"";
             async_job->albedo_before = albedo_before;
@@ -10825,6 +10855,8 @@ namespace
             async_job->replay_side = replay_side;
             async_job->replay_back = replay_back;
             async_job->started = std::chrono::steady_clock::now();
+            async_job->next_server_dispatch_time = async_job->started;
+            async_job->next_local_dispatch_time = async_job->started;
             async_job->phase = MeshFirstBatchPhase::ServerBatch;
             {
                 std::lock_guard<std::mutex> lock(g_mesh_first_batch_mutex);
@@ -11043,6 +11075,10 @@ namespace
         {
             return;
         }
+
+        // Keep exploit bridge commands (anti-kick, decoy num, magnet, etc.) responsive
+        // while a long mesh-first paint job is streaming batches on the game thread.
+        drain_game_commands_on_game_thread();
 
         auto clear_dispatch_timer = [&]() {
             if (job->dispatch_timer_id)
@@ -11432,15 +11468,14 @@ namespace
             post_next_after(0);
         };
 
-        if (job->phase == MeshFirstBatchPhase::ServerBatch && job->offset >= job->strokes.size())
+        if (job->phase == MeshFirstBatchPhase::ServerBatch && job->offset >= job->strokes.size() &&
+            (!job->local_visual_sync_enabled || job->local_offset >= job->strokes.size()))
         {
             if (job->server_batch_elapsed_ms < 0.0)
             {
                 job->server_batch_elapsed_ms = elapsed_ms();
             }
-            // Push full texture to the server after all stroke batches so other
-            // players see the camo — local_visual_sync only updates this client.
-            begin_server_texture_sync();
+            finish_done();
             return;
         }
 
@@ -11652,103 +11687,43 @@ namespace
             return mesh_first_capture_cached_replication_snapshot(job);
         };
 
-        job->replication_pacing_pre_pressure = capture_replication_pacing_pressure();
-        mesh_first_update_replication_pacing_model(job, job->replication_pacing_pre_pressure);
+        auto schedule_mesh_first_batch_tick = [&](int delay_ms) {
+            const int wait_ms = std::max(1, delay_ms);
+            job->next_dispatch_time = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(wait_ms);
+            post_next_after(wait_ms);
+        };
 
-        if (job->replication_pacing_enabled)
-        {
-            mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_pre_pressure);
-            mesh_first_set_replication_pacing_effective(job,
-                                              mesh_first_replication_pacing_resolved_batch(job),
-                                              mesh_first_replication_pacing_requested_delay(job));
-            auto pre_level = mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_pre_pressure);
-            job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(pre_level);
-            if (!mesh_first_replication_pacing_queue_gate_open(job, job->replication_pacing_pre_pressure))
+        auto millis_until = [&](const std::chrono::steady_clock::time_point& target) -> int {
+            if (target.time_since_epoch().count() == 0)
             {
-                ++job->replication_pacing_backoff_count;
-                write_mesh_progress("mesh_server_batch_throttle",
-                                    "Waiting for paint replication queue to drain",
-                                    job->server_strokes_sent,
-                                    static_cast<int>(job->strokes.size()),
-                                    MeshFirstBatchPhase::ServerBatch,
-                                    false,
-                                    "running");
-                job->next_dispatch_time = std::chrono::steady_clock::now() +
-                                          std::chrono::milliseconds(std::max(1, job->server_batch_delay_ms));
-                post_next_after(job->server_batch_delay_ms);
-                return;
+                return 0;
             }
-        }
+            const auto remaining = target - now;
+            if (remaining.count() <= 0)
+            {
+                return 0;
+            }
+            return std::max(1,
+                            static_cast<int>(std::ceil(
+                                std::chrono::duration<double, std::milli>(remaining).count())));
+        };
 
-        const std::size_t chunk_offset = job->offset;
-        const std::size_t count = std::min<std::size_t>(static_cast<std::size_t>(std::max(1, job->server_batch_limit)),
-                                                        job->strokes.size() - chunk_offset);
-        SdkContext ctx{};
-        ctx.component = job->component;
-        ctx.relay_component = job->relay_component;
-        ctx.server_packed_paint_batch_function = job->server_packed_paint_batch_function;
-        ctx.server_relay_packed_stroke_batch_function = job->server_relay_packed_stroke_batch_function;
-        std::string batch_failure{};
-        ++job->server_batch_calls;
-        const auto rpc_started = std::chrono::steady_clock::now();
-        const bool batch_ok = sdk_call_packed_paint_batch_from_strokes(ctx.component,
-                                                                       ctx.relay_component,
-                                                                       ctx.server_packed_paint_batch_function,
-                                                                       ctx.server_relay_packed_stroke_batch_function,
-                                                                       job->server_packed_paint_batch_use_relay,
-                                                                       job->strokes,
-                                                                       chunk_offset,
-                                                                       count,
-                                                                       job->server_packed_paint_source_id,
-                                                                       job->texture_size,
-                                                                       batch_failure);
-        job->replication_pacing_last_rpc_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rpc_started).count();
-        if (!batch_ok)
-        {
-            ++job->server_batch_failures;
-            job->first_failure = batch_failure.empty() ? job->server_batch_rpc + "_failed" : batch_failure;
-            job->server_batch_elapsed_ms = elapsed_ms();
-            finish_failed("mesh_server_batch_failed",
-                          job->server_batch_rpc + " failed: " + job->first_failure,
-                          job->first_failure);
-            return;
-        }
-
-        ++job->server_batch_success;
-        job->server_strokes_sent += static_cast<int>(count);
-        job->offset += count;
-        job->server_batch_elapsed_ms = elapsed_ms();
-
-        job->replication_pacing_post_pressure = capture_replication_pacing_pressure();
-        mesh_first_update_replication_pacing_model(job, job->replication_pacing_post_pressure);
-
-        if (job->replication_pacing_enabled)
-        {
-            mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_post_pressure);
-            mesh_first_set_replication_pacing_effective(job,
-                                              mesh_first_replication_pacing_resolved_batch(job),
-                                              mesh_first_replication_pacing_requested_delay(job));
-            job->replication_pacing_pressure_level =
-                mesh_first_replication_pacing_pressure_level_name(mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_post_pressure));
-        }
-
-        if (job->local_visual_sync_enabled)
-        {
+        auto paint_local_chunk = [&](std::size_t chunk_offset, std::size_t local_count) -> bool {
             if (!job->local_paint_at_uv_function)
             {
                 job->local_visual_sync_failure = "PaintAtUVWithBrush_unavailable";
                 finish_failed("mesh_local_visual_sync_failed",
                               "PaintAtUVWithBrush is unavailable",
                               job->local_visual_sync_failure);
-                return;
+                return false;
             }
             if (!job->local_sync_started)
             {
                 job->local_sync_started = true;
                 job->local_sync_started_at = std::chrono::steady_clock::now();
             }
-            for (std::size_t index = 0; index < count; ++index)
+            for (std::size_t index = 0; index < local_count; ++index)
             {
                 std::string local_failure{};
                 ++job->local_stroke_calls;
@@ -11758,17 +11733,248 @@ namespace
                                                      local_failure))
                 {
                     ++job->local_stroke_failures;
-                    job->local_visual_sync_failure = local_failure.empty() ? "PaintAtUVWithBrush_failed" : local_failure;
+                    job->local_visual_sync_failure =
+                        local_failure.empty() ? "PaintAtUVWithBrush_failed" : local_failure;
                     finish_failed("mesh_local_visual_sync_failed",
-                                  job->server_batch_rpc + " succeeded but local visual sync failed: " + job->local_visual_sync_failure,
+                                  job->server_batch_rpc + " succeeded but local visual sync failed: " +
+                                      job->local_visual_sync_failure,
                                   job->local_visual_sync_failure);
-                    return;
+                    return false;
                 }
                 ++job->local_stroke_success;
                 ++job->local_offset;
             }
             ++job->local_batch_calls;
             job->local_visual_sync_elapsed_ms = mesh_first_local_elapsed_ms(job);
+            return true;
+        };
+
+        const std::size_t total_strokes = job->strokes.size();
+        const bool server_pending = job->offset < total_strokes;
+        const bool local_pending = job->local_visual_sync_enabled && job->local_offset < total_strokes;
+
+        if (!job->local_visual_sync_decoupled)
+        {
+            job->replication_pacing_pre_pressure = capture_replication_pacing_pressure();
+            mesh_first_update_replication_pacing_model(job, job->replication_pacing_pre_pressure);
+
+            if (job->replication_pacing_enabled)
+            {
+                mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_pre_pressure);
+                mesh_first_set_replication_pacing_effective(job,
+                                                  mesh_first_replication_pacing_resolved_batch(job),
+                                                  mesh_first_replication_pacing_requested_delay(job));
+                auto pre_level =
+                    mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_pre_pressure);
+                job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(pre_level);
+                if (!mesh_first_replication_pacing_queue_gate_open(job, job->replication_pacing_pre_pressure))
+                {
+                    ++job->replication_pacing_backoff_count;
+                    write_mesh_progress("mesh_server_batch_throttle",
+                                        "Waiting for paint replication queue to drain",
+                                        job->server_strokes_sent,
+                                        static_cast<int>(job->strokes.size()),
+                                        MeshFirstBatchPhase::ServerBatch,
+                                        false,
+                                        "running");
+                    schedule_mesh_first_batch_tick(job->server_batch_delay_ms);
+                    return;
+                }
+            }
+
+            const std::size_t chunk_offset = job->offset;
+            const std::size_t count = std::min<std::size_t>(static_cast<std::size_t>(std::max(1, job->server_batch_limit)),
+                                                            total_strokes - chunk_offset);
+            SdkContext ctx{};
+            ctx.component = job->component;
+            ctx.relay_component = job->relay_component;
+            ctx.server_packed_paint_batch_function = job->server_packed_paint_batch_function;
+            ctx.server_relay_packed_stroke_batch_function = job->server_relay_packed_stroke_batch_function;
+            std::string batch_failure{};
+            ++job->server_batch_calls;
+            const auto rpc_started = std::chrono::steady_clock::now();
+            const bool batch_ok = sdk_call_packed_paint_batch_from_strokes(ctx.component,
+                                                                           ctx.relay_component,
+                                                                           ctx.server_packed_paint_batch_function,
+                                                                           ctx.server_relay_packed_stroke_batch_function,
+                                                                           job->server_packed_paint_batch_use_relay,
+                                                                           job->strokes,
+                                                                           chunk_offset,
+                                                                           count,
+                                                                           job->server_packed_paint_source_id,
+                                                                           job->texture_size,
+                                                                           batch_failure);
+            job->replication_pacing_last_rpc_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rpc_started).count();
+            if (!batch_ok)
+            {
+                ++job->server_batch_failures;
+                job->first_failure = batch_failure.empty() ? job->server_batch_rpc + "_failed" : batch_failure;
+                job->server_batch_elapsed_ms = elapsed_ms();
+                finish_failed("mesh_server_batch_failed",
+                              job->server_batch_rpc + " failed: " + job->first_failure,
+                              job->first_failure);
+                return;
+            }
+
+            ++job->server_batch_success;
+            job->server_strokes_sent += static_cast<int>(count);
+            job->offset += count;
+            job->server_batch_elapsed_ms = elapsed_ms();
+
+            job->replication_pacing_post_pressure = capture_replication_pacing_pressure();
+            mesh_first_update_replication_pacing_model(job, job->replication_pacing_post_pressure);
+
+            if (job->replication_pacing_enabled)
+            {
+                mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_post_pressure);
+                mesh_first_set_replication_pacing_effective(job,
+                                                  mesh_first_replication_pacing_resolved_batch(job),
+                                                  mesh_first_replication_pacing_requested_delay(job));
+                job->replication_pacing_pressure_level =
+                    mesh_first_replication_pacing_pressure_level_name(
+                        mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_post_pressure));
+            }
+
+            if (job->local_visual_sync_enabled && !paint_local_chunk(chunk_offset, count))
+            {
+                return;
+            }
+
+            write_mesh_progress("mesh_server_batch",
+                                "mesh-first " + job->server_batch_rpc + " stream",
+                                job->server_strokes_sent,
+                                static_cast<int>(job->strokes.size()),
+                                MeshFirstBatchPhase::ServerBatch,
+                                false,
+                                "running");
+            if (job->offset < total_strokes)
+            {
+                schedule_mesh_first_batch_tick(job->server_batch_delay_ms);
+                return;
+            }
+            if (job->server_batch_elapsed_ms < 0.0)
+            {
+                job->server_batch_elapsed_ms = elapsed_ms();
+            }
+            finish_done();
+            return;
+        }
+
+        const bool server_due = server_pending && millis_until(job->next_server_dispatch_time) == 0;
+        const bool local_due = local_pending && millis_until(job->next_local_dispatch_time) == 0;
+
+        if (server_due && server_pending)
+        {
+            bool server_batch_sent = false;
+            job->replication_pacing_pre_pressure = capture_replication_pacing_pressure();
+            mesh_first_update_replication_pacing_model(job, job->replication_pacing_pre_pressure);
+
+            if (job->replication_pacing_enabled)
+            {
+                mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_pre_pressure);
+                mesh_first_set_replication_pacing_effective(job,
+                                                  mesh_first_replication_pacing_resolved_batch(job),
+                                                  mesh_first_replication_pacing_requested_delay(job));
+                auto pre_level =
+                    mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_pre_pressure);
+                job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(pre_level);
+                if (!mesh_first_replication_pacing_queue_gate_open(job, job->replication_pacing_pre_pressure))
+                {
+                    ++job->replication_pacing_backoff_count;
+                    write_mesh_progress("mesh_server_batch_throttle",
+                                        "Waiting for paint replication queue to drain",
+                                        job->server_strokes_sent,
+                                        static_cast<int>(job->strokes.size()),
+                                        MeshFirstBatchPhase::ServerBatch,
+                                        false,
+                                        "running");
+                    job->next_server_dispatch_time =
+                        now + std::chrono::milliseconds(std::max(1, job->server_batch_delay_ms));
+                }
+                else
+                {
+                    server_batch_sent = true;
+                }
+            }
+            else
+            {
+                server_batch_sent = true;
+            }
+
+            if (server_batch_sent)
+            {
+            const std::size_t chunk_offset = job->offset;
+            const std::size_t count = std::min<std::size_t>(static_cast<std::size_t>(std::max(1, job->server_batch_limit)),
+                                                            total_strokes - chunk_offset);
+            SdkContext ctx{};
+            ctx.component = job->component;
+            ctx.relay_component = job->relay_component;
+            ctx.server_packed_paint_batch_function = job->server_packed_paint_batch_function;
+            ctx.server_relay_packed_stroke_batch_function = job->server_relay_packed_stroke_batch_function;
+            std::string batch_failure{};
+            ++job->server_batch_calls;
+            const auto rpc_started = std::chrono::steady_clock::now();
+            const bool batch_ok = sdk_call_packed_paint_batch_from_strokes(ctx.component,
+                                                                           ctx.relay_component,
+                                                                           ctx.server_packed_paint_batch_function,
+                                                                           ctx.server_relay_packed_stroke_batch_function,
+                                                                           job->server_packed_paint_batch_use_relay,
+                                                                           job->strokes,
+                                                                           chunk_offset,
+                                                                           count,
+                                                                           job->server_packed_paint_source_id,
+                                                                           job->texture_size,
+                                                                           batch_failure);
+            job->replication_pacing_last_rpc_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rpc_started).count();
+            if (!batch_ok)
+            {
+                ++job->server_batch_failures;
+                job->first_failure = batch_failure.empty() ? job->server_batch_rpc + "_failed" : batch_failure;
+                job->server_batch_elapsed_ms = elapsed_ms();
+                finish_failed("mesh_server_batch_failed",
+                              job->server_batch_rpc + " failed: " + job->first_failure,
+                              job->first_failure);
+                return;
+            }
+
+            ++job->server_batch_success;
+            job->server_strokes_sent += static_cast<int>(count);
+            job->offset += count;
+            job->server_batch_elapsed_ms = elapsed_ms();
+
+            job->replication_pacing_post_pressure = capture_replication_pacing_pressure();
+            mesh_first_update_replication_pacing_model(job, job->replication_pacing_post_pressure);
+
+            if (job->replication_pacing_enabled)
+            {
+                mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_post_pressure);
+                mesh_first_set_replication_pacing_effective(job,
+                                                  mesh_first_replication_pacing_resolved_batch(job),
+                                                  mesh_first_replication_pacing_requested_delay(job));
+                job->replication_pacing_pressure_level =
+                    mesh_first_replication_pacing_pressure_level_name(
+                        mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_post_pressure));
+            }
+
+            job->next_server_dispatch_time =
+                now + std::chrono::milliseconds(std::max(0, job->server_batch_delay_ms));
+            }
+        }
+
+        if (local_due && local_pending)
+        {
+            const std::size_t local_chunk_offset = job->local_offset;
+            const std::size_t local_count = std::min<std::size_t>(
+                static_cast<std::size_t>(std::max(1, job->local_visual_sync_batch_limit)),
+                total_strokes - local_chunk_offset);
+            if (!paint_local_chunk(local_chunk_offset, local_count))
+            {
+                return;
+            }
+            job->next_local_dispatch_time =
+                now + std::chrono::milliseconds(std::max(0, job->local_visual_sync_delay_ms));
         }
 
         write_mesh_progress("mesh_server_batch",
@@ -11778,18 +11984,27 @@ namespace
                             MeshFirstBatchPhase::ServerBatch,
                             false,
                             "running");
-        if (job->offset < job->strokes.size())
+
+        if (!server_pending && !local_pending)
         {
-            job->next_dispatch_time = std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(std::max(0, job->server_batch_delay_ms));
-            post_next_after(job->server_batch_delay_ms);
+            if (job->server_batch_elapsed_ms < 0.0)
+            {
+                job->server_batch_elapsed_ms = elapsed_ms();
+            }
+            finish_done();
             return;
         }
-        if (job->server_batch_elapsed_ms < 0.0)
+
+        int next_wait_ms = 1000000;
+        if (server_pending)
         {
-            job->server_batch_elapsed_ms = elapsed_ms();
+            next_wait_ms = std::min(next_wait_ms, millis_until(job->next_server_dispatch_time));
         }
-        begin_server_texture_sync();
+        if (local_pending)
+        {
+            next_wait_ms = std::min(next_wait_ms, millis_until(job->next_local_dispatch_time));
+        }
+        schedule_mesh_first_batch_tick(next_wait_ms);
         return;
     }
 

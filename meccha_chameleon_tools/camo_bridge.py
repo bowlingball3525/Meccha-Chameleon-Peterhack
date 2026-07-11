@@ -1469,24 +1469,39 @@ class CamoBridgeMixin:
         side_uv = max(0.04, min(0.50, side_uv))
         front_back_uv = round(1.15 - t * 1.0, 4)  # 1.15 → 0.15
         front_back_uv = max(0.08, min(1.20, front_back_uv))
-        # Slightly faster batch pacing at low quality; at high quality use the
-        # minimum (50 ms) so server replication hits the game's max batch rate
-        # and other players see camo sooner (local visual sync is instant).
-        batch_delay_ms = int(round(80 - t * 30))  # 80 ms → 50 ms
-        batch_delay_ms = max(50, min(80, batch_delay_ms))
         return {
             "stroke_size_texels": stroke,
             "coverage_step_texels": stroke,
             "side_source_max_uv": side_uv,
             "front_back_source_max_uv": front_back_uv,
-            "server_batch_delay_ms": batch_delay_ms,
         }
 
+    @staticmethod
+    def _server_replication_tuning(speed):
+        """Map server replication speed 1–10 → peer-only ServerPackedPaintBatch pacing."""
+        s = max(1, min(10, int(speed)))
+        t = (s - 1) / 9.0
+        batch_limit = int(round(20 + t * 30))   # 20 → 50 strokes per RPC
+        delay_ms = int(round(100 - t * 75))     # 100 → 25 ms between server batches
+        return {
+            "server_batch_limit": max(20, min(50, batch_limit)),
+            "server_batch_delay_ms": max(25, min(100, delay_ms)),
+            "local_batch_limit": 20,
+            "local_batch_delay_ms": 75,
+            "local_visual_sync_decoupled": True,
+        }
+
+    def _paint_replication_fields(self):
+        cfg = getattr(self, "config", None)
+        speed = int(getattr(cfg, "server_replication_speed", 6) if cfg else 6)
+        return self._server_replication_tuning(speed)
+
     def _paint_payload(self, pid):
-        """Official MecchaCamouflage mesh_first_paint payload (v1.6.0-beta.4)."""
+        """Official MecchaCamouflage mesh_first_paint payload (v1.6.0-beta.5)."""
         cfg = getattr(self, "config", None)
         quality = max(1, min(20, int(getattr(cfg, "paint_quality", 12) if cfg else 12)))
         tuning = self._quality_to_mesh_first_tuning(quality)
+        replication = self._paint_replication_fields()
         skip_front = bool(getattr(cfg, "camo_skip_front_pass", False)) if cfg else False
         back_only = bool(getattr(cfg, "camo_back_pass_only", False)) if cfg else False
         if back_only:
@@ -1514,11 +1529,18 @@ class CamoBridgeMixin:
             "coverage_step_texels": tuning["coverage_step_texels"],
             "side_source_max_uv": tuning["side_source_max_uv"],
             "front_back_source_max_uv": tuning["front_back_source_max_uv"],
-            "server_batch_delay_ms": tuning["server_batch_delay_ms"],
-            "server_batch_limit": 50,
+            "server_batch_limit": replication["server_batch_limit"],
+            "server_batch_delay_ms": replication["server_batch_delay_ms"],
+            "local_batch_limit": replication["local_batch_limit"],
+            "local_batch_delay_ms": replication["local_batch_delay_ms"],
+            "local_visual_sync_decoupled": replication["local_visual_sync_decoupled"],
             "tuning": {
                 "stroke_size_texels": tuning["stroke_size_texels"],
-                "server_batch_delay_ms": tuning["server_batch_delay_ms"],
+                "server_batch_limit": replication["server_batch_limit"],
+                "server_batch_delay_ms": replication["server_batch_delay_ms"],
+                "local_batch_limit": replication["local_batch_limit"],
+                "local_batch_delay_ms": replication["local_batch_delay_ms"],
+                "local_visual_sync_decoupled": replication["local_visual_sync_decoupled"],
                 "coverage_step_texels": tuning["coverage_step_texels"],
                 "side_source_max_uv": tuning["side_source_max_uv"],
                 "front_back_source_max_uv": tuning["front_back_source_max_uv"],
@@ -1541,8 +1563,25 @@ class CamoBridgeMixin:
             },
         }
 
+    def _ensure_bridge_for_paint(self):
+        """Wait for preload inject to finish, then verify bridge without forced re-inject."""
+        import time as _t
+
+        preload = getattr(self, "_bridge_preload_thread", None)
+        if preload and preload.is_alive():
+            print("[CAMO] waiting for bridge preload...", flush=True)
+            preload.join(timeout=90.0)
+        if getattr(self, "_bridge_preload_ok", False) and self._resolve_bridge_port(fast=True):
+            return self._ensure_bridge(force=False)
+        return self._ensure_bridge(force=True)
+
+    def _camo_after_success(self):
+        """Release noclip after a successful paint — do not cancel an already-finished job."""
+        self._camo_set_collision_free(False, label="done")
+        self._camo_noclip_hold = False
+
     def _finalize_camo_paint(self):
-        """Stop template_brush_paint tick loops after apply."""
+        """Stop active paint / quiesce flags after failure, cancel, or user stop."""
         import time as _t
 
         print("[CAMO] stopping paint loop...", flush=True)
@@ -1586,7 +1625,6 @@ class CamoBridgeMixin:
             "coverage_step_texels",
             "side_source_max_uv",
             "front_back_source_max_uv",
-            "server_batch_delay_ms",
         ):
             payload[key] = tuning[key]
             payload.setdefault("tuning", {})[key] = tuning[key]
@@ -1609,12 +1647,11 @@ class CamoBridgeMixin:
             return False
 
         self._camo_abort = False
-        self._bridge_port = None
         try:
             pid = self.pm.process_id
             if not pid:
                 return False
-            if not self._ensure_bridge(force=True):
+            if not self._ensure_bridge_for_paint():
                 return False
 
             rgba = self._bgra_to_rgba_bytes(bgra_bytes, opacity=opacity)
@@ -1639,7 +1676,7 @@ class CamoBridgeMixin:
                 print(f"[PAINT] {self._camo_last_error}", flush=True)
                 self._finalize_camo_paint()
                 return False
-            self._finalize_camo_paint()
+            self._camo_after_success()
             print("[PAINT] image apply complete", flush=True)
             return True
         except Exception as exc:
@@ -1661,7 +1698,6 @@ class CamoBridgeMixin:
             return False
 
         self._camo_abort = False
-        self._bridge_port = None
         self._camo_noclip_owned = False
         self._camo_noclip_hold = False
         try:
@@ -1678,7 +1714,7 @@ class CamoBridgeMixin:
             if not pid:
                 return False
 
-            if not self._ensure_bridge(force=True):
+            if not self._ensure_bridge_for_paint():
                 return False
 
             payload = self._paint_payload(pid)
@@ -1702,7 +1738,7 @@ class CamoBridgeMixin:
                 self._finalize_camo_paint()
                 return False
 
-            self._finalize_camo_paint()
+            self._camo_after_success()
             import time as _t
             self._camo_last_success_ts = _t.monotonic()
             meta = (resp or {}).get("metadata") or {}

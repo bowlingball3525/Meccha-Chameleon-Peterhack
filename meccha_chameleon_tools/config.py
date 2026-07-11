@@ -197,6 +197,7 @@ class Config:
     preset_paint_grid: int = 32
     # Quality level 1-5 for F10 Camouflage (grid size / samples per cell).
     paint_quality: int = 12             # camo quality 1-20; 12=High+
+    server_replication_speed: int = 6   # 1=official slow peer sync, 10=fastest
     # Quality level 1-5 for Apply Image to Character (stamp grid density).
     image_quality: int = 3
     # Wrap mode for Apply Image to Character.

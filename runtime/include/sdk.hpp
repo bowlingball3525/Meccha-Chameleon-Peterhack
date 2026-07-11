@@ -7,20 +7,20 @@ namespace sdk
 {
     namespace FieldOffsets
     {
-        constexpr std::uintptr_t UWorld_OwningGameInstance = 0x0228;
-        constexpr std::uintptr_t UGameInstance_LocalPlayers = 0x0038;
-        constexpr std::uintptr_t UPlayer_PlayerController = 0x0030;
-        constexpr std::uintptr_t Controller_ControlRotation = 0x0320;
-        constexpr std::uintptr_t PlayerController_PlayerCameraManager = 0x0360;
-        constexpr std::uintptr_t BP_FirstPersonCharacter_RuntimePaintable = 0x0B68;
-        constexpr std::uintptr_t RuntimePaintable_CurrentBrushSettings = 0x0170;
-        constexpr std::uintptr_t SceneCapture2D_CaptureComponent2D = 0x02B8;
-        constexpr std::uintptr_t SceneCaptureComponent_CaptureSource = 0x0241;
+        constexpr std::uintptr_t UWorld_OwningGameInstance = 0x228;
+        constexpr std::uintptr_t UGameInstance_LocalPlayers = 0x38;
+        constexpr std::uintptr_t UPlayer_PlayerController = 0x30;
+        constexpr std::uintptr_t Controller_ControlRotation = 0x320;
+        constexpr std::uintptr_t PlayerController_PlayerCameraManager = 0x360;
+        constexpr std::uintptr_t BP_FirstPersonCharacter_RuntimePaintable = 0xB68;
+        constexpr std::uintptr_t RuntimePaintable_CurrentBrushSettings = 0x170;
+        constexpr std::uintptr_t SceneCapture2D_CaptureComponent2D = 0x2B8;
+        constexpr std::uintptr_t SceneCaptureComponent_CaptureSource = 0x241;
         constexpr std::uintptr_t SceneCaptureComponent_CaptureFlags = 0x0242;
-        constexpr std::uintptr_t SceneCaptureComponent_bAlwaysPersistRenderingState = 0x0243;
-        constexpr std::uintptr_t SceneCaptureComponent2D_ProjectionType = 0x0328;
-        constexpr std::uintptr_t SceneCaptureComponent2D_FOVAngle = 0x032C;
-        constexpr std::uintptr_t SceneCaptureComponent2D_TextureTarget = 0x0350;
+        constexpr std::uintptr_t SceneCaptureComponent_bAlwaysPersistRenderingState = 0x243;
+        constexpr std::uintptr_t SceneCaptureComponent2D_ProjectionType = 0x328;
+        constexpr std::uintptr_t SceneCaptureComponent2D_FOVAngle = 0x32C;
+        constexpr std::uintptr_t SceneCaptureComponent2D_TextureTarget = 0x350;
     }
 
     enum class ECameraProjectionMode : std::uint8_t

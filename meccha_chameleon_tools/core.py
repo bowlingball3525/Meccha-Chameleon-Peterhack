@@ -564,6 +564,10 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
     ESP_DEAD_STREAK_LIMIT = 2       # consecutive ambiguous dead reads before hiding
     ESP_RAGDOLL_CONFIRM_SEC = 1.25  # ragdoll must persist this long before hiding a pawn
     ESP_RAGDOLL_RECOVER_SEC = 0.6   # non-ragdoll this long → survivor recovered, show again
+    ESP_RAGDOLL_MESH_CACHE_SEC = 0.28   # cache physics ragdoll reads (mesh lookup is expensive)
+    ESP_ALIVE_CACHE_SEC = 0.22          # cache full alive/dead resolution between snapshot passes
+    ESP_RAGDOLL_SLOW_POLL_SEC = 0.35    # poll ragdoll physics at most ~3 Hz per unknown pawn
+    ESP_LIVE_SURVIVORS_CACHE_SEC = 0.22 # LiveSurvivors_PlayerState roster refresh
     ESP_TELEPORT_CLEAR_DIST = 2500.0  # local pawn jumps this far → lobby→match, clear cache
     # Ragdoll / death detection (BP_FirstPersonCharacter_Main_C + UE mesh physics)
     PAWN_OFF_DEAD = 0x05AA                    # bool — local only, not replicated on remote corpses
@@ -573,6 +577,8 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
     BODY_CORE_SIM_PHYS_OFF = 0x008            # FBodyInstanceCore::bSimulatePhysics byte
     SKM_BLEND_PHYSICS_BYTE = 0x0A71           # USkeletalMeshComponent flag byte
     SKM_BLEND_PHYSICS_BIT = 5                 # bBlendPhysics — ragdoll blend active
+    # BP_GameState_cLeon_C — replicated live survivor roster (Net, RepNotify)
+    GS_LEON_OFF_LIVE_SURVIVORS_PS = 0x0348
 
     GUOBJECT_SIG = bytes([
         0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00,
@@ -594,7 +600,7 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         (bytes([0x48, 0x8D, 0x3D, 0x00, 0x00, 0x00, 0x00]),
          bytes([1, 1, 1, 0, 0, 0, 0])),
     )
-    FNAMEPOOL_DELTA = 0x11C658   # GObjects − GNames (dump 5.6.1-44394996, 2026-07-07)
+    FNAMEPOOL_DELTA = 0x11C658   # GObjects − GNames (dump 5.6.1-44394996, 2026-07-10)
 
     OFFSET_MAP = {
         "UWorld::GameState": ("World", "GameState"),
@@ -745,6 +751,14 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         self._esp_ragdoll_state = {}           # pawn -> recoverable down/up hysteresis state
         self._esp_eliminated_pawns = set()     # confirmed dead pawn ptrs (infection corpse latch)
         self._esp_eliminated_ps = set()        # PlayerState ptrs whose character is eliminated
+        self._esp_live_survivors_ps = set()    # current LiveSurvivors_PlayerState ptrs
+        self._esp_was_live_survivor_ps = set() # PS ever seen in live roster this match
+        self._esp_live_survivors_ts = 0.0
+        self._esp_live_survivors_had_data = False
+        self._esp_health_dead_streak = {}      # pawn -> consecutive zero-health reads
+        self._esp_ragdoll_mesh_cache = {}      # pawn -> (monotonic_ts, is_ragdolling)
+        self._esp_alive_cache = {}             # pawn -> (monotonic_ts, alive_for_esp)
+        self._esp_ragdoll_slow_poll_ts = {}    # pawn -> last expensive ragdoll mesh read
         self._ps_pawn_sticky = {}              # PlayerState -> last known pawn (infection/replication gaps)
         self._esp_world_pos_cache = {}         # actor -> (monotonic_ts, pos)
         self._esp_visibility_cache = {}        # actor -> (monotonic_ts, visible)
@@ -2805,6 +2819,14 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         self._esp_ragdoll_state.clear()
         self._esp_eliminated_pawns.clear()
         self._esp_eliminated_ps.clear()
+        self._esp_live_survivors_ps.clear()
+        self._esp_was_live_survivor_ps.clear()
+        self._esp_live_survivors_ts = 0.0
+        self._esp_live_survivors_had_data = False
+        self._esp_health_dead_streak.clear()
+        self._esp_ragdoll_mesh_cache.clear()
+        self._esp_alive_cache.clear()
+        self._esp_ragdoll_slow_poll_ts.clear()
         self._ps_pawn_sticky.clear()
         self._esp_world_pos_cache.clear()
         self._esp_visibility_cache.clear()
@@ -3436,6 +3458,12 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
 
     def _mark_eliminated(self, pawn=0, ps=0):
         """Latch a pawn/PlayerState as eliminated for the rest of the match."""
+        if pawn and self._is_local_owned_pawn_ptr(pawn):
+            return
+        if ps:
+            ctx = getattr(self, "_local_pawn_ctx_cache", None) or {}
+            if ps == ctx.get("ps"):
+                return
         latch_pawns = getattr(self, "_esp_eliminated_pawns", None)
         latch_ps = getattr(self, "_esp_eliminated_ps", None)
         if latch_pawns is None:
@@ -3451,11 +3479,17 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         if ps:
             latch_ps.add(ps)
         self._drop_sticky_pawn(pawn, ps)
+        if pawn:
+            self._esp_alive_cache.pop(pawn, None)
+            self._esp_ragdoll_mesh_cache.pop(pawn, None)
+            self._esp_ragdoll_slow_poll_ts.pop(pawn, None)
 
     def _is_eliminated(self, pawn=0, ps=0):
-        if ps and ps in getattr(self, "_esp_eliminated_ps", set()):
+        elim_ps = getattr(self, "_esp_eliminated_ps", None) or set()
+        elim_pawns = getattr(self, "_esp_eliminated_pawns", None) or set()
+        if ps and ps in elim_ps:
             return True
-        if pawn and pawn in getattr(self, "_esp_eliminated_pawns", set()):
+        if pawn and pawn in elim_pawns:
             return True
         return False
 
@@ -3470,25 +3504,137 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
             pass
         return None
 
-    def _is_pawn_ragdolling(self, pawn):
+    def _get_leon_game_state(self):
+        world = self._get_world()
+        if not world:
+            return 0
+        gs = rp(self.pm, world + self.offsets["UWorld::GameState"])
+        if not gs:
+            return 0
+        cls = self.objects.class_name(gs) or ""
+        if "GameState_cLeon" not in cls:
+            return 0
+        return gs
+
+    def _refresh_live_survivor_ps_cache(self):
+        """Read BP_GameState_cLeon_C::LiveSurvivors_PlayerState (replicated)."""
+        import time as _time
+
+        now = _time.monotonic()
+        if now - getattr(self, "_esp_live_survivors_ts", 0.0) < self.ESP_LIVE_SURVIVORS_CACHE_SEC:
+            return getattr(self, "_esp_live_survivors_ps", set()) or set()
+
+        live = set()
+        gs = self._get_leon_game_state()
+        if gs:
+            try:
+                data, count, _ = read_array(self.pm, gs + self.GS_LEON_OFF_LIVE_SURVIVORS_PS)
+                if data and count > 0:
+                    for i in range(min(count, 64)):
+                        ps = rp(self.pm, data + i * 8)
+                        if ps:
+                            live.add(ps)
+            except Exception:
+                pass
+
+        self._esp_live_survivors_ps = live
+        self._esp_live_survivors_ts = now
+        if live:
+            self._esp_live_survivors_had_data = True
+            was_live = getattr(self, "_esp_was_live_survivor_ps", None)
+            if was_live is None:
+                was_live = set()
+                self._esp_was_live_survivor_ps = was_live
+            was_live.update(live)
+        return live
+
+    def _is_live_survivor_player_state(self, ps, pawn=0):
+        """True while this PlayerState is on the replicated live-survivor roster."""
+        if not ps:
+            return True
+        is_hunter = self._read_is_hunter(pawn) if pawn else None
+        if is_hunter is True:
+            return True
+        if not getattr(self, "_esp_live_survivors_had_data", False):
+            return True
+        live = self._refresh_live_survivor_ps_cache()
+        return ps in live
+
+    def _is_eliminated_survivor_by_roster(self, ps, pawn=0):
+        """True when a survivor was live on the roster and has since been removed (death)."""
+        if not ps:
+            return False
+        if pawn and self._is_local_owned_pawn_ptr(pawn):
+            return False
+        is_hunter = self._read_is_hunter(pawn) if pawn else None
+        if is_hunter is True:
+            return False
+        was_live = getattr(self, "_esp_was_live_survivor_ps", None) or set()
+        if not was_live or ps not in was_live:
+            return False
+        live = self._refresh_live_survivor_ps_cache() or set()
+        return ps not in live
+
+    def _pawn_remote_health_dead(self, pawn, player_state=0):
+        """Zero-health streak for hunters / fallback when roster is unavailable."""
+        if not pawn or self._is_local_owned_pawn_ptr(pawn):
+            return False
+        hp = self._pawn_health_leon(pawn)
+        if hp is None:
+            self._esp_health_dead_streak.pop(pawn, None)
+            return False
+        if hp > 0.5:
+            self._esp_health_dead_streak.pop(pawn, None)
+            return False
+        streak = self._esp_health_dead_streak.get(pawn, 0) + 1
+        self._esp_health_dead_streak[pawn] = streak
+        return streak >= self.ESP_DEAD_STREAK_LIMIT
+
+    def _is_pawn_ragdolling(self, pawn, *, force=False):
         """True when the character mesh is simulating ragdoll physics (dead corpse)."""
         if not self._is_valid_game_ptr(pawn) or not self._can_read_game_memory():
             return False
+        import time as _time
+        now = _time.monotonic()
+        cache = getattr(self, "_esp_ragdoll_mesh_cache", None)
+        if cache is None:
+            cache = {}
+            self._esp_ragdoll_mesh_cache = cache
+        if not force:
+            hit = cache.get(pawn)
+            if hit and (now - hit[0]) < self.ESP_RAGDOLL_MESH_CACHE_SEC:
+                return hit[1]
         mesh = self.get_skeletal_mesh(pawn)
-        if not mesh:
+        ragdolling = False
+        if mesh:
+            try:
+                sim_byte = self.pm.read_bytes(
+                    mesh + self.PRIM_BODY_INSTANCE_OFF + self.BODY_CORE_SIM_PHYS_OFF, 1,
+                )[0]
+                if sim_byte & 0x01:
+                    ragdolling = True
+                elif self.pm.read_bytes(mesh + self.SKM_BLEND_PHYSICS_BYTE, 1)[0] & (
+                    1 << self.SKM_BLEND_PHYSICS_BIT
+                ):
+                    ragdolling = True
+            except Exception:
+                pass
+        cache[pawn] = (now, ragdolling)
+        self._esp_ragdoll_slow_poll_ts[pawn] = now
+        return ragdolling
+
+    def _esp_ragdoll_slow_poll_due(self, pawn):
+        import time as _time
+        now = _time.monotonic()
+        slow = getattr(self, "_esp_ragdoll_slow_poll_ts", None)
+        if slow is None:
+            slow = {}
+            self._esp_ragdoll_slow_poll_ts = slow
+        last = slow.get(pawn, 0.0)
+        if now - last < self.ESP_RAGDOLL_SLOW_POLL_SEC:
             return False
-        try:
-            sim_byte = self.pm.read_bytes(
-                mesh + self.PRIM_BODY_INSTANCE_OFF + self.BODY_CORE_SIM_PHYS_OFF, 1,
-            )[0]
-            if sim_byte & 0x01:
-                return True
-            blend_byte = self.pm.read_bytes(mesh + self.SKM_BLEND_PHYSICS_BYTE, 1)[0]
-            if blend_byte & (1 << self.SKM_BLEND_PHYSICS_BIT):
-                return True
-        except Exception:
-            pass
-        return False
+        slow[pawn] = now
+        return True
 
     def _touch_ragdoll_latch(self, pawn):
         """Latch ragdoll — corpses can reset physics while the player stays dead.
@@ -3500,6 +3646,8 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         real players. Genuine corpses ragdoll continuously and latch quickly.
         """
         if not pawn:
+            return False
+        if self._is_local_owned_pawn_ptr(pawn):
             return False
         latch = self._esp_ragdoll_latch
         if pawn in latch:
@@ -3524,37 +3672,53 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         pending.pop(pawn, None)
         return False
 
-    def _pawn_is_downed_ragdoll(self, pawn):
+    def _pawn_is_downed_ragdoll(self, pawn, player_state=0):
         """Recoverable ragdoll hide (distinguishes a corpse from a knocked-down survivor).
 
         A genuine corpse simulates ragdoll physics *continuously*, so it stays
         hidden. A living survivor only blends physics briefly (hit reaction,
         knockdown, stagger, stun) and then gets back up — so once the physics
-        stops for ESP_RAGDOLL_RECOVER_SEC we show them again. This replaces the
-        old permanent latch that erased any survivor who ragdolled for 0.4 s.
+        stops for ESP_RAGDOLL_RECOVER_SEC we show them again, but only while
+        they remain on LiveSurvivors_PlayerState. Removed survivors stay hidden
+        even after corpse physics reset.
         """
         if not pawn:
             return False
+        if self._is_local_owned_pawn_ptr(pawn):
+            return False
+        if self._is_eliminated_survivor_by_roster(player_state, pawn):
+            return True
+        latch = getattr(self, "_esp_ragdoll_latch", None) or set()
+        if pawn in latch:
+            return True
         import time as _time
         now = _time.monotonic()
         states = self._esp_ragdoll_state
         state = states.get(pawn)
+        pending = getattr(self, "_esp_ragdoll_pending", None) or {}
         if state is None:
-            # Safety cap: pointers can be reused across rounds; keep bounded even
-            # if a cache clear is missed. Lobbies are small so this is generous.
             if len(states) > 256:
                 states.clear()
+            if pawn not in pending and not self._esp_ragdoll_slow_poll_due(pawn):
+                return False
             state = {"down": False, "ragdoll_since": 0.0, "clear_since": 0.0}
             states[pawn] = state
+        elif not state.get("down") and pawn not in pending and not self._esp_ragdoll_slow_poll_due(pawn):
+            return False
         if self._is_pawn_ragdolling(pawn):
             state["clear_since"] = 0.0
             if state["ragdoll_since"] == 0.0:
                 state["ragdoll_since"] = now
             if not state["down"] and (now - state["ragdoll_since"]) >= self.ESP_RAGDOLL_CONFIRM_SEC:
                 state["down"] = True
+                if self._touch_ragdoll_latch(pawn):
+                    self._mark_eliminated(pawn, player_state)
         else:
             state["ragdoll_since"] = 0.0
             if state["down"]:
+                still_live = self._is_live_survivor_player_state(player_state, pawn)
+                if not still_live:
+                    return True
                 if state["clear_since"] == 0.0:
                     state["clear_since"] = now
                 elif (now - state["clear_since"]) >= self.ESP_RAGDOLL_RECOVER_SEC:
@@ -3611,6 +3775,16 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         """True only on strong elimination signals — avoid lobby false positives."""
         if not pawn:
             return True
+        # Ragdoll/roster heuristics are for remote ESP only. Applying them to the
+        # local character false-positives on knockdowns and breaks exploit pawn
+        # resolution (_resolve_owned_pawn uses _is_pawn_alive).
+        if self._is_local_owned_pawn_ptr(pawn):
+            try:
+                if self.pm.read_bytes(pawn + self.PAWN_OFF_DEAD, 1)[0] & 1:
+                    return True
+            except Exception:
+                pass
+            return False
         if self._is_eliminated(pawn=pawn, ps=player_state):
             return True
         cls_name = self.objects.class_name(pawn) or ""
@@ -3620,43 +3794,68 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         if "Ragdoll" in cls_name or "Corpse" in cls_name or "Dead" in cls_name:
             self._mark_eliminated(pawn, player_state)
             return True
-        # Physics ragdoll alone is NOT permanent: downed survivors recover. Hide
-        # them only while the corpse keeps simulating (recoverable, no elimination
-        # latch), so a knockdown/stun no longer erases a live player for the match.
-        if self._pawn_is_downed_ragdoll(pawn):
+        if self._is_eliminated_survivor_by_roster(player_state, pawn):
+            self._mark_eliminated(pawn, player_state)
+            return True
+        if self._touch_ragdoll_latch(pawn):
+            self._mark_eliminated(pawn, player_state)
+            return True
+        # Physics ragdoll alone is NOT permanent for live survivors: downed players
+        # recover. Removed roster survivors and latched corpses stay hidden.
+        if self._pawn_is_downed_ragdoll(pawn, player_state):
             return True
         if not self._can_read_game_memory():
             return False
-        # bDead is local-only — remote reads are garbage and false-positive constantly.
-        if self._is_local_owned_pawn_ptr(pawn):
-            try:
-                if self.pm.read_bytes(pawn + self.PAWN_OFF_DEAD, 1)[0] & 1:
-                    self._mark_eliminated(pawn, player_state)
-                    return True
-            except Exception:
-                pass
+        if self._pawn_remote_health_dead(pawn, player_state):
+            self._mark_eliminated(pawn, player_state)
+            return True
         return False
 
     def _is_pawn_alive(self, pawn, player_state=0):
         """False only for confirmed-dead / eliminated pawns (no health-based guesses)."""
         return self._pawn_alive_for_esp(pawn, player_state)
 
-    def _pawn_alive_for_esp(self, pawn, player_state=0):
+    def _pawn_alive_for_esp(self, pawn, player_state=0, *, use_cache=True):
         """Hide on ragdoll/elimination latch only — avoid unreliable remote health reads."""
         if not pawn:
             return False
+        if self._is_eliminated(pawn=pawn, ps=player_state):
+            return False
+        import time as _time
+        now = _time.monotonic()
+        cache = getattr(self, "_esp_alive_cache", None)
+        if use_cache and cache is not None:
+            hit = cache.get(pawn)
+            if hit and (now - hit[0]) < self.ESP_ALIVE_CACHE_SEC:
+                return hit[1]
         depth = getattr(self, "_esp_alive_check_depth", 0)
         if depth > 0:
-            return not self._is_eliminated(pawn=pawn, ps=player_state)
-        self._esp_alive_check_depth = depth + 1
-        try:
-            if self._is_eliminated(pawn=pawn, ps=player_state):
-                return False
-            if self._is_pawn_confirmed_dead(pawn, player_state):
-                return False
-            return True
-        finally:
-            self._esp_alive_check_depth = depth
+            alive = not self._is_eliminated(pawn=pawn, ps=player_state)
+        else:
+            self._esp_alive_check_depth = depth + 1
+            try:
+                alive = not self._is_pawn_confirmed_dead(pawn, player_state)
+            finally:
+                self._esp_alive_check_depth = depth
+        if cache is None:
+            cache = {}
+            self._esp_alive_cache = cache
+        cache[pawn] = (now, alive)
+        return alive
+
+    def _pawn_alive_for_esp_positions(self, pawn, player_state=0):
+        """Fast path for high-frequency ESP position refresh (~45 Hz)."""
+        if not pawn:
+            return False
+        if self._is_eliminated(pawn=pawn, ps=player_state):
+            return False
+        cache = getattr(self, "_esp_alive_cache", None) or {}
+        hit = cache.get(pawn)
+        if hit:
+            import time as _time
+            if _time.monotonic() - hit[0] < self.ESP_ALIVE_CACHE_SEC:
+                return hit[1]
+        return True
 
     def _prune_dead_players(self, players):
         alive = []
@@ -4135,7 +4334,7 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
 
 
     # Camouflage — offsets from Dumper-7 dump
-    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-07-07 dump)
+    # C:\dumper-7\5.6.1-44394996+++UE5+Release-5.6-Chameleon (2026-07-10 dump)
     #
     # Globals (OffsetsInfo.json / Basic.hpp):
     #   GObjects 0x09F3E750  GNames 0x09E220F8  GWorld 0x09C87620  ProcessEvent 0x015D0B80
@@ -4217,6 +4416,15 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
         if owned and ps:
             cls = self.objects.class_name(owned) or ""
             if self._is_player_class(cls) and self._is_pawn_alive(owned, ps):
+                elim_pawns = getattr(self, "_esp_eliminated_pawns", None)
+                if elim_pawns is not None:
+                    elim_pawns.discard(owned)
+                elim_ps = getattr(self, "_esp_eliminated_ps", None)
+                if elim_ps is not None and ps:
+                    elim_ps.discard(ps)
+                latch = getattr(self, "_esp_ragdoll_latch", None)
+                if latch is not None:
+                    latch.discard(owned)
                 self._local_owned_pawn_sticky = owned
                 self._local_owned_pawn_sticky_ps = ps
                 return owned
@@ -5171,7 +5379,7 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
                 for pdata in players:
                     actor = pdata.get("actor")
                     ps = pdata.get("player_state", 0)
-                    if not actor or not self._pawn_alive_for_esp(actor, ps):
+                    if not actor or not self._pawn_alive_for_esp_positions(actor, ps):
                         continue
                     entry = dict(pdata)
                     self._apply_sticky_player_esp(entry, actor, fast_track=fast_track)
@@ -7840,10 +8048,10 @@ class MecchaESP(CamoBridgeMixin, ExploitsMixin):
     def _verify_paint_build_offsets(self):
         """Log dump vs live prologue checks for the current game build."""
         dump_globals = (
-            ("GObjects", 0x09F3C6D0),
-            ("GNames", 0x09E20078),
-            ("GWorld", 0x09C85620),
-            ("ProcessEvent", 0x015D0AD0),
+            ("GObjects", 0x9F3E750),
+            ("GNames", 0x9E220F8),
+            ("GWorld", 0x9C87620),
+            ("ProcessEvent", 0x15D0B80),
         )
         workers = (
             ("PaintAtUV", self.RVA_PAINT_AT_UV_LEGACY),

@@ -13,8 +13,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QCheckBox, QComboBox, QLabel,
     QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QColorDialog,
     QSpinBox, QDoubleSpinBox, QSlider, QListWidget, QStackedWidget,
-    QFileDialog, QLineEdit, QMessageBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QSizePolicy,
+    QFileDialog, QLineEdit, QMessageBox, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QImage
@@ -33,9 +32,6 @@ from meccha_chameleon_tools.config import (
 )
 from meccha_chameleon_tools.i18n import UI_LANGUAGES, normalize_lang, tr as i18n_tr
 from meccha_chameleon_tools.log_util import set_log_config
-from meccha_chameleon_tools.blocklist import (
-    load_blocklist, save_blocklist, add_blocked_player, remove_blocked_player, blocklist_ids,
-)
 from meccha_chameleon_tools.qt_util import mono_font, mono_css_family
 
 
@@ -538,14 +534,12 @@ def _quality_to_image_grid(level: int) -> int:
 
 # Sidebar tab ids (internal) → English label keys for i18n
 TAB_ORDER = [
-    "VISUALS", "COLORS", "PLAYERS", "RADAR", "AIMBOT", "EXPLOITS",
+    "VISUALS", "COLORS", "AIMBOT", "EXPLOITS",
     "CAMOUFLAGE", "MISC", "CHANGELOG", "DEBUGGING",
 ]
 TAB_LABELS = {
     "VISUALS": "Visuals",
     "COLORS": "Colors",
-    "PLAYERS": "Players (WIP)",
-    "RADAR": "Radar",
     "AIMBOT": "Aimbot",
     "EXPLOITS": "Exploits",
     "CAMOUFLAGE": "Camouflage",
@@ -565,7 +559,6 @@ class Menu(QWidget):
     bridge_exploit_finished = pyqtSignal(bool, str)
     exploits_rename_finished = pyqtSignal(bool, str)
     update_check_failed = pyqtSignal(str)
-    players_steam_resolved = pyqtSignal(int, str)
     stop_camo_finished = pyqtSignal(bool)
     return_lobby_finished = pyqtSignal(bool, str)
 
@@ -665,7 +658,6 @@ class Menu(QWidget):
         self.bridge_exploit_finished.connect(self._bridge_exploit_done, _queued)
         self.exploits_rename_finished.connect(self._exploits_rename_done, _queued)
         self.update_check_failed.connect(self._on_update_check_failed, _queued)
-        self.players_steam_resolved.connect(self._on_player_steam_resolved, _queued)
         self.stop_camo_finished.connect(self._stop_camo_done, _queued)
         self.return_lobby_finished.connect(self._return_to_lobby_done, _queued)
         self._paint_watchdog = QTimer(self)
@@ -678,14 +670,14 @@ class Menu(QWidget):
         self._magnet_hotkey_vk = 0
         self._camo_thread = None
         self._camo_busy = False
+        self._camo_watchdog = QTimer(self)
+        self._camo_watchdog.setSingleShot(True)
+        self._camo_watchdog.timeout.connect(self._camo_watchdog_timeout)
         self._bridge_exploit_thread = None
         self._bridge_exploit_busy = False
         self._stop_thread = None
-        self._player_rows = []
-        self._players_steam_resolve_pending = False
         self._i18n_bindings = []
         self._i18n_refreshers = []
-        self._blocklist_entries = load_blocklist()
         self.esp.refresh_blocklist_cache(force=True)
         if hasattr(self.esp, "set_rename_notify"):
             self.esp.set_rename_notify(
@@ -696,8 +688,6 @@ class Menu(QWidget):
         self._peter_logo_fetch_done = None
         self._peter_logo_fetch_result = None
         self._build_ui()
-        self._player_list_timer = QTimer(self)
-        self._player_list_timer.timeout.connect(self._refresh_players_tab)
         self._bridge_preload_timer = QTimer(self)
         self._bridge_preload_timer.timeout.connect(self._poll_bridge_preload)
         self._watch_bridge_preload()
@@ -839,9 +829,24 @@ class Menu(QWidget):
         self._camo_busy = True
         self.lbl_camo_status.setText("Painting (360° wrap)...")
         self._camo_set_overlay_feedback("PAINTING...", 600)
+        timeout_ms = int(getattr(self.esp, "CAMO_PAINT_ROUTE_TIMEOUT", 300) * 1000) + 15000
+        self._camo_watchdog.start(timeout_ms)
         self._camo_thread = threading.Thread(target=self._camo_menu_worker, daemon=True)
         self._camo_thread.start()
         self._update_camo_buttons()
+
+    def _camo_watchdog_timeout(self):
+        if not getattr(self, "_camo_busy", False):
+            return
+        thread = getattr(self, "_camo_thread", None)
+        if thread and thread.is_alive():
+            print("[CAMO] paint watchdog — thread still running, releasing UI", flush=True)
+            try:
+                self.esp.camo_stop()
+            except Exception:
+                pass
+            self.esp._camo_last_error = "Paint timed out — try again or lower quality"
+        self._camo_menu_done(False)
 
     def _camo_menu_worker(self):
         ok = False
@@ -855,6 +860,8 @@ class Menu(QWidget):
             self.camo_job_finished.emit(ok)
 
     def _camo_menu_done(self, ok):
+        if hasattr(self, "_camo_watchdog"):
+            self._camo_watchdog.stop()
         self._camo_busy = False
         self._camo_thread = None
         if ok:
@@ -1217,12 +1224,6 @@ class Menu(QWidget):
             key = getattr(self.config, "exploits_magnet_key", "G")
             self.lbl_magnet_key.setText(f"{self._t('Magnet toggle key')}: {key}")
 
-    def _refresh_player_table_headers(self):
-        if not hasattr(self, "tbl_players"):
-            return
-        cols = getattr(self, "_player_table_columns", ["Name", "Team", "Steam ID", ""])
-        self.tbl_players.setHorizontalHeaderLabels([self._t(c) if c else "" for c in cols])
-
     def _on_ui_language_changed(self, _index=0):
         if not hasattr(self, "cmb_ui_language"):
             return
@@ -1505,14 +1506,13 @@ class Menu(QWidget):
         # Build each tab page
         self._build_visuals_tab()
         self._build_colors_tab()
-        self._build_players_tab()
-        self._build_radar_tab()
         self._build_aimbot_tab()
         self._build_exploits_tab()
         self._build_camouflage_tab()
         self._build_misc_tab()
         self._build_changelog_tab()
         self._build_debugging_tab()
+        self._update_steam_features_active()
 
     def _switch_tab(self, idx):
         if 0 <= idx < len(TAB_ORDER):
@@ -1521,15 +1521,7 @@ class Menu(QWidget):
             QTimer.singleShot(0, lambda n=tab_name: self._after_tab_switch(n))
 
     def _after_tab_switch(self, tab_name):
-        if tab_name == "PLAYERS":
-            self._update_steam_features_active()
-            self._refresh_players_tab(force=True)
-            if not self._player_list_timer.isActive():
-                self._player_list_timer.start(5000)
-        else:
-            if self._player_list_timer.isActive():
-                self._player_list_timer.stop()
-            self._update_steam_features_active()
+        self._update_steam_features_active()
 
     def _build_visuals_tab(self):
         p = self._pages["VISUALS"]
@@ -1559,6 +1551,8 @@ class Menu(QWidget):
                            ("distance_scaling","Dist. Scaling")]:
             cb = self._chk(label, cfg)
             lo.addWidget(cb)
+            if cfg == "show_steam_id":
+                cb.stateChanged.connect(lambda _s: self._update_steam_features_active())
         dr = QHBoxLayout()
         dr.addWidget(self._mk_label("Dot Radius:"))
         self.spn_dot = QSpinBox()
@@ -1620,391 +1614,17 @@ class Menu(QWidget):
         oof_settings_lo.addLayout(oof_lbl_row)
         lo.addWidget(self.oof_settings)
         self._sync_oof_settings_ui()
-        lo.addStretch()
 
-    def _build_players_tab(self):
-        p = self._pages["PLAYERS"]
-        lo = QVBoxLayout(p)
-        lo.setContentsMargins(4, 4, 4, 4)
-        lo.setSpacing(4)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #2a4a1a;")
+        lo.addWidget(sep)
 
-        hdr = self._mk_label("PLAYERS (WIP)")
-        hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
-        lo.addWidget(hdr)
+        radar_hdr = self._mk_label("Radar")
+        radar_hdr.setStyleSheet("font-size: 12px; font-weight: bold; color: #7ec850; padding: 4px 0 0 0;")
+        lo.addWidget(radar_hdr)
 
-        hint = self._mk_label(
-            "Session player list (WIP) with Steam64 IDs. Save IDs to blocklist — "
-            "Auto-Kick removes them when you are host; otherwise leaves the lobby."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
-        lo.addWidget(hint)
-
-        self.tbl_players = QTableWidget(0, 4)
-        self._player_table_columns = ["Name", "Team", "Steam ID", ""]
-        self.tbl_players.setHorizontalHeaderLabels(
-            [self._t(c) for c in self._player_table_columns if c]
-        )
-        self._i18n_bind_refresh(self._refresh_player_table_headers)
-        self.tbl_players.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tbl_players.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.tbl_players.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tbl_players.verticalHeader().setVisible(False)
-        self.tbl_players.setShowGrid(False)
-        self.tbl_players.setAlternatingRowColors(False)
-        self.tbl_players.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.tbl_players.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.tbl_players.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.tbl_players.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.tbl_players.setMinimumHeight(120)
-        self.tbl_players.setStyleSheet(
-            "QTableWidget { background: #141e10; color: #d4e4c8; gridline-color: #2a4a1a; }"
-            " QTableWidget::item { background: #141e10; color: #d4e4c8; padding: 3px 6px; }"
-            " QTableWidget::item:selected { background: #2a5a1a; color: #e8ffe0; }"
-            " QHeaderView::section { background: #1a2814; color: #7ec850; padding: 4px; border: none; }"
-            " QScrollBar:vertical { background: #111a0d; width: 12px; border-radius: 5px; margin: 0; }"
-            " QScrollBar::handle:vertical { background: #3a6a2a; border-radius: 5px; min-height: 24px; }"
-            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
-            " QScrollBar:horizontal { background: #111a0d; height: 10px; border-radius: 5px; }"
-            " QScrollBar::handle:horizontal { background: #3a6a2a; border-radius: 5px; min-width: 20px; }"
-            " QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }"
-        )
-        hdr_view = self.tbl_players.horizontalHeader()
-        hdr_view.setSectionResizeMode(0, QHeaderView.Stretch)
-        hdr_view.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hdr_view.setSectionResizeMode(2, QHeaderView.Stretch)
-        hdr_view.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tbl_players.itemSelectionChanged.connect(self._on_players_table_selection)
-        self._players_last_selected_row = -1
-        lo.addWidget(self.tbl_players, 1)
-
-        btn_row = QHBoxLayout()
-        self.btn_copy_steam_id = self._mk_btn("Copy Steam ID")
-        self.btn_copy_steam_id.setFocusPolicy(Qt.NoFocus)
-        self.btn_copy_steam_id.clicked.connect(self._copy_selected_steam_id)
-        self.btn_save_block = self._mk_btn("Save to Blocklist")
-        self.btn_save_block.setFocusPolicy(Qt.NoFocus)
-        self.btn_save_block.clicked.connect(self._save_selected_to_blocklist)
-        self.btn_kill_survivor = self._mk_btn("Kill Selected Survivor")
-        self.btn_kill_survivor.setFocusPolicy(Qt.NoFocus)
-        self.btn_kill_survivor.setToolTip(
-            "Hunter only: sends KillPlayer server RPC on the selected survivor (in-match; bridge game-thread preferred)."
-        )
-        self.btn_kill_survivor.clicked.connect(self._kill_selected_survivor)
-        btn_row.addWidget(self.btn_copy_steam_id)
-        btn_row.addWidget(self.btn_save_block)
-        btn_row.addWidget(self.btn_kill_survivor)
-        lo.addLayout(btn_row)
-
-        lo.addWidget(self._mk_label("Blocklist (saved to C:\\peterhack\\blocked_players.json)"))
-        self.lst_blocklist = QListWidget()
-        self.lst_blocklist.setMinimumHeight(110)
-        self.lst_blocklist.setStyleSheet(
-            "QListWidget { background: #141e10; color: #d4e4c8; border: 1px solid #2a4a1a; }"
-        )
-        lo.addWidget(self.lst_blocklist)
-
-        blk_row = QHBoxLayout()
-        self.btn_remove_block = self._mk_btn("Remove Selected")
-        self.btn_remove_block.clicked.connect(self._remove_selected_blocklist)
-        blk_row.addWidget(self.btn_remove_block)
-        lo.addLayout(blk_row)
-
-        self.cb_autokick = self._chk("Auto-Kick blocklisted players", "autokick_enabled")
-        self.cb_autokick.setToolTip(
-            "When host: kicks blocked Steam IDs via Redpoint.\n"
-            "When not host: optionally leaves the lobby instead."
-        )
-        lo.addWidget(self.cb_autokick)
-        self.cb_autokick_leave = self._chk(
-            "Leave lobby if blocked player joins (non-host)", "autokick_leave_on_block",
-        )
-        lo.addWidget(self.cb_autokick_leave)
-
-        self.lbl_players_status = QLabel("")
-        self.lbl_players_status.setStyleSheet("color: #888; font-size: 10px;")
-        lo.addWidget(self.lbl_players_status)
-
-        self._refresh_blocklist_ui()
-
-    def _update_steam_features_active(self):
-        """Enable background Steam ID reads only when something needs them."""
-        on_players_tab = (
-            hasattr(self, "stack")
-            and self._pages.get("PLAYERS") is self.stack.currentWidget()
-        )
-        active = (
-            on_players_tab
-            or getattr(self.config, "show_steam_id", False)
-            or bool(getattr(self.esp, "_blocklist_cache_ids", set()))
-            or getattr(self.config, "autokick_enabled", False)
-        )
-        self.esp.set_steam_features_active(active)
-        if on_players_tab:
-            self._schedule_players_steam_resolve()
-
-    def _on_players_table_selection(self):
-        rows = self.tbl_players.selectionModel().selectedRows()
-        if rows:
-            self._players_last_selected_row = rows[0].row()
-
-    def _selected_player_row(self):
-        row = getattr(self, "_players_last_selected_row", -1)
-        sm = self.tbl_players.selectionModel()
-        if sm:
-            sel = sm.selectedRows()
-            if sel:
-                row = sel[0].row()
-        if row < 0:
-            row = self.tbl_players.currentRow()
-        if row < 0 or row >= len(self._player_rows):
-            return None
-        return self._player_rows[row]
-
-    @staticmethod
-    def _steam_id_from_display(text: str) -> str:
-        text = (text or "").strip()
-        if not text or text in ("—", "-", "?"):
-            return ""
-        import re
-        match = re.search(r"7656119\d{10}", text)
-        return match.group(0) if match else text
-
-    def _resolve_player_steam_id(self, pdata, force=False):
-        ps = pdata.get("player_state", 0) if pdata else 0
-        sid = ""
-        if ps and force:
-            self.esp._steam_id_cache.pop(ps, None)
-        if ps:
-            if force:
-                sid = self.esp._bridge_resolve_steam_id(ps, timeout=12)
-            if not sid:
-                sid = self.esp.get_player_steam_id(ps, force=force)
-        if not sid and pdata:
-            sid = (pdata.get("steam_id") or "").strip()
-        if not sid and pdata:
-            row = getattr(self, "_players_last_selected_row", -1)
-            if row >= 0:
-                item = self.tbl_players.item(row, 2)
-                if item:
-                    sid = self._steam_id_from_display(item.text())
-        if sid and ps:
-            pdata["steam_id"] = sid
-            self.esp._steam_id_cache[ps] = (sid, time.monotonic())
-        return sid
-
-    def _players_status(self, text, ms=2500):
-        self.lbl_players_status.setText(text)
-        QTimer.singleShot(ms, lambda: self.lbl_players_status.setText(""))
-
-    def _refresh_blocklist_ui(self):
-        self._blocklist_entries = load_blocklist()
-        self.esp.refresh_blocklist_cache(force=True)
-        self.esp.invalidate_session_players_cache()
-        self._players_tab_sig = None
-        self._players_tab_blocked = None
-        self.lst_blocklist.clear()
-        for entry in self._blocklist_entries:
-            sid = entry.get("steam_id", "")
-            name = entry.get("name") or "?"
-            added = entry.get("added") or ""
-            label = f"{name}  —  {sid}"
-            if added:
-                label += f"  ({added})"
-            self.lst_blocklist.addItem(label)
-
-    def _player_row_signature(self, players, blocked):
-        parts = []
-        for p in players:
-            parts.append(
-                (
-                    p.get("player_state"),
-                    p.get("pawn"),
-                    p.get("player_name"),
-                    p.get("is_hunter"),
-                    (p.get("steam_id") or "")[:20],
-                    p.get("is_local"),
-                )
-            )
-        return (tuple(parts), frozenset(blocked or ()))
-
-    def _refresh_players_tab(self, force=False):
-        if not hasattr(self, "tbl_players"):
-            return
-        if self._pages.get("PLAYERS") is not self.stack.currentWidget():
-            return
-        try:
-            players = self.esp.get_session_players(
-                force=force,
-                resolve_steam=force or self.esp._steam_features_active,
-            )
-        except Exception:
-            players = []
-        blocked = self._blocklist_entries and blocklist_ids(self._blocklist_entries) or set()
-        sig = self._player_row_signature(players, blocked)
-        if sig == getattr(self, "_players_tab_sig", None):
-            return
-        self._players_tab_sig = sig
-        self._player_rows = players
-        sel_row = getattr(self, "_players_last_selected_row", -1)
-        self.tbl_players.setUpdatesEnabled(False)
-        self.tbl_players.blockSignals(True)
-        try:
-            self.tbl_players.setRowCount(len(players))
-            bg = QColor(20, 30, 16)
-            fg = QColor(212, 228, 200)
-            for row, pdata in enumerate(players):
-                name = pdata.get("player_name") or pdata.get("steam_name") or "?"
-                if pdata.get("is_local"):
-                    name = f"{name} (you)"
-                ih = pdata.get("is_hunter")
-                team = "Hunter" if ih is True else ("Survivor" if ih is False else "?")
-                sid = (pdata.get("steam_id") or "").strip() or "—"
-                flag = "BLOCKED" if sid in blocked else ("LOCAL" if pdata.get("is_local") else "")
-                for col, text in enumerate((name, team, sid, flag)):
-                    item = QTableWidgetItem(text)
-                    item.setBackground(bg)
-                    if sid in blocked:
-                        item.setForeground(QColor(255, 140, 60))
-                    elif pdata.get("is_local"):
-                        item.setForeground(QColor(126, 200, 80))
-                    else:
-                        item.setForeground(fg)
-                    self.tbl_players.setItem(row, col, item)
-                self.tbl_players.setRowHeight(row, 22)
-            if 0 <= sel_row < len(players):
-                self.tbl_players.selectRow(sel_row)
-        finally:
-            self.tbl_players.blockSignals(False)
-            self.tbl_players.setUpdatesEnabled(True)
-        self._schedule_players_steam_resolve()
-
-    def _schedule_players_steam_resolve(self):
-        """Resolve one Steam ID per tick on a worker thread (never block Qt)."""
-        if getattr(self, "_players_steam_resolve_pending", False):
-            return
-        if self._pages.get("PLAYERS") is not self.stack.currentWidget():
-            return
-        thread = getattr(self, "_players_steam_resolve_thread", None)
-        if thread and thread.is_alive():
-            return
-        self._players_steam_resolve_pending = True
-        self._players_steam_resolve_thread = threading.Thread(
-            target=self._resolve_next_player_steam_id_worker,
-            daemon=True,
-            name="players-steam-resolve",
-        )
-        self._players_steam_resolve_thread.start()
-
-    def _resolve_next_player_steam_id_worker(self):
-        row = -1
-        sid = ""
-        try:
-            rows = getattr(self, "_player_rows", [])
-            for i, pdata in enumerate(rows):
-                if (pdata.get("steam_id") or "").strip():
-                    continue
-                ps = pdata.get("player_state", 0)
-                if not ps:
-                    continue
-                row = i
-                sid = self.esp._bridge_resolve_steam_id(ps, timeout=6)
-                if not sid:
-                    sid = self.esp.get_player_steam_id(ps, force=True)
-                if sid:
-                    pdata["steam_id"] = sid
-                break
-        finally:
-            self._players_steam_resolve_pending = False
-        self.players_steam_resolved.emit(row, sid or "")
-
-    def _on_player_steam_resolved(self, row, sid):
-        if self._pages.get("PLAYERS") is not self.stack.currentWidget():
-            return
-        if row >= 0:
-            if sid:
-                item = self.tbl_players.item(row, 2)
-                if item:
-                    item.setText(sid)
-                self._players_tab_sig = None
-            QTimer.singleShot(150, self._schedule_players_steam_resolve)
-
-    def _kill_selected_survivor(self):
-        pdata = self._selected_player_row()
-        if not pdata:
-            self._players_status("Select a survivor first")
-            return
-        if pdata.get("is_hunter") is not False:
-            self._players_status("Selected player is not a survivor")
-            return
-        pawn = self.esp._fresh_kill_target_pawn(pdata) if hasattr(self.esp, "_fresh_kill_target_pawn") else (pdata.get("pawn") or 0)
-        if not pawn:
-            self._players_status("Survivor pawn not available yet")
-            return
-        if not hasattr(self.esp, "kill_survivor_pawn"):
-            self._players_status("Kill not available")
-            return
-        ok, err = self.esp.kill_survivor_pawn(pawn, config=self.config, pdata=pdata)
-        name = pdata.get("player_name") or "survivor"
-        self._players_status(f"Kill sent for {name} ({err})" if ok else f"Kill failed: {err}")
-
-    def _copy_selected_steam_id(self):
-        pdata = self._selected_player_row()
-        if not pdata:
-            self._players_status("Select a player first")
-            return
-        self._players_status("Resolving Steam ID...")
-        QApplication.processEvents()
-        sid = self._resolve_player_steam_id(pdata, force=True)
-        if not sid:
-            self._players_status("No Steam ID yet — try again in a few seconds")
-            return
-        QApplication.clipboard().setText(sid)
-        self._players_status(f"Copied {sid}")
-        self._players_tab_sig = None
-        self._refresh_players_tab()
-
-    def _save_selected_to_blocklist(self):
-        pdata = self._selected_player_row()
-        if not pdata:
-            self._players_status("Select a player first")
-            return
-        sid = self._resolve_player_steam_id(pdata, force=True)
-        if not sid:
-            self._players_status("No Steam ID — wait for replication")
-            return
-        name = pdata.get("player_name") or pdata.get("steam_name") or sid
-        if add_blocked_player(sid, name):
-            self._refresh_blocklist_ui()
-            self._refresh_players_tab()
-            self._players_status(f"Saved {name}")
-        else:
-            self._players_status("Failed to save blocklist")
-
-    def _remove_selected_blocklist(self):
-        row = self.lst_blocklist.currentRow()
-        if row < 0 or row >= len(self._blocklist_entries):
-            self._players_status("Select a blocklist entry")
-            return
-        sid = self._blocklist_entries[row].get("steam_id", "")
-        if remove_blocked_player(sid):
-            self._refresh_blocklist_ui()
-            self._refresh_players_tab()
-            self._players_status("Removed from blocklist")
-        else:
-            self._players_status("Failed to update blocklist")
-
-    def _on_exploits_rename_text_changed(self, text):
-        self.config.exploits_rename_text = text.strip()
-        if hasattr(self.esp, "_exploits_rename_pending_name"):
-            self.esp._exploits_rename_pending_name = None
-
-    def _build_radar_tab(self):
-        p = self._pages["RADAR"]
-        lo = QVBoxLayout(p)
-        lo.setContentsMargins(4, 4, 4, 4)
-        lo.setSpacing(4)
-        self.cb_radar = self._chk("Radar Enabled","radar_enabled")
+        self.cb_radar = self._chk("Radar Enabled", "radar_enabled")
         lo.addWidget(self.cb_radar)
         sr = QHBoxLayout()
         sr.addWidget(self._mk_label("Radar Size:"))
@@ -2023,7 +1643,22 @@ class Menu(QWidget):
         self.spn_radar_range.valueChanged.connect(lambda v: setattr(self.config, "radar_range", float(v)))
         rr.addWidget(self.spn_radar_range)
         lo.addLayout(rr)
+
         lo.addStretch()
+
+    def _update_steam_features_active(self):
+        """Enable background Steam ID reads only when something needs them."""
+        active = (
+            getattr(self.config, "show_steam_id", False)
+            or bool(getattr(self.esp, "_blocklist_cache_ids", set()))
+            or getattr(self.config, "autokick_enabled", False)
+        )
+        self.esp.set_steam_features_active(active)
+
+    def _on_exploits_rename_text_changed(self, text):
+        self.config.exploits_rename_text = text.strip()
+        if hasattr(self.esp, "_exploits_rename_pending_name"):
+            self.esp._exploits_rename_pending_name = None
 
     def _build_aimbot_tab(self):
         p = self._pages["AIMBOT"]
@@ -2103,13 +1738,6 @@ class Menu(QWidget):
         hdr = self._mk_label("EXPLOITS (memory writes)")
         hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
         lo.addWidget(hdr)
-
-        hint = self._mk_label(
-            "Memory writes via resolved SDK offsets. Use the DEBUGGING tab to control log output."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
-        lo.addWidget(hint)
 
         lo.addWidget(self._chk("No Gun Cooldown (Hunter)", "exploits_no_gun_cooldown"))
         lo.addWidget(self._chk("No Recoil", "exploits_no_recoil"))
@@ -2238,14 +1866,6 @@ class Menu(QWidget):
         bridge_hdr.setStyleSheet("font-size: 12px; font-weight: bold; color: #7ec850; padding: 4px 0 0 0;")
         lo.addWidget(bridge_hdr)
 
-        bridge_hint = self._mk_label(
-            "Teleport and kill use the camo bridge over localhost TCP.\n"
-            "Bridge auto-injects when Peterhack connects to the game."
-        )
-        bridge_hint.setWordWrap(True)
-        bridge_hint.setStyleSheet("color: #6a8a5a; font-size: 10px;")
-        lo.addWidget(bridge_hint)
-
         tp_row = QHBoxLayout()
         tp_row.addWidget(QLabel("X:"))
         self.spn_tp_x = QDoubleSpinBox()
@@ -2340,17 +1960,6 @@ class Menu(QWidget):
         hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #7ec850; padding: 2px 0;")
         lo.addWidget(hdr)
 
-        info = self._mk_label(
-            "Fully automatic — 6-pass wrap: front → left → right → back, "
-            "then head/shoulders + inner legs.\n"
-            "Camera angles are computed dynamically from your pose (any angle/emote).\n"
-            "Noclip on front pass when not standing upright.\n"
-            "Click Paint Now or press F10. F9 cancels. Camera only — pawn does not spin."
-        )
-        info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 0;")
-        info.setWordWrap(True)
-        lo.addWidget(info)
-
         camo_q_row = QHBoxLayout()
         camo_q_row.addWidget(self._mk_label("Camo quality:"))
         self.sld_camo_quality = QSlider(Qt.Horizontal)
@@ -2384,36 +1993,44 @@ class Menu(QWidget):
         camo_q_row.addWidget(self.lbl_camo_quality)
         lo.addLayout(camo_q_row)
 
-        skip_front = self._chk("Disable front pass (only if flat map)", "camo_skip_front_pass")
-        skip_front.setToolTip(
-            "Skip the front camera pass — left, right, back only.\n"
-            "Use on flat maps where the front pass is unnecessary or causes issues."
+        sync_row = QHBoxLayout()
+        sync_row.addWidget(self._mk_label("Server sync speed:"))
+        self.sld_server_replication = QSlider(Qt.Horizontal)
+        self.sld_server_replication.setRange(1, 10)
+        self.sld_server_replication.setValue(getattr(self.config, "server_replication_speed", 6))
+        self.sld_server_replication.setTickPosition(QSlider.TicksBelow)
+        self.sld_server_replication.setTickInterval(1)
+        self.sld_server_replication.setToolTip(
+            "How fast camouflage replicates to other players (ServerPackedPaintBatch only).\n"
+            "Does not change local paint speed on your screen.\n"
+            "1 = official slow (20 strokes/batch, 100 ms) · 10 = fastest (50/batch, 25 ms)."
         )
-        lo.addWidget(skip_front)
-
-        back_only = self._chk("Back pass only", "camo_back_pass_only")
-        back_only.setToolTip(
-            "Paint only the back-facing orbit pass (spine).\n"
-            "Skips front, sides, and detail passes — fastest option for back-panel touch-ups."
+        sync_row.addWidget(self.sld_server_replication)
+        self.lbl_server_replication = QLabel("")
+        self.lbl_server_replication.setStyleSheet(
+            "color: #8ab870; font-size: 10px; min-width: 120px;"
         )
-        lo.addWidget(back_only)
 
-        def _sync_camo_pass_toggles(_state=0):
-            if back_only.isChecked():
-                skip_front.blockSignals(True)
-                skip_front.setChecked(False)
-                skip_front.blockSignals(False)
-                self.config.camo_skip_front_pass = False
-            elif skip_front.isChecked():
-                back_only.blockSignals(True)
-                back_only.setChecked(False)
-                back_only.blockSignals(False)
-                self.config.camo_back_pass_only = False
-            self.config.camo_skip_front_pass = skip_front.isChecked()
-            self.config.camo_back_pass_only = back_only.isChecked()
+        def _server_sync_label(v):
+            if v <= 3:
+                return self._t("Slow")
+            if v <= 6:
+                return self._t("Balanced")
+            if v <= 8:
+                return self._t("Fast")
+            return self._t("Turbo")
 
-        skip_front.stateChanged.connect(_sync_camo_pass_toggles)
-        back_only.stateChanged.connect(_sync_camo_pass_toggles)
+        def _on_server_replication_change(v):
+            setattr(self.config, "server_replication_speed", v)
+            self.lbl_server_replication.setText(f"{_server_sync_label(v)} ({v})")
+
+        self._i18n_bind_refresh(
+            lambda: _on_server_replication_change(self.sld_server_replication.value())
+        )
+        self.sld_server_replication.valueChanged.connect(_on_server_replication_change)
+        _on_server_replication_change(self.sld_server_replication.value())
+        sync_row.addWidget(self.lbl_server_replication)
+        lo.addLayout(sync_row)
 
         self.lbl_camo_status = QLabel(self._t("Injecting bridge..."))
         self.lbl_camo_status.setStyleSheet("color: #888; font-size: 10px; padding: 4px 0;")
@@ -2783,16 +2400,6 @@ class Menu(QWidget):
         self.cb_ui_overlay_vsync.toggled.connect(self._on_ui_overlay_vsync_toggled)
         self._i18n_bind(self.cb_ui_overlay_vsync, "VSync (match monitor refresh)")
         lo.addWidget(self.cb_ui_overlay_vsync)
-
-        info = self._mk_label(
-            "ESP overlay refresh when the menu is hidden (1–100). Enable VSync to match "
-            "your monitor Hz (up to 240). While this menu is open, overlay draw is capped "
-            "at 30 FPS (or lower if you set below 30) so the menu stays responsive. "
-            "Release the slider to apply."
-        )
-        info.setStyleSheet("color: #7a9a6a; font-size: 10px;")
-        info.setWordWrap(True)
-        lo.addWidget(info)
 
         self._sync_ui_overlay_vsync_controls()
         if getattr(self.config, "ui_overlay_vsync", False):

@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "meccha_chameleon_tools" / "core.py"
 EXPLOITS = ROOT / "meccha_chameleon_tools" / "exploits.py"
+SDK_HPP = ROOT / "runtime" / "include" / "sdk.hpp"
 
 GLOBAL_PATCHES = {
     "GWORLD_RVA": "OFFSET_GWORLD",
@@ -35,6 +36,29 @@ FALLBACK_OFFSETS = {
     "UWorld::GameState": ("UWorld", "GameState"),
     "UGameInstance::LocalPlayers": ("UGameInstance", "LocalPlayers"),
 }
+
+SDK_FIELD_PATCHES = {
+    "UWorld_OwningGameInstance": ("UWorld", "OwningGameInstance"),
+    "UGameInstance_LocalPlayers": ("UGameInstance", "LocalPlayers"),
+    "UPlayer_PlayerController": ("UPlayer", "PlayerController"),
+    "Controller_ControlRotation": ("AController", "ControlRotation"),
+    "PlayerController_PlayerCameraManager": ("APlayerController", "PlayerCameraManager"),
+    "BP_FirstPersonCharacter_RuntimePaintable": ("ABP_FirstPersonCharacter_cLeon_Character_C", "RuntimePaintable"),
+    "RuntimePaintable_CurrentBrushSettings": ("URuntimePaintableComponent", "CurrentBrushSettings"),
+    "SceneCapture2D_CaptureComponent2D": ("ASceneCapture2D", "CaptureComponent2D"),
+    "SceneCaptureComponent_CaptureSource": ("USceneCaptureComponent", "CaptureSource"),
+    "SceneCaptureComponent_bAlwaysPersistRenderingState": ("USceneCaptureComponent", "bAlwaysPersistRenderingState"),
+    "SceneCaptureComponent2D_ProjectionType": ("USceneCaptureComponent2D", "ProjectionType"),
+    "SceneCaptureComponent2D_FOVAngle": ("USceneCaptureComponent2D", "FOVAngle"),
+    "SceneCaptureComponent2D_TextureTarget": ("USceneCaptureComponent2D", "TextureTarget"),
+}
+
+VERIFY_GLOBALS = (
+    ("GObjects", "OFFSET_GOBJECTS"),
+    ("GNames", "OFFSET_GNAMES"),
+    ("GWorld", "OFFSET_GWORLD"),
+    ("ProcessEvent", "OFFSET_PROCESSEVENT"),
+)
 
 # Prefer C:\dumper-7 (user may typo as duper-7)
 DUMP_ROOTS = [Path(r"C:\dumper-7"), Path(r"C:\duper-7")]
@@ -195,6 +219,60 @@ def collect_fallback_updates(dump: Path) -> dict[str, int]:
     return updates
 
 
+def collect_sdk_updates(dump: Path) -> dict[str, int]:
+    classes = load_class_offsets(dump)
+    updates: dict[str, int] = {}
+    for const, (cls, field) in SDK_FIELD_PATCHES.items():
+        full = f"{cls}::{field}"
+        if full in classes:
+            updates[const] = classes[full]
+    return updates
+
+
+def apply_sdk_updates(updates: dict[str, int]) -> None:
+    if not SDK_HPP.is_file() or not updates:
+        return
+    text = SDK_HPP.read_text(encoding="utf-8")
+    changed = []
+    missing = []
+    for name, value in sorted(updates.items()):
+        pat = re.compile(rf"(constexpr std::uintptr_t {re.escape(name)} = )0x[0-9A-Fa-f]+")
+        new_text, n = pat.subn(rf"\g<1>0x{value:X}", text, count=1)
+        if n:
+            text = new_text
+            changed.append(f"  {name} = 0x{value:X}")
+        else:
+            missing.append(name)
+    if changed:
+        SDK_HPP.write_text(text, encoding="utf-8")
+        print("Patched runtime/include/sdk.hpp:")
+        print("\n".join(changed))
+    if missing:
+        print(f"SDK field not found in sdk.hpp: {', '.join(missing)}")
+
+
+def apply_verify_globals(dump: Path) -> None:
+    oi = json.loads((dump / "Dumpspace" / "OffsetsInfo.json").read_text(encoding="utf-8"))
+    globals_map = {k: v for k, v in oi["data"] if k.startswith("OFFSET")}
+    if not CORE.is_file():
+        return
+    text = CORE.read_text(encoding="utf-8")
+    changed = []
+    for label, key in VERIFY_GLOBALS:
+        value = globals_map.get(key)
+        if value is None:
+            continue
+        pat = re.compile(rf'(\("{label}",\s*)0x[0-9A-Fa-f]+(\))')
+        new_text, n = pat.subn(rf"\g<1>0x{value:X}\2", text, count=1)
+        if n:
+            text = new_text
+            changed.append(f"  _verify_paint_build_offsets {label} -> 0x{value:X}")
+    if changed:
+        CORE.write_text(text, encoding="utf-8")
+        print("Patched core.py verify globals:")
+        print("\n".join(changed))
+
+
 def apply_fallback_updates(updates: dict[str, int]) -> None:
     if not CORE.is_file() or not updates:
         return
@@ -338,7 +416,10 @@ def main():
     if args.apply:
         apply_updates(updates)
         apply_fallback_updates(collect_fallback_updates(dump))
+        apply_sdk_updates(collect_sdk_updates(dump))
+        apply_verify_globals(dump)
         print("\nDone — restart Peterhack to pick up new offsets.")
+        print("Rebuild bridge DLL if runtime/include/sdk.hpp changed.")
     return 0
 
 
